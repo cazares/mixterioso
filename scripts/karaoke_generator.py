@@ -3,10 +3,11 @@
 """
 karaoke_generator.py — unified entrypoint for Karaoke Time
 
-Stable build + 🧠 Hybrid transcript/whisper flow:
+Stable build + 🧠 Hybrid transcript/whisper flow + unified lyric retriever:
  - ✅ Uses YouTube transcript (if available) instead of Whisper
  - ✅ Falls back to Whisper + lyric correction when no transcript
  - ✅ Auto-extracts YouTube ID from URL if not provided
+ - ✅ Fetches best lyrics via multi-source chain (fetch_best_lyrics.py)
  - ✅ Supports --max-seconds trimming for fast iteration
 """
 
@@ -60,7 +61,6 @@ def extract_youtube_id(url: str) -> str:
     """Extracts the video ID from any YouTube URL format."""
     if not url:
         return None
-    # Support full, short, and embed links
     patterns = [
         r"(?:v=|\/v\/|youtu\.be\/|\/embed\/)([A-Za-z0-9_-]{11})",
         r"^([A-Za-z0-9_-]{11})$"
@@ -142,6 +142,18 @@ def main():
     mp3_out = Path("songs") / f"{artist_slug}_{title_slug}.mp3"
     lyrics_path = Path("lyrics") / f"{artist_slug}_{title_slug}.txt"
 
+    # --- Fetch lyrics early (multi-source chain) ---
+    if not lyrics_path.exists() or args.clear_cache:
+        run([
+            "python3", "scripts/fetch_best_lyrics.py",
+            "--artist", args.artist,
+            "--title", args.title,
+            "--genius-token", args.genius_token,
+            "--out", str(lyrics_path),
+        ])
+    else:
+        print(f"🌀 Cached lyrics: {lyrics_path}")
+
     # --- YouTube URL or ID ---
     youtube_url = args.youtube_url
     if not youtube_url and args.youtube_id:
@@ -220,6 +232,9 @@ def main():
 
     print("\n✅ Karaoke generation complete!")
 
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     warn_if_hardcoded_keys(__file__)
     main()
+
+# end of karaoke_generator.py
