@@ -68,6 +68,8 @@ parser.add_argument("--output-video", help="Path to output karaoke video file (.
 parser.add_argument("--vocals-percent", type=float, help="Vocal mix percentage (0–100)")
 parser.add_argument("--no-cache", action="store_true", help="Force regeneration of Demucs stems")
 
+parser.add_argument("--offset", type=float, default=0.0, help="Shift all lyric timestamps (in seconds, can be negative)")
+
 args = parser.parse_args()
 
 # ───────────────────────────────────────────────────────────────
@@ -235,8 +237,9 @@ if args.input_lyrics_text and not args.input_lyrics_timestamps:
                 "--csv", str(csv_path),
                 "--mp3", args.input_audio,
                 "--font-size", "140",
-                "--offset", "0"
-            ], check=True)
+                "--offset", str(args.offset)
+                ], check=True)
+
         else:
             print("⚠️  No CSV file generated; skipping render.")
 
@@ -245,12 +248,35 @@ if args.input_lyrics_text and not args.input_lyrics_timestamps:
 
 elif args.input_lyrics_timestamps:
     print("🎬 Rendering final video...")
+
+    timestamp_path = Path(args.input_lyrics_timestamps)
+
+    # Force everything to CSV
+    if timestamp_path.suffix.lower() != ".csv":
+        csv_candidate = timestamp_path.with_suffix(".csv")
+        if csv_candidate.exists():
+            print(f"💡 Using corresponding CSV: {csv_candidate}")
+            timestamp_path = csv_candidate
+        else:
+            # Fallback: search for latest *_synced.csv
+            lyrics_dir = Path("lyrics")
+            csv_files = sorted(lyrics_dir.glob("*_synced.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if csv_files:
+                latest_csv = csv_files[0]
+                print(f"💡 Found latest synced CSV: {latest_csv}")
+                timestamp_path = latest_csv
+            else:
+                error("❌ No valid CSV lyric timing files found. Please run interactive mode first.")
+
+    # Confirm target
+    print(f"🎯 Using lyric timing file: {timestamp_path}")
+
     subprocess.run([
         "python3", "scripts/karaoke_core.py",
-        "--csv", args.input_lyrics_timestamps,
+        "--csv", str(timestamp_path),
         "--mp3", args.input_audio,
         "--font-size", "140",
-        "--offset", "0"
+        "--offset", str(args.offset)
     ], check=True)
 
 print("\n✅ Karaoke Time completed successfully.")

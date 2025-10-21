@@ -62,8 +62,8 @@ def main():
         lines = [l.strip() for l in lyrics_path.read_text(encoding="utf-8").splitlines() if l.strip()]
         ts = 0.0
         for line in lines:
+            # Default all timestamps to 0 so offset applies literally
             rows.append({"timestamp": ts, "text": line})
-            ts += 3.0
 
     header = f"""[Script Info]
 ScriptType: v4.00+
