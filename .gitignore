@@ -10,3 +10,4 @@ __pycache__/
 *.wav
 *demucs*
 *.txt*.mp3
+*.env
