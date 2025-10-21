@@ -36,6 +36,21 @@ def confirm(question: str) -> bool:
         sys.exit(1)
 
 # ───────────────────────────────────────────────────────────────
+# New helper for UTF-8 normalization
+# ───────────────────────────────────────────────────────────────
+def clean_text(s: str) -> str:
+    """Normalize and sanitize any text for safe terminal output or file usage."""
+    return (
+        s.encode("utf-8", "ignore")
+        .decode("utf-8")
+        .replace("\uFEFF", "")
+        .replace("\uFFFD", "")
+        .replace("\xa0", " ")
+        .replace("\r", "")
+        .strip()
+    )
+
+# ───────────────────────────────────────────────────────────────
 # Argument parsing
 # ───────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(
@@ -65,7 +80,7 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 # Base-filename expansion (non-destructive)
 # ───────────────────────────────────────────────────────────────
 if args.base_filename:
-    base = Path(args.base_filename)
+    base = Path(clean_text(args.base_filename))
     info(f"Using base filename: {base}")
     args.input_audio = args.input_audio or str(base.with_suffix(".mp3"))
     args.input_lyrics_text = args.input_lyrics_text or str(base.with_suffix(".txt"))
@@ -76,6 +91,7 @@ if args.base_filename:
 # Input validation: audio vs URL
 # ───────────────────────────────────────────────────────────────
 if args.input_url:
+    args.input_url = clean_text(args.input_url)
     print("🎧 You provided a YouTube URL.")
     print()
     print("Choose how to download the audio:")
@@ -85,7 +101,7 @@ if args.input_url:
     choice = input("Choose 1 or 2 [default: 1]: ").strip() or "1"
 
     if choice == "1":
-        mp3_path = Path(f"songs/{args.base_filename}.mp3")
+        mp3_path = Path(f"songs/{clean_text(args.base_filename)}.mp3")
         if mp3_path.exists():
             print(f"🎵 Reusing existing audio file: {mp3_path}")
             args.input_audio = str(mp3_path)
@@ -95,7 +111,7 @@ if args.input_url:
             result = subprocess.run([
                 "yt-dlp", "-x", "--audio-format", "mp3",
                 "--extractor-args", "youtube:player_client=android",
-                "-o", f"songs/{args.base_filename}.%(ext)s",
+                "-o", f"songs/{clean_text(args.base_filename)}.%(ext)s",
                 args.input_url
             ])
             if result.returncode == 0:
@@ -135,7 +151,7 @@ if args.input_lyrics_text and args.input_lyrics_timestamps:
         error("Invalid choice. Please re-run and choose 1 or 2.")
 
 if args.input_lyrics_text:
-    lyrics_path = Path(args.input_lyrics_text)
+    lyrics_path = Path(clean_text(args.input_lyrics_text))
     if not lyrics_path.exists():
         print(f"❌ Lyrics text file not found: {lyrics_path}")
         os.makedirs(lyrics_path.parent, exist_ok=True)
@@ -181,8 +197,8 @@ if not args.output_video:
 if args.input_lyrics_text and not args.input_lyrics_timestamps:
     print("🎤 Launching interactive lyric timing mode...")
 
-    artist = input("Enter artist name: ").strip() or "Unknown Artist"
-    title = input("Enter song title: ").strip() or Path(args.base_filename).stem
+    artist = clean_text(input("Enter artist name: ").strip() or "Unknown Artist")
+    title = clean_text(input("Enter song title: ").strip() or Path(args.base_filename).stem)
 
     lyrics_dir = Path("lyrics")
     lyrics_dir.mkdir(exist_ok=True)
@@ -211,7 +227,6 @@ if args.input_lyrics_text and not args.input_lyrics_timestamps:
             "--interactive"
         ], check=True)
 
-        # After lyric timing completes, render MP4
         csv_path = Path("lyrics") / f"{artist.replace(' ', '_')}_{title.replace(' ', '_')}_synced.csv"
         if csv_path.exists():
             print(f"🎬 Rendering video from {csv_path} ...")
@@ -240,3 +255,5 @@ elif args.input_lyrics_timestamps:
 
 print("\n✅ Karaoke Time completed successfully.")
 print("🎬 Output video saved as:", args.output_video)
+
+# end of karaoke_time_cli.py

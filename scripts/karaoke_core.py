@@ -6,11 +6,26 @@ Now includes:
   • automatic FFmpeg rendering after .ASS creation
   • support for .txt and .csv lyric inputs
   • global --offset for timing shifts (+/- seconds)
+  • UTF-8 text normalization to prevent missing glyphs/boxes
 """
 
 import csv, sys, subprocess, shlex
 from pathlib import Path
 import argparse
+import unicodedata  # additive import
+
+# ───────────────────────────────────────────────────────────────
+def clean_text(s: str) -> str:
+    """Normalize lyric text to pure UTF-8 and strip invisible characters."""
+    return (
+        s.encode("utf-8", "ignore")
+        .decode("utf-8")
+        .replace("\uFEFF", "")
+        .replace("\uFFFD", "")
+        .replace("\xa0", " ")
+        .replace("\r", "")
+        .strip()
+    )
 
 def seconds_to_ass(ts):
     m, s = divmod(float(ts), 60)
@@ -22,7 +37,7 @@ def render_karaoke_video(audio_path, ass_path, output_path, font_name, font_size
     ffmpeg_cmd = f"""
         ffmpeg -f lavfi -i color=c=black:size=1280x720 \
         -i "{audio_path}" \
-        -vf "subtitles={ass_path}:force_style='Fontsize={font_size},Fontname={font_name}'" \
+        -vf "subtitles={ass_path}:charenc=UTF-8:force_style='Fontname={font_name},Fontsize={font_size}'" \
         -c:v libx264 -pix_fmt yuv420p -c:a aac -movflags +faststart -shortest "{output_path}"
     """
     try:
@@ -31,6 +46,7 @@ def render_karaoke_video(audio_path, ass_path, output_path, font_name, font_size
     except subprocess.CalledProcessError as e:
         print(f"❌ FFmpeg failed: {e}")
 
+# ───────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Generate karaoke MP4 from lyrics (CSV or TXT) and audio file.")
     parser.add_argument("--csv", required=True, help="Path to lyrics file (.csv or .txt)")
@@ -57,9 +73,10 @@ def main():
                 ts = float(row["timestamp"]) + offset
                 if ts < 0:
                     ts = 0.0  # prevent negative start times
-                rows.append({"timestamp": ts, "text": row["text"]})
+                text = clean_text(row["text"])
+                rows.append({"timestamp": ts, "text": text})
     else:
-        lines = [l.strip() for l in lyrics_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        lines = [clean_text(l) for l in lyrics_path.read_text(encoding="utf-8").splitlines() if l.strip()]
         ts = 0.0
         for line in lines:
             rows.append({"timestamp": ts, "text": line})
@@ -82,7 +99,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     for i, row in enumerate(rows):
         start = seconds_to_ass(row["timestamp"])
         end = seconds_to_ass(rows[i + 1]["timestamp"]) if i + 1 < len(rows) else seconds_to_ass(float(row["timestamp"]) + 3)
-        lyric = row["text"].strip().replace(",", "，")
+        # Clean invisible Unicode residues, then normalize safely
+        lyric = (
+            row["text"]
+            .replace("\u200b", "")
+            .replace("\u200c", "")
+            .replace("\u200d", "")
+            .replace("\u00a0", " ")
+            # .replace(",", "，")
+            .strip()
+        )
+        lyric = unicodedata.normalize("NFC", lyric)
         lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{lyric}")
 
     ass_path.write_text(header + "\n".join(lines), encoding="utf-8")
@@ -94,6 +121,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     render_karaoke_video(audio_path, ass_path, output_path, font_name, font_size)
 
+# ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
 
