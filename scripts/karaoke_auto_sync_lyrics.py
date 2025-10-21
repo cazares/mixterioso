@@ -3,9 +3,9 @@
 """
 karaoke_auto_sync_lyrics.py — auto or interactive lyric timing
 
-Fixed 2025-10-19:
-✅ Adds working --interactive flag
-✅ Safe from argparse parsing issues
+Fixed 2025-10-21:
+✅ Adds user-controlled start ("Press Enter to start clock")
+✅ Keeps existing behavior identical otherwise
 ✅ Writes CSV with [timestamp, text]
 """
 
@@ -27,6 +27,9 @@ def run_interactive(artist: str, title: str, lyrics_path: Path, out_csv: Path):
 
     with open(lyrics_path, encoding="utf-8") as f:
         lines = [l.strip() for l in f if l.strip()]
+
+    # NEW: user-controlled start
+    input("⏯️  Ready when you are. Press [Enter] to start the clock and first lyric...")
 
     start = time.time()
     rows = []

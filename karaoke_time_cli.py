@@ -4,13 +4,14 @@
 karaoke_time_cli.py — Unified command-line wrapper for Karaoke Time
 Author: Miguel Cázares
 
-Supports local audio OR YouTube URLs.
+Now supports local audio OR YouTube URLs.
 """
 
 import argparse
 import sys
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 import subprocess
 
@@ -21,14 +22,18 @@ def error(msg: str):
     print(f"❌ {msg}")
     sys.exit(1)
 
-
 def warn(msg: str):
     print(f"⚠️  {msg}")
-
 
 def info(msg: str):
     print(f"ℹ️  {msg}")
 
+def confirm(question: str) -> bool:
+    try:
+        return input(f"{question} [y/N] ").strip().lower().startswith("y")
+    except KeyboardInterrupt:
+        print()
+        sys.exit(1)
 
 # ───────────────────────────────────────────────────────────────
 # Argument parsing
@@ -38,10 +43,12 @@ parser = argparse.ArgumentParser(
 )
 
 parser.add_argument("--base-filename", help="Base name for input/output files (auto-fills related paths)")
+
 parser.add_argument("--input-audio", help="Path to input audio file (.mp3 or .wav)")
 parser.add_argument("--input-url", help="YouTube URL to download and process")
 parser.add_argument("--input-lyrics-text", help="Path to lyrics text file (.txt)")
 parser.add_argument("--input-lyrics-timestamps", help="Path to lyrics timings file (.csv or .ass)")
+
 parser.add_argument("--output-video", help="Path to output karaoke video file (.mp4)")
 parser.add_argument("--vocals-percent", type=float, help="Vocal mix percentage (0–100)")
 parser.add_argument("--no-cache", action="store_true", help="Force regeneration of Demucs stems")
@@ -55,7 +62,7 @@ load_dotenv()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 # ───────────────────────────────────────────────────────────────
-# Base-filename expansion
+# Base-filename expansion (non-destructive)
 # ───────────────────────────────────────────────────────────────
 if args.base_filename:
     base = Path(args.base_filename)
@@ -66,13 +73,15 @@ if args.base_filename:
     args.output_video = args.output_video or str(base.with_suffix(".mp4"))
 
 # ───────────────────────────────────────────────────────────────
-# Audio source handling
+# Input validation: audio vs URL
 # ───────────────────────────────────────────────────────────────
 if args.input_url:
-    print("🎧 You provided a YouTube URL.\n")
+    print("🎧 You provided a YouTube URL.")
+    print()
     print("Choose how to download the audio:")
     print("  1. yt-dlp  — direct download (⚡ fastest, no API key needed, recommended)")
-    print("  2. YouTube API  — uses your API key for metadata and lyric alignment (⚙️ slower, requires valid YOUTUBE_API_KEY)\n")
+    print("  2. YouTube API  — uses your API key for metadata and lyric alignment (⚙️ slower, requires valid YOUTUBE_API_KEY)")
+    print()
     choice = input("Choose 1 or 2 [default: 1]: ").strip() or "1"
 
     if choice == "1":
@@ -93,55 +102,87 @@ if args.input_url:
                 args.input_audio = str(mp3_path)
                 print("✅ Download complete via yt-dlp.")
             else:
-                error("yt-dlp failed or was interrupted. Re-run and choose option 2 as fallback.")
+                print("❌ yt-dlp failed or was interrupted.")
+                print("💡 Tip: re-run this command and select option 2 (YouTube API) as a fallback.")
+                sys.exit(1)
 
     elif choice == "2":
-        error("YouTube API mode not yet implemented for direct URL download.")
+        print("⚠️  YouTube API mode not yet implemented for direct URL download.")
+        print("💡  Please use yt-dlp (option 1) for now.")
+        sys.exit(1)
+
     else:
-        error("Invalid choice. Aborting.")
+        print("⚠️ Invalid choice. Aborting.")
+        sys.exit(1)
 
 # ───────────────────────────────────────────────────────────────
-# Determine mode
+# Lyrics validation
 # ───────────────────────────────────────────────────────────────
-mode = None
+if not args.input_lyrics_text and not args.input_lyrics_timestamps:
+    error("You must specify either --input-lyrics-text (for interactive mode) "
+          "or --input-lyrics-timestamps (for non-interactive mode).")
+
 if args.input_lyrics_text and args.input_lyrics_timestamps:
-    choice = input("⚠️  Both provided. 1=interactive (text), 2=non-interactive (timings) [default: 1]: ").strip() or "1"
+    print("⚠️  Both --input-lyrics-text and --input-lyrics-timestamps were provided.")
+    print("    1. Use interactive mode (generate new CSV from text)")
+    print("    2. Use existing timings (non-interactive)")
+    choice = input("Choose 1 or 2 [default: 1]: ").strip() or "1"
     if choice == "1":
         args.input_lyrics_timestamps = None
-        mode = "interactive"
-    else:
+    elif choice == "2":
         args.input_lyrics_text = None
-        mode = "timings"
-elif args.input_lyrics_text:
-    mode = "interactive"
-elif args.input_lyrics_timestamps:
-    mode = "timings"
-else:
-    error("You must specify --input-lyrics-text (interactive) or --input-lyrics-timestamps (non-interactive).")
+    else:
+        error("Invalid choice. Please re-run and choose 1 or 2.")
+
+if args.input_lyrics_text:
+    lyrics_path = Path(args.input_lyrics_text)
+    if not lyrics_path.exists():
+        print(f"❌ Lyrics text file not found: {lyrics_path}")
+        os.makedirs(lyrics_path.parent, exist_ok=True)
+        print("💡 Created empty lyrics file for you.")
+        lyrics_path.touch()
+        print(f"📝 Open {lyrics_path} in your editor, paste lyrics, save, and press [Enter] once done.")
+        while True:
+            input("⏸️  Waiting... Press [Enter] after saving your lyrics: ")
+            if lyrics_path.exists() and lyrics_path.stat().st_size > 0:
+                print("✅ Lyrics file detected and not empty.")
+                break
+            else:
+                print("⚠️  File still missing or empty. Please edit and save it, then press [Enter] again.")
 
 # ───────────────────────────────────────────────────────────────
-# Vocals selection
+# Vocals
 # ───────────────────────────────────────────────────────────────
 if args.vocals_percent is None:
-    print("\n🎚️  No --vocals-percent specified.")
+    print()
+    print("🎚️  No --vocals-percent specified.")
     print("    1. Full vocals (100%)")
     print("    2. No vocals (0%)")
     choice = input("Choose 1 or 2 [default: 1]: ").strip() or "1"
-    args.vocals_percent = 100.0 if choice == "1" else 0.0
+    if choice == "1":
+        args.vocals_percent = 100.0
+    elif choice == "2":
+        args.vocals_percent = 0.0
+    else:
+        error("Invalid choice. Please re-run and choose 1 or 2.")
 
 if not (0.0 <= args.vocals_percent <= 100.0):
     error("--vocals-percent must be between 0 and 100.")
 
+# ───────────────────────────────────────────────────────────────
+# Output validation
+# ───────────────────────────────────────────────────────────────
 if not args.output_video:
     error("You must specify --output-video or --base-filename to auto-fill it.")
 
 # ───────────────────────────────────────────────────────────────
-# Interactive Mode
+# Run Karaoke generator
 # ───────────────────────────────────────────────────────────────
-if mode == "interactive":
+if args.input_lyrics_text and not args.input_lyrics_timestamps:
     print("🎤 Launching interactive lyric timing mode...")
-    artist = input("Enter artist name: ").strip() or "Unknown_Artist"
-    title = input("Enter song title: ").strip() or (Path(args.base_filename).stem if args.base_filename else "Unknown_Title")
+
+    artist = input("Enter artist name: ").strip() or "Unknown Artist"
+    title = input("Enter song title: ").strip() or Path(args.base_filename).stem
 
     lyrics_dir = Path("lyrics")
     lyrics_dir.mkdir(exist_ok=True)
@@ -151,34 +192,43 @@ if mode == "interactive":
         print(f"❌ Lyrics file not found: {lyrics_path}")
         print("💡 Created empty lyrics file for you.")
         lyrics_path.touch()
+        print(f"📝 Open {lyrics_path} in your editor, paste your lyrics, save, and press [Enter] once done.")
+        while True:
+            input("⏸️  Waiting... Press [Enter] after saving your lyrics: ")
+            if lyrics_path.exists() and lyrics_path.stat().st_size > 0:
+                print("✅ Lyrics file detected and not empty.")
+                break
+            else:
+                print("⚠️  File still missing or empty. Please edit and save it, then press [Enter] again.")
 
-    print(f"📝 Open {lyrics_path} in your editor, paste lyrics, save, and press [Enter] once done.")
-    while True:
-        try:
-            input("⏸️  Waiting… press [Enter] after saving: ")
-        except KeyboardInterrupt:
-            print()
-            error("Interrupted by user.")
-        if lyrics_path.exists() and lyrics_path.stat().st_size > 0:
-            print("✅ Lyrics file detected and not empty.")
-            break
-        print("⚠️  File still missing or empty. Save and press [Enter] again.")
+    print("🎬 Starting lyric tapper...")
+    try:
+        subprocess.run([
+            "python3", "scripts/karaoke_auto_sync_lyrics.py",
+            "--artist", artist,
+            "--title", title,
+            "--vocals-percent", str(args.vocals_percent),
+            "--interactive"
+        ], check=True)
 
-    print("🎬 Starting lyric tapper…")
-    subprocess.run([
-        "python3", "scripts/karaoke_auto_sync_lyrics.py",
-        "--artist", artist,
-        "--title", title,
-        "--vocals-percent", str(args.vocals_percent),
-        "--interactive"
-    ], check=True)
+        # After lyric timing completes, render MP4
+        csv_path = Path("lyrics") / f"{artist.replace(' ', '_')}_{title.replace(' ', '_')}_synced.csv"
+        if csv_path.exists():
+            print(f"🎬 Rendering video from {csv_path} ...")
+            subprocess.run([
+                "python3", "scripts/karaoke_core.py",
+                "--csv", str(csv_path),
+                "--mp3", args.input_audio,
+                "--font-size", "140",
+                "--offset", "0"
+            ], check=True)
+        else:
+            print("⚠️  No CSV file generated; skipping render.")
 
-# ───────────────────────────────────────────────────────────────
-# Non-interactive Mode
-# ───────────────────────────────────────────────────────────────
-elif mode == "timings":
-    if not Path(args.input_lyrics_timestamps).exists():
-        error(f"Timings file not found: {args.input_lyrics_timestamps}")
+    except subprocess.CalledProcessError as e:
+        error(f"Lyric sync failed: {e}")
+
+elif args.input_lyrics_timestamps:
     print("🎬 Rendering final video...")
     subprocess.run([
         "python3", "scripts/karaoke_core.py",
@@ -188,9 +238,5 @@ elif mode == "timings":
         "--offset", "0"
     ], check=True)
 
-# ───────────────────────────────────────────────────────────────
-# Done
-# ───────────────────────────────────────────────────────────────
 print("\n✅ Karaoke Time completed successfully.")
 print("🎬 Output video saved as:", args.output_video)
-sys.exit(0)
