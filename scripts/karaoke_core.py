@@ -11,13 +11,13 @@ Now includes:
 import csv, sys, subprocess, shlex
 from pathlib import Path
 import argparse
+import unicodedata   # 🆕 added
 
 def seconds_to_ass(ts):
     m, s = divmod(float(ts), 60)
     return f"0:{int(m):02d}:{s:05.2f}".replace('.', ',')
 
 def render_karaoke_video(audio_path, ass_path, output_path, font_name, font_size):
-    """Run FFmpeg to render final karaoke MP4 automatically."""
     print(f"\n🎬 Rendering karaoke video to {output_path}...")
     ffmpeg_cmd = f"""
         ffmpeg -f lavfi -i color=c=black:size=1280x720 \
@@ -42,6 +42,17 @@ def main():
 
     lyrics_path = Path(args.csv)
     audio_path = Path(args.mp3)
+     
+    # Ensure audio_path points to the correct songs/ directory if missing
+    if not audio_path.exists():
+        songs_dir = Path("songs") / audio_path.name
+        if songs_dir.exists():
+            audio_path = songs_dir
+            print(f"🎵 Using fallback audio path: {audio_path}")
+        else:
+            print(f"❌ Audio file not found: {audio_path}")
+            sys.exit(1)
+
     font_name = args.font_name
     font_size = args.font_size
     offset = args.offset
@@ -56,14 +67,15 @@ def main():
             for row in reader:
                 ts = float(row["timestamp"]) + offset
                 if ts < 0:
-                    ts = 0.0  # prevent negative start times
-                rows.append({"timestamp": ts, "text": row["text"]})
+                    ts = 0.0
+                lyric = unicodedata.normalize("NFC", row["text"].strip())   # 🆕 fix for invisible chars
+                rows.append({"timestamp": ts, "text": lyric})
     else:
         lines = [l.strip() for l in lyrics_path.read_text(encoding="utf-8").splitlines() if l.strip()]
         ts = 0.0
         for line in lines:
-            # Default all timestamps to 0 so offset applies literally
-            rows.append({"timestamp": ts, "text": line})
+            lyric = unicodedata.normalize("NFC", line.strip())  # 🆕 normalize plain text too
+            rows.append({"timestamp": ts, "text": lyric})
 
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -82,9 +94,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     for i, row in enumerate(rows):
         start = seconds_to_ass(row["timestamp"])
         end = seconds_to_ass(rows[i + 1]["timestamp"]) if i + 1 < len(rows) else seconds_to_ass(float(row["timestamp"]) + 3)
-        # lyric = row["text"].strip().replace(",", "，") ... gets rid of weird rectangle boxes in rendered lyrics
-        lyric = row["text"].strip()
-        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{lyric}")
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{row['text']}")
 
     ass_path.write_text(header + "\n".join(lines), encoding="utf-8")
     print(f"✅ ASS file written: {ass_path}")
