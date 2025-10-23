@@ -10,3 +10,12 @@ __pycache__/
 *.wav
 *demucs*
 *.txt*.mp3
+*.env
+demucs_env/
+intermediate/
+logs/
+*.mkv
+merged_output/
+ouput/
+separated/
+songs/
