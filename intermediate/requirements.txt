@@ -1,7 +1,0 @@
-requests
-soundfile
-demucs
-torch
-torchaudio
-ffmpeg-python
-tqdm
