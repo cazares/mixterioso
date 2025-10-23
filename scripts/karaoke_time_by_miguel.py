@@ -38,6 +38,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# 🎨 ANSI Color Codes (added)
+RESET = "\033[0m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+
+def colorize(level: str, msg: str) -> str:
+    """Color-coded messages for better UX."""
+    if level == "fatal":
+        return f"{RED}💀 [fatal]{RESET} {msg}"
+    if level == "warn":
+        return f"{YELLOW}⚠️  [warn]{RESET} {msg}"
+    if level == "info":
+        return f"{CYAN}ℹ️  {msg}{RESET}"
+    return msg
+
 try:
     import soundfile as sf
 except Exception:
@@ -46,14 +65,14 @@ except Exception:
 # ------------------------------- Utils ---------------------------------- #
 
 def die(msg: str, code: int = 1):
-    print(f"[fatal] {msg}", file=sys.stderr)
+    print(colorize("fatal", msg), file=sys.stderr)
     sys.exit(code)
 
 def warn(msg: str):
-    print(f"[warn] {msg}", file=sys.stderr)
+    print(colorize("warn", msg), file=sys.stderr)
 
 def info(msg: str):
-    print(f"[info] {msg}")
+    print(colorize("info", msg))
 
 def run(cmd: List[str], check: bool = True, capture: bool = False, cwd: Optional[str] = None) -> subprocess.CompletedProcess:
     """Run a subprocess with nice logging."""
@@ -66,11 +85,11 @@ def has_bin(name: str) -> bool:
     return which(name) is not None
 
 def ensure_bins():
-    if not has_bin("ffmpeg"): die("ffmpeg not found in PATH")
-    if not has_bin("ffprobe"): die("ffprobe not found in PATH")
+    if not has_bin("ffmpeg"): die("ffmpeg not found in PATH ⚙️")
+    if not has_bin("ffprobe"): die("ffprobe not found in PATH ⚙️")
     if not has_bin("demucs"):
         warn("demucs not found in PATH. Install with: pip3 install demucs")
-        die("demucs is required for stem separation")
+        die("demucs is required for stem separation 🎚️")
 
 def read_text_lines(path: Path) -> List[str]:
     raw = path.read_text(encoding="utf-8", errors="replace")
@@ -95,7 +114,7 @@ def audio_duration_seconds(audio_path: Path) -> float:
         dur = float(result.stdout.strip())
         return dur
     except Exception:
-        warn("Unable to read duration; defaulting to 180s")
+        warn("Unable to read duration; defaulting to 180s ⏱️")
         return 180.0
 
 def time_s() -> float:
@@ -110,7 +129,7 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 def yes_no(prompt: str, default_no: bool = True) -> bool:
-    ans = input(prompt).strip().lower()
+    ans = input(f"{YELLOW}{prompt}{RESET}").strip().lower()
     if ans == "y": return True
     if ans == "n": return False
     return not default_no
@@ -119,7 +138,7 @@ def yes_no(prompt: str, default_no: bool = True) -> bool:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="Karaoke Time by Miguel — all-in-one local tool with Perform Along Buddy mode",
+        description="🎶 Karaoke Time by Miguel — all-in-one local tool with Perform Along Buddy mode",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--lyrics", required=True, help="Path to lyrics .txt (one line per subtitle line)")
@@ -142,13 +161,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def tap_to_time(lines: List[str], interactive: bool = True) -> List[float]:
     """Return start times (seconds) per line based on Enter key taps."""
-    print("\n🎤 Manual lyric timing")
+    print(f"\n{MAGENTA}🎤 Manual lyric timing mode activated!{RESET}")
     print("Press Enter when each line should APPEAR. Press Ctrl+C to abort.\n")
     if not interactive:
-        die("Interactive timing requested but --no-prompt passed or no TTY")
+        die("Interactive timing requested but --no-prompt passed or no TTY ❌")
 
     # Allow user to get ready
-    input("Cue ready. Start your song playback now, then press Enter to begin...")
+    input("🎵 Cue ready. Start your song playback now, then press Enter to begin...")
     start = time_s()
     starts: List[float] = []
     try:
@@ -158,8 +177,8 @@ def tap_to_time(lines: List[str], interactive: bool = True) -> List[float]:
             t = time_s() - start
             starts.append(t)
     except KeyboardInterrupt:
-        die("Timing interrupted by user")
-    print("Timing complete.\n")
+        die("Timing interrupted by user ❌")
+    print(f"{GREEN}✅ Timing complete!{RESET}\n")
     return starts
 
 # ----------------------------- CSV Handling ------------------------------ #
@@ -172,16 +191,18 @@ def write_timing_csv(csv_path: Path, lines: List[str], starts: List[float]):
         w.writerow(["line","start"])
         for ln, st in zip(lines, starts):
             w.writerow([ln, f"{st:.3f}"])
+    info(f"📝 Saved timing CSV → {csv_path}")
 
 def read_timing_csv(csv_path: Path) -> Tuple[List[str], List[float]]:
     lines, starts = [], []
     with csv_path.open("r", encoding="utf-8") as f:
         r = csv.DictReader(f)
         if "line" not in r.fieldnames or "start" not in r.fieldnames:
-            die("Timing CSV missing required headers: line,start")
+            die("Timing CSV missing required headers: line,start ⚠️")
         for row in r:
             lines.append(row["line"])
             starts.append(float(row["start"]))
+    info(f"📂 Loaded timing CSV → {csv_path}")
     return lines, starts
 
 # ---------------------------- ASS Generation ----------------------------- #
@@ -229,9 +250,9 @@ def write_ass(ass_path: Path, w: int, h: int, font_size: int,
     with ass_path.open("w", encoding="utf-8") as f:
         f.write(header + "\n")
         for line, st, en in zip(lines, starts, ends):
-            # Replace \N literal if user included, else normal line
             txt = line.replace("\\N", r"\N")
             f.write(f"Dialogue: 0,{srt_time(st+offset)},{srt_time(en)},Default,,0,0,0,,{txt}\n")
+    info(f"🖋️  Wrote new ASS subtitles → {ass_path}")
 
 # ---------------------------- Demucs + Mix ------------------------------- #
 
@@ -252,13 +273,12 @@ class StemPlan:
 
 def interactive_stem_selection(no_prompt: bool) -> StemPlan:
     if no_prompt:
-        # Non-interactive default: do nothing (all 100%)
         levels = {name: 100 for name in STEM_ORDER}
         return StemPlan(selected={}, all_levels=levels)
 
     chosen = set()
     while True:
-        print("\nSelect stems to modify. Enter 1-6 to toggle. 0 to confirm.")
+        print(f"\n{MAGENTA}🎚️  Select stems to modify. Enter 1-6 to toggle. 0 to confirm.{RESET}")
         for idx, (label, key) in enumerate(STEM_MENU, 1):
             mark = "x" if key in chosen else " "
             print(f"{idx} - [{mark}] {label}")
@@ -271,26 +291,22 @@ def interactive_stem_selection(no_prompt: bool) -> StemPlan:
             if key in chosen: chosen.remove(key)
             else: chosen.add(key)
         else:
-            print("Enter a number 0..6.")
+            print("Enter a number 0..6 🎵")
 
     if not chosen:
-        # No changes requested; default all = 100%
         levels = {name: 100 for name in STEM_ORDER}
         return StemPlan(selected={}, all_levels=levels)
 
-    # Confirm chosen list
     names = [label for (label,key) in STEM_MENU if key in chosen]
-    yn = input(f"You selected to modify: {', '.join(names)} - [y/N] to confirm: ").strip().lower()
+    yn = input(f"🎛️  You selected: {', '.join(names)} - [y/N] to confirm: ").strip().lower()
     if yn != "y":
-        # Restart selection
         return interactive_stem_selection(no_prompt=False)
 
-    # Ask percentages per chosen
     levels = {name: 100 for name in STEM_ORDER}
     for label, key in STEM_MENU:
         if key in chosen:
             while True:
-                val = input(f"Enter percent for: {label} (0-100): ").strip()
+                val = input(f"Enter percent for: {label} (0-100) 🎚️ : ").strip()
                 if not val:
                     pct = 100
                     break
@@ -300,8 +316,7 @@ def interactive_stem_selection(no_prompt: bool) -> StemPlan:
                 print("Enter integer 0..100.")
             levels[key] = pct
 
-    # Final summary table
-    print("\nSummary of requested stem levels:")
+    print(f"\n{CYAN}Summary of requested stem levels:{RESET}")
     print("Stem       Volume %")
     print("-------------------")
     for label, key in STEM_MENU:
@@ -310,40 +325,28 @@ def interactive_stem_selection(no_prompt: bool) -> StemPlan:
     if yn2 != "y":
         return interactive_stem_selection(no_prompt=False)
 
-    # Only selected are those with != 100 OR explicitly toggled by user
     selected = {k: levels[k] for k in chosen}
     return StemPlan(selected=selected, all_levels=levels)
 
 def run_demucs_separation(audio_path: Path, model: str, device: Optional[str], out_root: Path) -> Path:
-    """
-    Runs Demucs only if stems do not already exist.
-    Returns the directory containing the 6 separated WAVs.
-    """
     ensure_dir(out_root)
     base = sanitize_basename(audio_path)
     demucs_dir = out_root / model / base
 
-    # ✅ if all stems already exist, skip Demucs entirely
     if all((demucs_dir / f"{stem}.wav").exists() for stem in STEM_ORDER):
-        info(f"Reusing existing stems in {demucs_dir}")
+        info(f"♻️  Reusing existing stems in {demucs_dir}")
         return demucs_dir
 
-    info("Running Demucs separation (stems not found)...")
+    info("🎵 Running Demucs separation (stems not found)...")
     cmd = ["demucs", "--name", model, "--out", str(out_root)]
     if device:
         cmd += ["--device", device]
     cmd += [str(audio_path)]
     run(cmd, check=True)
-
     return demucs_dir
 
 def mix_stems_to_file(stem_dir: Path, levels: Dict[str, int], out_mp3: Path):
-    """
-    Mix the six stems with individual volumes. Only apply volume filters where level != 100.
-    """
-    inputs = []
-    filters = []
-    map_names = []
+    inputs, filters, map_names = [], [], []
     idx = 0
 
     for stem in STEM_ORDER:
@@ -353,7 +356,6 @@ def mix_stems_to_file(stem_dir: Path, levels: Dict[str, int], out_mp3: Path):
         inputs += ["-i", str(stem_wav)]
         level = levels.get(stem, 100)
         if level == 100:
-            # no volume filter; pass input directly to amix
             map_names.append(f"[{idx}:a]")
         else:
             vol = max(level, 0) / 100.0
@@ -361,32 +363,26 @@ def mix_stems_to_file(stem_dir: Path, levels: Dict[str, int], out_mp3: Path):
             map_names.append(f"[a{idx}]")
         idx += 1
 
-    # Build filter_complex: optional volume steps + final amix
     fc = ""
     if filters:
         fc += ";".join(filters) + ";"
     fc += f"{''.join(map_names)}amix=inputs=6:normalize=0[aout]"
 
-    cmd = ["ffmpeg","-y"]
-    cmd += inputs
-    cmd += ["-filter_complex", fc, "-map","[aout]","-c:a","libmp3lame","-q:a","2", str(out_mp3)]
+    info("🎚️  Mixing stems into final accompaniment...")
+    cmd = ["ffmpeg","-y"] + inputs + ["-filter_complex", fc, "-map","[aout]","-c:a","libmp3lame","-q:a","2", str(out_mp3)]
     run(cmd, check=True)
+    info(f"🎧 Mixed audio → {out_mp3}")
 
 # ----------------------------- Rendering -------------------------------- #
 
 def render_karaoke_video(audio_path: Path, ass_path: Path, out_mp4: Path,
                          resolution: str, fps: int, bg_color: str):
-    """
-    Create a solid-color background video and burn ASS subtitles, mux with audio.
-    """
-    # Determine duration from audio and render matching video
     dur = audio_duration_seconds(audio_path)
     w_h = resolution
-    # Create video with subtitles burned-in
-    # We first produce a temp video, then mux audio to avoid A/V drift.
     tmp_video = out_mp4.with_suffix(".tmp_video.mp4")
 
     subfilter = f"ass={ass_path.as_posix()}"
+    info("🎬 Rendering video background and burning subtitles...")
     cmd1 = [
         "ffmpeg","-y",
         "-f","lavfi","-t", f"{dur:.3f}",
@@ -408,18 +404,18 @@ def render_karaoke_video(audio_path: Path, ass_path: Path, out_mp4: Path,
         str(out_mp4)
     ]
     run(cmd2, check=True)
-
     try:
         tmp_video.unlink()
     except Exception:
         pass
+    info(f"📽️  Final video ready → {out_mp4}")
 
 # ------------------------------ Main Flow -------------------------------- #
 
 def print_ytdlp_hint(target_mp3: Path):
     base = target_mp3.name
-    print("\nAudio file not found.")
-    print("To fetch an MP3 from YouTube, run:")
+    print("\n🎧 Audio file not found.")
+    print("💡 To fetch an MP3 from YouTube, run:")
     print(f'yt-dlp -x --audio-format mp3 "<YouTube_URL>" -o "{base}"\n')
 
 def main():
@@ -431,77 +427,62 @@ def main():
     if not lyrics_path.exists():
         die(f"Lyrics file not found: {lyrics_path}")
 
-    # Output foldering
     base = sanitize_basename(audio_path)
     out_dir = Path("output") / base
     ensure_dir(out_dir)
 
-    # Planned artifact paths
     csv_path = Path(args.csv).expanduser().resolve() if args.csv else (out_dir / f"{base}_timing.csv")
     ass_path = Path(args.ass).expanduser().resolve() if args.ass else (out_dir / f"{base}_subtitles.ass")
-    # Accompaniment audio
     buddy_mp3 = out_dir / f"{base}_buddy_mix.mp3"
     instr_mp3 = out_dir / f"{base}_instrumental.mp3"
-    final_mp4  = out_dir / f"{base}_karaoke.mp4"  # may add [buddy] suffix later
+    final_mp4  = out_dir / f"{base}_karaoke.mp4"
 
-    # Audio existence check
     if not audio_path.exists():
         print_ytdlp_hint(audio_path)
         die(f"Audio mp3 not found: {audio_path}")
 
-    # Tools existence
     ensure_bins()
 
-    # ---------------- Interactive stem selection & confirmation -----------
     stem_plan = interactive_stem_selection(no_prompt=args.no_prompt)
 
-    # Final plan summary before long-running work
-    print("\n===== PLAN SUMMARY =====")
+    print(f"\n{BLUE}===== PLAN SUMMARY ====={RESET}")
     print(f"Lyrics: {lyrics_path}")
     print(f"Audio : {audio_path}")
     print(f"Output dir: {out_dir}")
     print("\nStem levels (percent):")
     for label, key in STEM_MENU:
         print(f"  {label:<10} {stem_plan.all_levels[key]:>3}%")
-    # Decide target accompaniment:
-    # If any level != 100 OR user selected stems, we will produce buddy mix.
     any_change = any(v != 100 for v in stem_plan.all_levels.values())
     target_audio = buddy_mp3 if any_change else instr_mp3
     final_name = out_dir / (f"{base}_karaoke_buddy.mp4" if any_change else f"{base}_karaoke.mp4")
-    print(f"\nAccompaniment target: {target_audio.name}")
-    print(f"Final video target  : {final_name.name}")
+    print(f"\n🎵 Accompaniment target: {target_audio.name}")
+    print(f"🎬 Final video target  : {final_name.name}")
     print("========================\n")
 
     if not args.no_prompt:
         proceed = yes_no("Proceed with Demucs separation and audio mixing? [y/N]: ", default_no=True)
         if not proceed:
-            die("Cancelled by user before Demucs")
+            die("Cancelled by user before Demucs ❌")
 
     if args.dry_run:
         print("[dry-run] Exiting before processing.")
         return
 
-    # ---------------- Demucs separation ----------------
     demucs_out_root = out_dir / "demucs_stems"
     demucs_dir = run_demucs_separation(audio_path, args.model, args.device, demucs_out_root)
 
-    # Build accompaniment:
-    # If any_change: apply user levels. Else: create instrumental by setting vocals=0, others=100.
     levels = dict(stem_plan.all_levels)
     if not any_change:
-        levels["vocals"] = 0  # default instrumental
+        levels["vocals"] = 0
 
-    # Mix stems
+    info("🎛️  Beginning stem mixdown process...")
     target_audio = buddy_mp3 if any_change else instr_mp3
-    info("Mixing stems to accompaniment...")
     mix_stems_to_file(demucs_dir, levels, target_audio)
 
-    # ---------------- Timing CSV -----------------------
     if csv_path.exists():
-        info(f"Reusing timing CSV: {csv_path}")
+        info(f"🕒 Reusing timing CSV: {csv_path}")
         lines, starts = read_timing_csv(csv_path)
     else:
-        # read lyrics and run tap-to-time
         lines = read_text_lines(lyrics_path)
         if not lines:
             die("Lyrics file has no lines after trimming.")
@@ -509,10 +490,8 @@ def main():
             die("Timing CSV missing and --no-prompt set; cannot capture interactively.")
         starts = tap_to_time(lines, interactive=True)
         write_timing_csv(csv_path, lines, starts)
-        info(f"Saved timing CSV: {csv_path}")
+        info(f"💾 Saved timing CSV: {csv_path}")
 
-    # ---------------- ASS subtitles --------------------
-    # Always rebuild .ass so new font size, alignment, or offset take effect.
     m = re.match(r"^(\d+)x(\d+)$", args.resolution.strip().lower())
     if not m:
         die(f"Bad --resolution: {args.resolution}")
@@ -520,12 +499,12 @@ def main():
     if 'lines' not in locals() or 'starts' not in locals():
         lines, starts = read_timing_csv(csv_path)
     write_ass(ass_path, w, h, args.font_size, lines, starts, args.offset, args.line_hold)
-    info(f"Overwrote ASS: {ass_path}")
+    info(f"🖋️  Overwrote ASS: {ass_path}")
 
-    # ---------------- Final render ---------------------
-    info("Rendering final MP4 with subtitles...")
+    info("🎬 Rendering final MP4 with subtitles...")
     render_karaoke_video(target_audio, ass_path, final_name, args.resolution, args.fps, args.bg_color)
-    info(f"✅ Done. Output: {final_name}")
+    info(f"{GREEN}✅ Done. Output: {final_name}{RESET}")
+    print(f"{MAGENTA}🎉 Enjoy your karaoke video! 🎶{RESET}")
 
 if __name__ == "__main__":
     try:

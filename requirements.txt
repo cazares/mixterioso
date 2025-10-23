@@ -1,7 +1,18 @@
-requests
+# Core dependencies for Karaoke Time by Miguel
+
+# Audio processing
 soundfile
 demucs
 torch
 torchaudio
+
+# Video and subtitle generation
 ffmpeg-python
+
+# Utilities
 tqdm
+requests
+
+# Optional but useful for lyric fetchers or OpenAI integrations
+python-dotenv
+openai
