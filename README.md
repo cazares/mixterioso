@@ -1,65 +1,95 @@
 # 🎤 Karaoke Time  
 *A lyric video generator by Miguel Cazares*
 
-Karaoke Time is a Python + AppleScript toolkit that creates karaoke-style lyric videos with synchronized subtitles, smooth fade-outs, and optional instrumental separation.  
-It’s designed for musicians, performers, and hobbyists who want to quickly generate professional-quality lyric videos from a simple CSV or plain text file.
+Karaoke Time is a **Python toolkit** that creates karaoke-style lyric videos with synchronized subtitles, customizable visuals, and optional **“Perform Along Buddy”** stem mixing powered by [Demucs](https://github.com/facebookresearch/demucs).  
+It’s built for musicians, performers, and creators who want to make professional-quality karaoke or rehearsal videos straight from text files — **no DAW required**.
 
 ---
 
 ## ✨ Features
 
 ### 🎵 Audio & Timing
-- **Automatic lyric timing**
-  - Tap-to-time mode for manual synchronization
-  - Adjustable line spacing (`--lyric-block-spacing`)
-  - Fade-out only (no fade-in) for clean transitions  
-- **Offset correction** (`--offset`) for global sync tuning
+- **Tap-to-time lyric synchronization**
+  - Manual timing loop for precise control
+  - Auto-reuse of existing CSV files
+- **6-stem mixing support**
+  - Interactive volume control for vocals, bass, drums, piano, guitar, and other stems
+  - Optional “Buddy Mode” for singing/playing along with partial vocals
+- **Offset correction** (`--offset`) for fine-tuning global lyric alignment
 
 ### 🎨 Visual Output
 - **Configurable subtitles**
   - Font size (`--font-size`)
-  - Line spacing and fade duration  
+  - Resolution (`--resolution`)
+  - Background color (`--bg-color`)
 - **High-quality render**
   - H.264 + AAC MP4 output via `ffmpeg`
-  - Faststart enabled for instant web playback
+  - `+faststart` flag for instant web playback
+- **Colorized, emoji-rich console logs** for better progress visibility 🖥️🎶
 
-### 🧠 Smart Automation
-- **Lyric fetching** from Genius, LyricsFreak, or Lyrics.com (with retries)
-- **Instrumental separation** powered by [Demucs](https://github.com/facebookresearch/demucs)
-- **Automatic AppleScript integration (macOS)**
-  - Pauses/mutes Music, Spotify, QuickTime, and Chrome `<video>/<audio>` tabs during render
-  - Optionally autoplays result in QuickTime
-
-### ⚙️ Developer Options
-- `--debug` writes detailed logs (`lyrics_debug_*.log`)
-- `--test-lyric-fetching` tests lyric sources without downloading or processing audio
-- `--override-lyric-fetch-txt <file>` bypasses fetch logic and uses your local lyrics file
-- `--no-prompt` runs everything automatically with zero manual steps
+### ⚙️ Workflow Automation
+- **Automatic environment setup**
+  - Run `initialize_environment.sh` to clean caches and install dependencies
+- **Smart caching**
+  - Skips Demucs re-separation if stems already exist
+  - Reuses previously timed CSV or ASS files when available
+- **Non-interactive mode**
+  - `--no-prompt` runs everything automatically from start to finish
+- **Dry-run simulation**
+  - `--dry-run` prints all planned steps without processing
 
 ---
 
 ## 🚀 Quick Start
 
-### 1️⃣ Environment setup
-Run once — creates `demucs_env`, installs dependencies, and ensures everything is ready.
+### 1️⃣ Initialize Environment
+Run once to prepare the project and free Codespaces storage:
 
 ```bash
-python3 karaoke_start.py
+bash initialize_environment.sh
 ```
 
-### 2️⃣ Generate Karaoke Video
-Example full command:
+This will:
+- Clean temporary files and cached models  
+- Create a `demucs_env` virtual environment  
+- Install all Python dependencies automatically  
+
+Activate it afterward:
 
 ```bash
-python3 karaoke_generator.py   --artist "Vicente Fernandez"   --title "El Caballo de mi Padre"   --strip-vocals   --offset -1.75   --no-prompt   --autoplay
+source demucs_env/bin/activate
 ```
 
-### 3️⃣ Manual Lyric Timing (if needed)
-If auto-fetch fails or you want to customize timing:
+---
+
+### 2️⃣ Generate a Karaoke Video
+Example end-to-end run:
 
 ```bash
-python3 karaoke_core.py   --lyrics-txt songs/Vicente_Fernandez__El_Caballo_de_mi_Padre/lyrics/FINAL_Vicente_Fernandez_El_Caballo_de_mi_Padre.txt   --mp3 El_Caballo_de_mi_Padre_instrumental.mp3   --artist "Vicente Fernandez"   --title "El Caballo de mi Padre"   --offset -1.75   --no-prompt   --autoplay
+python3 karaoke_time_by_miguel.py \
+  --lyrics "lyrics/John_Frusciante_The_Past_Recedes.txt" \
+  --audio "songs/John_Frusciante_The_Past_Recedes.mp3" \
+  --font-size 140 \
+  --offset -2 \
+  --no-prompt
 ```
+
+You’ll be prompted (unless `--no-prompt`) to select stem volumes interactively — vocals, bass, drums, etc.  
+Once finished, you’ll find your video in `output/<song_name>/`.
+
+---
+
+### 3️⃣ Manual Lyric Timing (Optional)
+If you want to retime or manually sync a lyrics file:
+
+```bash
+python3 karaoke_time_by_miguel.py \
+  --lyrics "lyrics/MySong.txt" \
+  --audio "songs/MySong.mp3"
+```
+
+This activates **Tap-to-Time Mode** — press **Enter** when each line should appear.  
+The resulting CSV will be saved automatically for reuse.
 
 ---
 
@@ -67,51 +97,54 @@ python3 karaoke_core.py   --lyrics-txt songs/Vicente_Fernandez__El_Caballo_de_mi
 
 ```
 karaoke-time-by-miguel/
-├── karaoke_start.py
-├── karaoke_generator.py
-├── karaoke_core.py
-├── karaoke_time.py
-├── karaoke_lyric_fetcher.py
-├── pause_media.applescript
-├── songs/
-│   └── Artist__Title/
-│       ├── lyrics/
-│       │   ├── auto_*.txt
-│       │   ├── FINAL_*.txt
-│       │   └── lyrics_timing.csv
-│       └── *_instrumental.mp3
-└── output/
-    └── *.mp4
+├── karaoke_time_by_miguel.py       # All-in-one main script
+├── initialize_environment.sh       # Unified setup + cleanup
+├── lyrics/                         # Plain-text lyric files
+│   ├── Artist_Title.txt
+│   └── Artist_Title_synced.csv
+├── output/
+│   └── Artist_Title/
+│       ├── *_instrumental.mp3
+│       ├── *_buddy_mix.mp3
+│       ├── *_subtitles.ass
+│       └── *_karaoke.mp4
+└── separated/                      # Demucs-generated stems (cached)
 ```
 
 ---
 
 ## 🧩 Dependencies
 
-Automatically installed via `karaoke_start.py`:
+Installed automatically via `initialize_environment.sh` or `requirements.txt` fallback:
 
 ```
-requests
 soundfile
 demucs
 torch
 torchaudio
 ffmpeg-python
 tqdm
-yt-dlp
+requests
+python-dotenv
+openai
 ```
 
 ---
 
 ## 💡 Tips
-- If you see JSON or “403 Forbidden” errors, try again with `--test-lyric-fetching` to isolate lyric sources.
-- When `--no-prompt` is active, lyrics fetching will **still allow manual entry** if all sources fail.
-- Reuse previous instrumentals to save time — don’t delete `_instrumental.mp3` unless you need to re-separate.
+
+- 🧠 Use `--dry-run` to preview steps without processing.
+- 🎚️ You can set all stems to 100% for a full mix, or reduce vocals to 0% for instrumentals.
+- ⚡ Skipping Demucs reuse existing separated stems — much faster on re-runs.
+- 🎬 To overwrite subtitle style or offset, just rerun with new flags; ASS files regenerate automatically.
 
 ---
 
 ## 🧑‍💻 Author
 **Miguel Cazares**  
-[https://miguelengineer.com](https://miguelengineer.com)
+[https://miguelengineer.com](https://miguelengineer.com)  
+
+Built with ❤️ for musicians who love code and karaoke.
 
 ---
+# end of README.md
