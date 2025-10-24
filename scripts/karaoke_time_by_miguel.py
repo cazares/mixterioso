@@ -431,6 +431,31 @@ def main():
     out_dir = Path("output") / base
     ensure_dir(out_dir)
 
+    # ---------------------------------------------------------------
+    # 🎧 Handle YouTube URLs automatically via yt-dlp
+    # ---------------------------------------------------------------
+    if str(args.audio).startswith(("http://", "https://")):
+        url = args.audio.strip()
+        info(f"Detected YouTube URL: {url}")
+        ensure_dir(Path("songs"))
+        base = sanitize_basename(Path(url.split('v=')[-1])) or "youtube_song"
+        download_mp3 = Path("songs") / f"{base}.mp3"
+        if not download_mp3.exists():
+            info(f"Downloading audio with yt-dlp to {download_mp3} ...")
+            try:
+                run([
+                    "yt-dlp",
+                    "-x", "--audio-format", "mp3",
+                    "-o", str(download_mp3),
+                    url
+                ])
+            except subprocess.CalledProcessError as e:
+                die(f"yt-dlp failed to download audio: {e}")
+        else:
+            info(f"Reusing existing MP3: {download_mp3}")
+        audio_path = download_mp3
+
+
     csv_path = Path(args.csv).expanduser().resolve() if args.csv else (out_dir / f"{base}_timing.csv")
     ass_path = Path(args.ass).expanduser().resolve() if args.ass else (out_dir / f"{base}_subtitles.ass")
     buddy_mp3 = out_dir / f"{base}_buddy_mix.mp3"
