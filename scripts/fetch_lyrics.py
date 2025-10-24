@@ -1,148 +1,210 @@
 #!/usr/bin/env python3
-# fetch_lyrics.py
-# Minimal, robust lyric fetcher with provider fallbacks and caching.
-
+# -*- coding: utf-8 -*-
 """
-Usage:
-  export MUSIXMATCH_API_KEY="..."    # optional, best legal coverage
-  export GENIUS_ACCESS_TOKEN="..."   # optional
-  python3 fetch_lyrics.py "Artist Name" "Song Title"
-
-Behavior:
-  - Try Musixmatch (licensed) if API key present.
-  - Else try Genius via lyricsgenius if token present.
-  - Else try lyrics.ovh public endpoint.
-  - Cache each successful fetch in ./lyrics_cache/{Artist} - {Title}.txt
-  - Returns JSON with keys: ok(bool), provider, source_url, lyrics (str or None), error (str or None)
+fetch_lyrics.py — multi-provider lyric fetcher (no API keys)
+Now includes colorized + debug logging, per-request byte sizes,
+and small inter-thread delays to avoid being rate-limited.
 """
 
-from __future__ import annotations
-import os
-import sys
-import time
-import json
-import logging
-import hashlib
+import sys, re, json, time, hashlib, logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
-import backoff
+from bs4 import BeautifulSoup
+from colorama import Fore, Style, init
 
-# Prefer these libs; optional import handled below.
-try:
-    import lyricsgenius
-except Exception:
-    lyricsgenius = None
+# ----- setup -----
+init(autoreset=True)
+# Real browser UA to avoid blocking
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/118.0.0.0 Safari/537.36")
+CACHE_DIR = Path("lyrics_results")
+CACHE_DIR.mkdir(exist_ok=True)
 
-# Configuration
-CACHE_DIR = Path("./lyrics_cache")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-USER_AGENT = "karaoke-fetcher/1.0 (+https://example.invalid)"
-REQUEST_TIMEOUT = 10  # seconds
-MAX_RETRIES = 3
+class ColorFormatter(logging.Formatter):
+    COLORS = {
+        logging.INFO: Fore.CYAN,
+        logging.WARNING: Fore.YELLOW,
+        logging.ERROR: Fore.RED,
+        logging.DEBUG: Fore.WHITE,
+    }
+    def format(self, record):
+        color = self.COLORS.get(record.levelno, "")
+        prefix = f"{Fore.MAGENTA}{time.strftime('%H:%M:%S')}{Style.RESET_ALL}"
+        msg = super().format(record)
+        return f"{prefix} {color}{msg}{Style.RESET_ALL}"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(ColorFormatter("%(levelname)s %(message)s"))
+root = logging.getLogger()
+root.setLevel(logging.DEBUG)  # enable full detail
+root.handlers = [handler]
 
+# ----- util -----
+def safe_name(artist, title, provider):
+    base = f"{artist} - {title} - {provider}"
+    h = hashlib.sha1(base.encode()).hexdigest()[:8]
+    return CACHE_DIR / f"{base} [{h}].txt"
 
-def _cache_path(artist: str, title: str) -> Path:
-    safe = (artist.strip() + " - " + title.strip())
-    hashed = hashlib.sha1(safe.encode("utf-8")).hexdigest()[:10]
-    fname = f"{safe} [{hashed}].txt"
-    return CACHE_DIR / fname
+def save_result(artist, title, provider, lyrics):
+    p = safe_name(artist, title, provider)
+    p.write_text(lyrics, encoding="utf-8")
+    logging.info(f"💾 saved → {p.name}")
 
+# ----- provider 1: lyrics.ovh -----
+def lyrics_ovh(artist, title):
+    name = "lyrics.ovh"
+    url = f"https://api.lyrics.ovh/v1/{artist}/{title}"
+    logging.info(f"→ Trying {name}")
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+            logging.debug(f"{name} HTTP {r.status_code}, {len(r.text)} bytes from {url}")
+            if r.status_code == 200 and r.json().get("lyrics"):
+                return {"provider": name, "ok": True,
+                        "lyrics": r.json()["lyrics"], "url": url}
+        except Exception as e:
+            logging.warning(f"{name} timeout/err attempt {attempt}: {e}")
+        time.sleep(attempt * 2)
+    return {"provider": name, "ok": False, "error": "no lyrics"}
 
-def _save_cache(artist: str, title: str, provider: str, source_url: Optional[str], text: str) -> None:
-    p = _cache_path(artist, title)
-    meta = {"provider": provider, "source_url": source_url, "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    content = json.dumps(meta, ensure_ascii=False) + "\n\n" + text
-    p.write_text(content, encoding="utf-8")
-    logging.info("Saved cache: %s", p)
-
-
-def _load_cache(artist: str, title: str) -> Optional[Dict[str, Any]]:
-    p = _cache_path(artist, title)
-    if not p.exists():
-        return None
-    raw = p.read_text(encoding="utf-8")
+# ----- provider 2: Genius scrape -----
+def genius_scrape(artist, title):
+    name = "genius-scrape"
+    q = f"{artist} {title} site:genius.com"
+    logging.info(f"→ Trying {name}")
     try:
-        meta_raw, lyrics = raw.split("\n\n", 1)
-        meta = json.loads(meta_raw)
-        return {"meta": meta, "lyrics": lyrics}
-    except Exception:
-        return None
-
-
-# Generic requests wrapper with exponential backoff
-@backoff.on_exception(backoff.expo, (requests.RequestException,), max_tries=4)
-def _get(url: str, params=None, headers=None) -> requests.Response:
-    hdrs = {"User-Agent": USER_AGENT}
-    if headers:
-        hdrs.update(headers)
-    resp = requests.get(url, params=params, headers=hdrs, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp
-
-
-def try_musixmatch(artist: str, title: str, api_key: str) -> Dict[str, Any]:
-    """
-    Uses Musixmatch track.search -> track.lyrics.get
-    Requires MUSIXMATCH_API_KEY with proper permissions.
-    """
-    base = "https://api.musixmatch.com/ws/1.1"
-    # 1) search for track
-    try:
-        logging.info("Trying Musixmatch search for %s - %s", artist, title)
-        s = _get(f"{base}/track.search", params={
-            "q_track": title, "q_artist": artist, "f_has_lyrics": 1, "apikey": api_key, "page_size": 3
-        })
-        j = s.json()
-        list_tracks = j.get("message", {}).get("body", {}).get("track_list", [])
-        if not list_tracks:
-            return {"ok": False, "error": "No track found on Musixmatch"}
-        # pick best match (first)
-        track = list_tracks[0]["track"]
-        track_id = track["track_id"]
-        # 2) get lyrics
-        l = _get(f"{base}/track.lyrics.get", params={"track_id": track_id, "apikey": api_key})
-        lj = l.json()
-        lyrics_body = lj.get("message", {}).get("body", {}).get("lyrics", {})
-        lyrics = lyrics_body.get("lyrics_body")
-        if not lyrics:
-            return {"ok": False, "error": "No lyrics field returned by Musixmatch"}
-        # Musixmatch appends license notices; strip trailing disclaimer lines if present
-        # Common pattern: "******* This Lyrics is NOT for Commercial use *******"
-        # We'll keep first part until '...*******' if present
-        cut_idx = lyrics.find("*******")
-        if cut_idx != -1:
-            lyrics = lyrics[:cut_idx].strip()
-        source_url = track.get("track_share_url") or None
-        _save_cache(artist, title, "musixmatch", source_url, lyrics)
-        return {"ok": True, "provider": "musixmatch", "source_url": source_url, "lyrics": lyrics}
-    except requests.HTTPError as e:
-        return {"ok": False, "error": f"HTTP error from Musixmatch: {e}"}
+        search = requests.get("https://duckduckgo.com/html/",
+                              params={"q": q}, headers={"User-Agent": UA}, timeout=20)
+        logging.debug(f"{name} search resp: {search.status_code}, {len(search.text)} bytes")
+        m = re.search(r'https://genius\.com/[^\"]+', search.text)
+        if not m:
+            logging.debug(f"{name} no Genius link found; first 400 chars:\n{search.text[:400]}")
+            return {"provider": name, "ok": False, "error": "no link"}
+        url = m.group(0)
+        page = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+        logging.debug(f"{name} page resp: {page.status_code}, {len(page.text)} bytes from {url}")
+        soup = BeautifulSoup(page.text, "html.parser")
+        divs = soup.find_all("div", attrs={"data-lyrics-container": "true"})
+        if not divs:
+            divs = soup.select(".lyrics")
+        text = "\n".join(d.get_text('\n') for d in divs).strip()
+        if text:
+            return {"provider": name, "ok": True, "lyrics": text, "url": url}
     except Exception as e:
-        return {"ok": False, "error": f"Musixmatch error: {e}"}
+        return {"provider": name, "ok": False, "error": str(e)}
+    return {"provider": name, "ok": False, "error": "no lyrics"}
 
-
-def try_genius(artist: str, title: str, access_token: str) -> Dict[str, Any]:
-    """
-    Uses lyricsgenius (wrapper around Genius). lyricsgenius will search and attempt to extract
-    lyrics by fetching the song page and scraping the lyrics block.
-    """
-    if lyricsgenius is None:
-        return {"ok": False, "error": "lyricsgenius library not installed"}
+# ----- provider 3: Fandom scrape -----
+def fandom_scrape(artist, title):
+    name = "lyrics.fandom"
+    logging.info(f"→ Trying {name}")
+    search_url = f"https://lyrics.fandom.com/wiki/{artist.replace(' ', '_')}:{title.replace(' ', '_')}"
     try:
-        logging.info("Trying Genius for %s - %s", artist, title)
-        g = lyricsgenius.Genius(access_token, timeout=REQUEST_TIMEOUT, skip_non_songs=True, excluded_terms=["(Remix)", "(Live)"])
-        # reduce rate pressure
-        g.headers["User-Agent"] = USER_AGENT
-        song = g.search_song(title, artist)
-        if not song:
-            return {"ok": False, "error": "Genius did not return song"}
-        lyrics = song.lyrics
-        source_url = song.url if hasattr(song, "url") else None
-        if not lyrics:
-            return {"ok": False, "error": "No lyrics returned from Genius (page may be blocked)"}
-        _save_cache(artist, title, "genius", source_url, lyrics)
-        return {"ok": True, "provider": "genius", "source_url": source_url, "lyrics": lyrics}
-    e
+        page = requests.get(search_url, headers={"User-Agent": UA}, timeout=20)
+        logging.debug(f"{name} HTTP {page.status_code}, {len(page.text)} bytes from {search_url}")
+        soup = BeautifulSoup(page.text, "html.parser")
+        box = soup.find("div", {"class": "lyricbox"})
+        if box:
+            for br in box.find_all(["br", "script"]):
+                br.replace_with("\n")
+            text = box.get_text("\n").strip()
+            if text:
+                return {"provider": name, "ok": True, "lyrics": text, "url": search_url}
+    except Exception as e:
+        return {"provider": name, "ok": False, "error": str(e)}
+    return {"provider": name, "ok": False, "error": "no lyrics"}
+
+# ----- provider 4: generic search-engine scrape -----
+def search_engine_scrape(artist, title):
+    name = "search-engine"
+    q = f'{artist} {title} lyrics'
+    logging.info(f"→ Trying {name}")
+    try:
+        r = requests.get("https://duckduckgo.com/html/",
+                         params={"q": q}, headers={"User-Agent": UA}, timeout=20)
+        logging.debug(f"{name} search HTTP {r.status_code}, {len(r.text)} bytes")
+        urls = re.findall(r'https://[^\"]+', r.text)
+        seen = set()
+        for u in urls:
+            if any(bad in u for bad in ["youtube", "spotify", "wikipedia", "duckduckgo"]) or u in seen:
+                continue
+            seen.add(u)
+            try:
+                page = requests.get(u, headers={"User-Agent": UA}, timeout=15)
+                logging.debug(f"{name} candidate {u} -> {page.status_code}, {len(page.text)} bytes")
+                if not page.ok:
+                    continue
+                soup = BeautifulSoup(page.text, "html.parser")
+                txt = soup.get_text(separator="\n")
+                if "lyrics" in txt.lower() and len(txt.split()) > 50:
+                    snippet = "\n".join(txt.splitlines()[:400])
+                    return {"provider": name, "ok": True, "lyrics": snippet, "url": u}
+            except Exception as inner:
+                logging.debug(f"{name} inner error {inner} for {u}")
+                continue
+    except Exception as e:
+        return {"provider": name, "ok": False, "error": str(e)}
+    return {"provider": name, "ok": False, "error": "no lyrics found"}
+
+# ----- provider 5: wikipedia summary search -----
+def wikipedia_summary(artist, title):
+    name = "wikipedia"
+    logging.info(f"→ Trying {name}")
+    q = f"{artist} {title} song"
+    try:
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{q.replace(' ', '_')}"
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+        logging.debug(f"{name} HTTP {r.status_code}, {len(r.text)} bytes from {url}")
+        if r.status_code == 200:
+            data = r.json()
+            extract = data.get("extract")
+            if extract:
+                snippet = extract.strip()
+                return {"provider": name, "ok": True, "lyrics": snippet, "url": data.get("content_urls", {}).get("desktop", {}).get("page", url)}
+        return {"provider": name, "ok": False, "error": "no summary"}
+    except Exception as e:
+        return {"provider": name, "ok": False, "error": str(e)}
+
+# ----- main orchestration -----
+def fetch_all(artist, title):
+    funcs = [lyrics_ovh, genius_scrape, fandom_scrape, search_engine_scrape, wikipedia_summary]
+    results = []
+    with ThreadPoolExecutor(max_workers=len(funcs)) as ex:
+        futs = {}
+        for f in funcs:
+            logging.debug(f"Scheduling {f.__name__}")
+            time.sleep(0.3)
+            fut = ex.submit(f, artist, title)
+            futs[fut] = f.__name__
+        for fut in as_completed(futs):
+            res = fut.result()
+            results.append(res)
+            if res.get("ok"):
+                logging.info(Fore.GREEN + f"✅ {res['provider']} success")
+                save_result(artist, title, res["provider"], res["lyrics"])
+            else:
+                logging.warning(f"❌ {res['provider']} failed: {res.get('error')}")
+    return results
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: python3 scripts/fetch_lyrics.py 'Artist' 'Song'")
+        sys.exit(1)
+    artist, title = sys.argv[1], sys.argv[2]
+    logging.info(f"🎵 Fetching lyrics for: {artist} — {title}")
+    out = fetch_all(artist, title)
+    ok = [r for r in out if r.get("ok")]
+    summary = {
+        "artist": artist,
+        "title": title,
+        "total_sources": len(out),
+        "successes": len(ok),
+        "providers": [r["provider"] for r in ok],
+    }
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
+# end of fetch_lyrics.py
