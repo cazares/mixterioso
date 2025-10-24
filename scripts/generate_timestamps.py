@@ -2,35 +2,38 @@
 # -*- coding: utf-8 -*-
 """
 generate_timestamps.py
-───────────────────────
-Downloads audio (YouTube or local file), converts to MP3,
-then uses local OpenAI Whisper to create timestamp CSVs
-with "sample_lyric_N" placeholders.
-
-No API key required. All filenames use underscores.
+Generates karaoke_time_by_miguel.py-compatible CSV timing data from audio.
+Steps:
+  1) Optional YouTube download (via yt-dlp)
+  2) Local Whisper transcription
+  3) Merge Whisper start times with lyric lines from .txt
+  4) Output CSV with headers: line,start
 """
 
-import os, sys, csv, time, logging, subprocess
+import csv
+import logging
+import subprocess
 from pathlib import Path
-from dotenv import load_dotenv
-import whisper  # local model
+import whisper
+import sys
 
-# ----- setup -----
-load_dotenv()
-SONGS_DIR = Path("songs")
-LYRICS_DIR = Path("lyrics")
+# ------------------------- Directories ------------------------- #
+ROOT_DIR = Path(__file__).resolve().parent.parent
+SONGS_DIR = ROOT_DIR / "songs"
+LYRICS_DIR = ROOT_DIR / "lyrics"
 SONGS_DIR.mkdir(exist_ok=True)
 LYRICS_DIR.mkdir(exist_ok=True)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ------------------------- Logging Setup ----------------------- #
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+)
 
-# ----- helpers -----
-def is_youtube_url(s: str) -> bool:
-    return ("youtube.com" in s) or ("youtu.be" in s)
-
+# ------------------------- Helpers ----------------------------- #
 def sanitize_filename(name: str) -> str:
-    """Replace spaces with underscores and strip illegal chars."""
-    return name.replace(" ", "_").replace("/", "_")
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in name).strip("_")
 
 def download_audio(url: str) -> Path:
     """Download YouTube audio via yt-dlp and return MP3 path with underscores."""
@@ -43,16 +46,8 @@ def download_audio(url: str) -> Path:
         "-o", str(output_path),
         url,
     ]
-    try:
-        subprocess.run(cmd, check=True, text=True)
-    except subprocess.CalledProcessError as e:
-        logging.error(f"yt-dlp failed: {e}")
-        sys.exit(2)
-
+    subprocess.run(cmd, check=True, text=True)
     mp3_files = sorted(SONGS_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not mp3_files:
-        logging.error("No MP3 found after download.")
-        sys.exit(3)
     latest = mp3_files[0]
     fixed_name = sanitize_filename(latest.stem) + ".mp3"
     fixed_path = latest.with_name(fixed_name)
@@ -65,14 +60,39 @@ def whisper_segments(audio_path: Path):
     """Run local Whisper transcription."""
     logging.info(f"🎧 Transcribing locally: {audio_path}")
     try:
-        model = whisper.load_model("small")  # choose tiny, small, base, medium, large
+        model = whisper.load_model("small")
         result = model.transcribe(str(audio_path), verbose=False)
-        segments = result.get("segments", [])
-        logging.info(f"Received {len(segments)} segments from Whisper (local)")
-        return segments
+        # Return the list of segments directly
+        return result.get("segments", [])
     except Exception as e:
         logging.error(f"Local Whisper transcription failed: {e}")
         return []
+
+def write_karaoke_csv(csv_path: Path, txt_path: Path, segments: list):
+    """Write CSV compatible with karaoke_time_by_miguel.py (headers: line,start)."""
+    import csv, logging
+
+    if not txt_path.exists():
+        logging.error(f"Lyrics file not found: {txt_path}")
+        return
+
+    # Load text lines
+    with open(txt_path, "r", encoding="utf-8") as f:
+        lyric_lines = [line.strip() for line in f if line.strip()]
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["line", "start"])
+        if len(lyric_lines) != len(segments):
+            logging.warning(
+                f"CAUTION: lyrics count ({len(lyric_lines)}) "
+                f"!= segment count ({len(segments)})."
+            )
+        for i, seg in enumerate(segments):
+            start = float(seg.get("start", 0))
+            text = lyric_lines[i] if i < len(lyric_lines) else f"sample_line_{i+1}"
+            writer.writerow([text, f"{start:.3f}"])
+    logging.info(f"✅ Wrote karaoke CSV → {csv_path}")
 
 def make_csv_from_segments(segments, out_path):
     """Write [start,end,sample_lyric_N] CSV."""
@@ -85,32 +105,34 @@ def make_csv_from_segments(segments, out_path):
             writer.writerow([start, end, f"sample_lyric_{i+1}"])
     logging.info(f"✅ CSV written: {out_path}")
 
-# ----- main -----
+# ------------------------- Main CLI ---------------------------- #
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 scripts/generate_timestamps.py <audiofile.mp3 | youtube_url>")
-        sys.exit(1)
+    import argparse
+    ap = argparse.ArgumentParser(description="Generate timestamp CSVs for karaoke_time_by_miguel.py")
+    ap.add_argument("--audio", help="Path to .mp3 or YouTube URL", required=True)
+    ap.add_argument("--text", help="Path to .txt lyrics file", required=True)
+    args = ap.parse_args()
 
-    source = sys.argv[1]
-    if is_youtube_url(source):
-        audio_path = download_audio(source)
-    else:
-        audio_path = Path(source)
-        if not audio_path.exists():
-            logging.error(f"Audio file not found: {audio_path}")
-            sys.exit(2)
+    audio_path = Path(args.audio)
+    if str(audio_path).startswith(("http://", "https://")):
+        audio_path = download_audio(args.audio)
 
     csv_name = sanitize_filename(audio_path.stem) + "_timestamps.csv"
-    out = LYRICS_DIR / csv_name
+    csv_path = LYRICS_DIR / csv_name
 
-    t0 = time.time()
-    segs = whisper_segments(audio_path)
-    if not segs:
-        logging.error("No segments returned; exiting")
-        sys.exit(3)
-    make_csv_from_segments(segs, out)
-    logging.info(f"Done in {time.time() - t0:.1f}s")
+    segments = whisper_segments(audio_path)
+    write_karaoke_csv(csv_path, txt_path, result["segments"])
+
+    logging.info(f"✅ Done. CSV saved at {csv_path}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAborted by user.")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        sys.exit(1)
+
 # end of generate_timestamps.py
