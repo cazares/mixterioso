@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-align_lines_from_words.py — precise word-level lyric alignment (no gaps, no padding)
-Drops 'end' column for Karaoke-Time compatibility.
+align_lines_from_words.py
+Align lyric lines to word-level Whisper timestamps (auto-detects JSON layout).
+Compatible with:
+  - whisper_timestamped / whisperX JSON (segments[*].words[*])
+  - faster_whisper (flat list of words)
+  - plain lists of dicts with start/end/text fields
+Outputs CSV with "line,start" at millisecond precision.
 """
 
-import csv, json, logging, sys
+import json, csv, logging, sys
 from pathlib import Path
 
 logging.basicConfig(
@@ -14,21 +19,60 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
+# ----------------------------- helpers ----------------------------- #
+
+def extract_words(data):
+    """Return flat list of {text,start,end} dicts from any known whisper format."""
+    words = []
+
+    # Case 1: dict with segments[]
+    if isinstance(data, dict):
+        if "segments" in data:
+            for seg in data["segments"]:
+                for w in seg.get("words", []):
+                    if all(k in w for k in ("start", "end")):
+                        words.append({
+                            "text": w.get("text", w.get("word", "")).strip(),
+                            "start": round(float(w["start"]), 3),
+                            "end": round(float(w["end"]), 3),
+                        })
+        elif "results" in data:  # alternate nesting
+            for seg in data["results"]:
+                for w in seg.get("words", []):
+                    if all(k in w for k in ("start", "end")):
+                        words.append({
+                            "text": w.get("text", w.get("word", "")).strip(),
+                            "start": round(float(w["start"]), 3),
+                            "end": round(float(w["end"]), 3),
+                        })
+    # Case 2: top-level list of word dicts
+    elif isinstance(data, list):
+        for w in data:
+            if isinstance(w, dict) and all(k in w for k in ("start", "end")):
+                words.append({
+                    "text": w.get("text", w.get("word", "")).strip(),
+                    "start": round(float(w["start"]), 3),
+                    "end": round(float(w["end"]), 3),
+                })
+    return words
+
+# ----------------------------- main logic ----------------------------- #
+
 def align_lines(json_path: Path, txt_path: Path, output_csv: Path):
     data = json.loads(json_path.read_text(encoding="utf-8"))
-    segs = data.get("segments") if isinstance(data, dict) else data
-    if not segs:
-        logging.error("💀 No segments found in JSON.")
-        sys.exit(1)
+    words = extract_words(data)
 
-    # flatten all words into one list
-    words = []
-    for s in segs:
-        for w in s.get("words", []):
-            if "start" in w and "end" in w:
-                words.append(w)
     if not words:
-        logging.error("💀 No word-level timing data found in JSON.")
+        logging.error("💀 No usable word-level timing data found.")
+        # debug snapshot
+        if isinstance(data, dict):
+            logging.error(f"Top-level keys: {list(data.keys())[:10]}")
+            first_key = next(iter(data), None)
+            logging.error(f"First item under first key: {str(data.get(first_key))[:400]}")
+        elif isinstance(data, list):
+            logging.error(f"Top-level is list with {len(data)} elements.")
+            if data:
+                logging.error(f"First element sample: {str(data[0])[:400]}")
         sys.exit(1)
 
     lines = [l.strip() for l in txt_path.read_text(encoding="utf-8").splitlines() if l.strip()]
@@ -36,45 +80,56 @@ def align_lines(json_path: Path, txt_path: Path, output_csv: Path):
         logging.error("❌ Lyrics TXT is empty.")
         sys.exit(1)
 
-    logging.info(f"🎧 Aligning {len(lines)} lines using {len(words)} words (no padding)...")
+    logging.info(f"🎧 Aligning {len(lines)} lyric lines using {len(words)} words...")
 
+    # fuzzy: use start of first matching word (and optionally 2nd word) for each line
     mapped = []
-    word_index = 0
-    n_words = len(words)
+    lw_total = len(lines)
+    w_total = len(words)
 
-    for line in lines:
-        line_words = line.lower().split()
-        match_window = words[word_index : word_index + 50]
-        # find best approximate start in next ~50 words
-        best_idx = word_index
-        for k in range(len(match_window)):
-            if match_window[k]["word"].lower().startswith(line_words[0][:3]):
-                best_idx = word_index + k
-                break
-        start_time = float(words[best_idx]["start"])
-        mapped.append([line, f"{start_time:.6f}"])
-        word_index = min(best_idx + len(line_words), n_words - 1)
+    for idx, line in enumerate(lines):
+        line_words = [w.lower() for w in line.split()]
+        if not line_words:
+            continue
+
+        # search using first 1–2 words
+        first1, first2 = line_words[0][:3], line_words[1][:3] if len(line_words) > 1 else None
+        start_time = None
+
+        for i in range(w_total - 1):
+            w1 = words[i]["text"].lower().strip()
+            w2 = words[i + 1]["text"].lower().strip() if i + 1 < w_total else ""
+            if w1.startswith(first1):
+                if not first2 or w2.startswith(first2):
+                    start_time = words[i]["start"]
+                    break
+
+        # fallback: try fuzzy last words match if still none
+        if start_time is None:
+            last1 = line_words[-1][:3]
+            for w in reversed(words):
+                if w["text"].lower().startswith(last1):
+                    start_time = w["start"]
+                    break
+
+        mapped.append([line, f"{start_time if start_time else 0.000:.3f}"])
 
     with output_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["line", "start"])
-        writer.writerows(mapped)
+        w = csv.writer(f)
+        w.writerow(["line", "start"])
+        w.writerows(mapped)
 
-    logging.info(
-        f"✅ Alignment complete:\n"
-        f"  • {len(lines)} lyric lines\n"
-        f"  • {len(words)} total words\n"
-        f"  → {output_csv.name} (no silence, ms precision)"
-    )
+    logging.info(f"✅ Alignment complete → {output_csv} ({len(mapped)} lines)")
+
+# ----------------------------- CLI ----------------------------- #
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="Align lyric lines using word-level Whisper JSON (no gaps).")
+    ap = argparse.ArgumentParser(description="Align lyric lines using Whisper word-level timestamps (auto-detect format).")
     ap.add_argument("--json", required=True)
     ap.add_argument("--text", required=True)
     ap.add_argument("--output", required=True)
     args = ap.parse_args()
-
     align_lines(Path(args.json), Path(args.text), Path(args.output))
 
 if __name__ == "__main__":
