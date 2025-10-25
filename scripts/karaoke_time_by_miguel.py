@@ -264,7 +264,7 @@ ASS_HEADER_TEMPLATE = """[Script Info]
 ScriptType: v4.00+
 PlayResX: {w}
 PlayResY: {h}
-WrapStyle: 2
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 YCbCr Matrix: TV.601
 
@@ -689,6 +689,14 @@ def main():
     )
     info(f"{GREEN}✅ Done. Output: {final_mp4}{RESET}")
     print(f"{MAGENTA}🎉 Enjoy your karaoke video 🎶{RESET}")
+
+    # Offer to open folder or video
+    choice = input("\nOpen output folder or video? [f=folder / v=video / n=none]: ").strip().lower()
+    if choice == "f":
+        subprocess.run(["open", str(final_mp4.parent)])
+    elif choice == "v":
+        subprocess.run(["open", str(final_mp4)])
+
 
 # ------------- guard ------------- #
 
