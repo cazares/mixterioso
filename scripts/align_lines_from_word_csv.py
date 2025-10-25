@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-align_lines_from_word_csv.py — align lyric lines to word-level CSV timestamps.
+align_lines_from_word_csv.py — sequential alignment using word-level timestamps.
 Features:
-  • Sort by start time
-  • Merge lines that share the *exact same* timestamp
-  • 3-decimal precision output
+  • Moves forward through word stream (no backtracking)
+  • Sorts by start time
+  • Merges only identical timestamps (exact to 3 decimals)
+  • Outputs 3-decimal precision
 """
 
 import csv, re, sys
@@ -35,33 +36,25 @@ def read_word_csv(path: Path):
             })
     return words
 
-def find_line_start(line_words, word_stream):
-    """Return best start time for this lyric line."""
-    if not line_words:
-        return None
-
+def find_line_start(line_words, word_stream, start_index):
+    """
+    Sequential scan: find first match of line_words after start_index.
+    Returns (start_time, next_index)
+    """
+    n = len(word_stream)
     lw_first = line_words[0]
     lw_second = line_words[1] if len(line_words) > 1 else None
-    lw_last = line_words[-1]
-    lw_prev = line_words[-2] if len(line_words) > 1 else None
 
-    best_idx = None
-    for i in range(len(word_stream)):
+    for i in range(start_index, n):
         w = word_stream[i]["word"]
         if w == lw_first:
-            if lw_second and i + 1 < len(word_stream) and word_stream[i + 1]["word"] == lw_second:
-                best_idx = i
-                break
-            elif not lw_second:
-                best_idx = i
-                break
-        elif w == lw_last and lw_prev and i > 0 and word_stream[i - 1]["word"] == lw_prev:
-            best_idx = i - 1
-            break
-
-    if best_idx is not None:
-        return word_stream[best_idx]["start"]
-    return None
+            if lw_second and i + 1 < n and word_stream[i + 1]["word"] == lw_second:
+                return word_stream[i]["start"], i + len(line_words)
+            else:
+                return word_stream[i]["start"], i + len(line_words)
+    # if no match found, return previous time
+    last_time = word_stream[-1]["start"] if word_stream else 0.0
+    return last_time, n
 
 def align_lines(word_csv: Path, txt_path: Path, output_csv: Path):
     words = read_word_csv(word_csv)
@@ -75,24 +68,25 @@ def align_lines(word_csv: Path, txt_path: Path, output_csv: Path):
 
     raw_rows = []
     prev_time = 0.0
+    idx = 0
     for line in lines:
         line_norm = normalize(line)
         line_words = line_norm.split()
-        t = find_line_start(line_words, words)
+        if not line_words:
+            continue
+        t, idx = find_line_start(line_words, words, idx)
         if t is None:
             t = prev_time
         raw_rows.append((line, round(t, 3)))
         prev_time = t
 
-    # group only by *identical* timestamps
+    # merge identical timestamps only
     merged = defaultdict(list)
     for line, t in raw_rows:
         merged[t].append(line)
 
-    # sort numerically by start
     sorted_items = sorted(merged.items(), key=lambda x: x[0])
 
-    # write final merged CSV
     with output_csv.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["line","start"])
@@ -104,12 +98,11 @@ def align_lines(word_csv: Path, txt_path: Path, output_csv: Path):
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="Align lyric lines using per-word CSV timestamps (sorted + exact-merge).")
+    ap = argparse.ArgumentParser(description="Sequentially align lyric lines using per-word CSV timestamps.")
     ap.add_argument("--words", required=True, help="CSV file from extract_words_to_csv.py")
     ap.add_argument("--text", required=True, help="Lyrics .txt file")
     ap.add_argument("--output", required=True, help="Output CSV path")
     args = ap.parse_args()
-
     align_lines(Path(args.words), Path(args.text), Path(args.output))
 
 if __name__ == "__main__":
