@@ -3,10 +3,10 @@
 """
 generate_timestamps.py
 Generates karaoke_time_by_miguel.py-compatible CSV timing data from audio.
-Now uses WhisperX forced alignment (float32 mode) and skips fade effects.
+Now uses WhisperX or Faster-Whisper (--refresh-csv) and decodes audio via ffmpeg-python.
 """
 
-import csv, logging, subprocess, sys
+import csv, logging, subprocess, sys, json, tempfile
 from pathlib import Path
 
 # ------------------------- Directories ------------------------- #
@@ -96,7 +96,6 @@ def write_karaoke_csv(csv_path: Path, txt_path: Path, segs: list):
     if not txt_path.exists():
         logging.error(f"{RED}Lyrics file not found:{RESET} {txt_path}")
         return
-
     lines = [l.strip() for l in txt_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -113,79 +112,49 @@ def validate_and_fix_csv(csv_path: Path):
         with csv_path.open("r", encoding="utf-8") as f:
             rows = list(csv.reader(f))
         if len(rows) <= 1:
-            logging.warning(f"{csv_path.name} is empty or header-only.")
             return False
         headers = [h.strip().lower() for h in rows[0]]
         if headers == ["line", "start"]:
-            logging.info(f"✅ CSV already valid: {csv_path.name}")
             return True
         if set(headers) >= {"start", "end", "text"}:
             fixed = [["line", "start"]] + [[r[2], r[0]] for r in rows[1:] if len(r) >= 3]
             with csv_path.open("w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerows(fixed)
-            logging.info(f"🩹 Fixed [start,end,text] CSV → {csv_path.name}")
             return True
-        logging.warning(f"❓ Unknown CSV format in {csv_path.name}")
         return False
-    except Exception as e:
-        logging.error(f"Error validating CSV: {e}")
+    except Exception:
         return False
 
-# ------------------------- Line Count Check ---------------------- #
 def warn_if_linecount_mismatch(txt_path: Path, csv_path: Path):
-    """Compare line counts between lyrics TXT and timestamps CSV, and warn if mismatch."""
     try:
         if not txt_path.exists() or not csv_path.exists():
             return
-
-        # Read text lines
         text_lines = [l.strip() for l in txt_path.read_text(encoding="utf-8").splitlines() if l.strip()]
-        # Read CSV lines (skip header)
         with csv_path.open("r", encoding="utf-8") as f:
             rows = list(csv.reader(f))
         csv_lines = [r[0].strip() for r in rows[1:] if len(r) >= 1 and r[0].strip()]
-
-        txt_count, csv_count = len(text_lines), len(csv_lines)
-
-        if txt_count != csv_count:
-            diff = abs(txt_count - csv_count)
-            logging.warning(
-                f"\n{YELLOW}⚠️  MISMATCH DETECTED between lyrics and timestamps:{RESET}\n"
-                f"  Lyrics TXT lines : {txt_count}\n"
-                f"  CSV timestamp lines : {csv_count}\n"
-                f"  Difference : {diff} line(s)\n"
-            )
-            logging.warning(
-                f"{MAGENTA}🔍 Preview of differences:{RESET}\n"
-                f"  First few TXT lines ({min(5, txt_count)}): {text_lines[:5]}\n"
-                f"  First few CSV lines ({min(5, csv_count)}): {csv_lines[:5]}\n"
-            )
-            logging.warning(
-                f"{YELLOW}💡 Fix suggestion:{RESET} Re-run forced alignment or manually trim/extend CSV to match lyrics."
-            )
+        if len(text_lines) != len(csv_lines):
+            logging.warning(f"⚠️ Lyrics {len(text_lines)} vs CSV {len(csv_lines)} lines differ.")
         else:
-            logging.info(f"{GREEN}✅ Line counts match ({txt_count} each).{RESET}")
-
+            logging.info(f"{GREEN}✅ Line counts match.{RESET}")
     except Exception as e:
-        logging.error(f"{RED}Error comparing line counts:{RESET} {e}")
+        logging.error(f"Mismatch check error: {e}")
 
 # ------------------------- Main CLI ----------------------------- #
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Generate timestamp CSVs for karaoke_time_by_miguel.py")
-    ap.add_argument("--audio", help="Path to .mp3 or YouTube URL", required=True)
-    ap.add_argument("--text", help="Path to .txt lyrics file", required=True)
-    ap.add_argument("--title", help="Optional clean title hint for naming", default=None)
+    ap.add_argument("--audio", required=True)
+    ap.add_argument("--text", required=True)
+    ap.add_argument("--title", default=None)
     args = ap.parse_args()
 
     txt_path = Path(args.text)
     csv_name = sanitize_filename(txt_path.stem) + "_timestamps.csv"
     csv_path = LYRICS_DIR / csv_name
-
-    # 🔍 Check if MP3 already exists
     mp3_path = SONGS_DIR / (sanitize_filename(args.title or txt_path.stem) + ".mp3")
+
     if mp3_path.exists():
-        logging.info(f"🎵 Using existing MP3 → {mp3_path.name}")
         audio_path = mp3_path
     else:
         if str(args.audio).startswith(("http://", "https://")):
@@ -193,36 +162,69 @@ def main():
         else:
             audio_path = Path(args.audio).expanduser().resolve()
 
-    # Validate or regenerate CSV
-    if csv_path.exists():
-        logging.info(f"📂 Found existing CSV → {csv_path.name}")
-        if validate_and_fix_csv(csv_path):
-            logging.info("✅ CSV valid. Skipping transcription.")
-            warn_if_linecount_mismatch(txt_path, csv_path)
-            return
-        logging.info("🔁 CSV invalid or empty, regenerating...")
+    if csv_path.exists() and validate_and_fix_csv(csv_path):
+        warn_if_linecount_mismatch(txt_path, csv_path)
+        return
 
     segs = whisperx_segments(audio_path, txt_path)
     if not segs:
-        logging.error("💀 No segments returned. Aborting.")
+        logging.error("💀 No segments returned.")
         return
-
     write_karaoke_csv(csv_path, txt_path, segs)
-
-    # Warn about mismatched line counts
     warn_if_linecount_mismatch(txt_path, csv_path)
+    logging.info(f"{GREEN}✅ Done → {csv_path}{RESET}")
 
-    logging.info(f"{GREEN}✅ Done. CSV saved at:{RESET} {csv_path}")
+# ------------------------- Faster-Whisper Mode ----------------------------- #
+if __name__ == "__main__" and "--refresh-csv" in sys.argv:
+    import argparse
+    import ffmpeg, numpy as np, soundfile as sf
+    from faster_whisper import WhisperModel
 
-# ------------------------- Entry Point -------------------------- #
-if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--audio", required=True)
+    ap.add_argument("--text", required=True)
+    ap.add_argument("--title", required=True)
+    ap.add_argument("--refresh-csv", action="store_true")
+    args, _ = ap.parse_known_args()
+
+    def decode_audio_ffmpeg(path):
+        tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+        (
+            ffmpeg.input(str(path))
+            .output(tmp_wav, format="wav", acodec="pcm_s16le", ac=1, ar="16000")
+            .overwrite_output()
+            .run(quiet=True)
+        )
+        audio, sr = sf.read(tmp_wav, dtype="float32")
+        return audio, sr
+
     try:
-        main()
-    except KeyboardInterrupt:
-        print("\nAborted by user.")
-        sys.exit(1)
+        title = sanitize_filename(args.title)
+        json_out = LYRICS_DIR / f"{title}_full.json"
+        csv_out = LYRICS_DIR / f"{title}_timestamps.csv"
+
+        model = WhisperModel("small", device="cpu", compute_type="float32")
+        audio_data, sr = decode_audio_ffmpeg(Path(args.audio))
+        segments, info = model.transcribe(audio_data, language="en")
+
+        data = [{"start": seg.start, "end": seg.end, "text": seg.text.strip()} for seg in segments]
+        json_out.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        txt_path = Path(args.text)
+        lines = [l.strip() for l in txt_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        with csv_out.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["line", "start"])
+            for i, seg in enumerate(data):
+                lyric = lines[i] if i < len(lines) else seg["text"]
+                writer.writerow([lyric, f"{seg['start']:.3f}"])
+
+        print(f"✅ Refreshed CSV + JSON → {csv_out.name}, {json_out.name}")
     except Exception as e:
-        logging.error(f"Error: {e}")
+        print(f"💀 Faster-Whisper refresh failed: {e}")
         sys.exit(1)
+
+elif __name__ == "__main__":
+    main()
 
 # end of generate_timestamps.py

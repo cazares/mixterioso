@@ -1,0 +1,2450 @@
+{
+  "text": " All around the world, we can make time Roppin' and I'm stoppin' cause I'm in my pump Born in the north, it's warm to entertain ya Cause I'm down for the state of Pennsylvania I try not to whine but I must warn ya About the motherfuckers of California Alabama babysitter, hallelujah Good fucker, I wish I knew ya I know, I know for sure That life is beautiful around the world I know, I know it's you You say hello and then I say I do Come back baby cause I like to say I've been around the world back from Bombay Fox or love, pop in your face Livin' in and out of a big fat suitcase Bonafide, I step aside, my Johnson Yes I could, in the woods of Wisconsin I wake up the cake at the lake, she's kissin' me As we do when they do in Sicily I know, I know for sure That life is beautiful around the world I know, I know it's you You say hello and then I say I do Where you wanna go, who you wanna be What you wanna do, just come with me I saw God, then I saw the fountains You and me, well sittin' in the Swiss mountains Me oh my oh, me and I oh Freer than a bird cause we're rockin' oh I hope around the world I feel dutiful Take a wife cause life is dutiful I know, I know for sure Bing bang dong dong, bing bang dong dong, bing bang I know, I know it's you Bing bang dong dong, bing bang dong dong, bing bang Mother Russia's too dark so far I know you're fallin' up Up in the round the world And I have seen your love I know, I know it's you You say hello and then I say I do I know, I know for sure Bing bang dong dong, bing bang dong dong, bing bang I know, I know for sure Bing bang dong dong, bing bang dong dong, bing bang",
+  "segments": [
+    {
+      "start": 32.06,
+      "end": 34.26,
+      "text": " All around the world, we can make time",
+      "confidence": 0.84,
+      "words": [
+        {
+          "text": "All",
+          "start": 32.06,
+          "end": 32.28,
+          "confidence": 0.28
+        },
+        {
+          "text": "around",
+          "start": 32.28,
+          "end": 32.6,
+          "confidence": 0.98
+        },
+        {
+          "text": "the",
+          "start": 32.6,
+          "end": 32.74,
+          "confidence": 0.99
+        },
+        {
+          "text": "world,",
+          "start": 32.74,
+          "end": 33.14,
+          "confidence": 0.99
+        },
+        {
+          "text": "we",
+          "start": 33.34,
+          "end": 33.48,
+          "confidence": 0.94
+        },
+        {
+          "text": "can",
+          "start": 33.48,
+          "end": 33.7,
+          "confidence": 0.98
+        },
+        {
+          "text": "make",
+          "start": 33.7,
+          "end": 33.94,
+          "confidence": 0.99
+        },
+        {
+          "text": "time",
+          "start": 33.94,
+          "end": 34.26,
+          "confidence": 0.98
+        }
+      ]
+    },
+    {
+      "start": 34.56,
+      "end": 36.74,
+      "text": " Roppin' and I'm stoppin' cause I'm in my pump",
+      "confidence": 0.71,
+      "words": [
+        {
+          "text": "Roppin'",
+          "start": 34.56,
+          "end": 34.98,
+          "confidence": 0.53
+        },
+        {
+          "text": "and",
+          "start": 34.98,
+          "end": 35.1,
+          "confidence": 0.94
+        },
+        {
+          "text": "I'm",
+          "start": 35.1,
+          "end": 35.3,
+          "confidence": 0.5
+        },
+        {
+          "text": "stoppin'",
+          "start": 35.3,
+          "end": 35.56,
+          "confidence": 0.9
+        },
+        {
+          "text": "cause",
+          "start": 35.56,
+          "end": 35.66,
+          "confidence": 0.69
+        },
+        {
+          "text": "I'm",
+          "start": 35.66,
+          "end": 36.0,
+          "confidence": 0.99
+        },
+        {
+          "text": "in",
+          "start": 36.0,
+          "end": 36.14,
+          "confidence": 0.99
+        },
+        {
+          "text": "my",
+          "start": 36.14,
+          "end": 36.48,
+          "confidence": 0.98
+        },
+        {
+          "text": "pump",
+          "start": 36.48,
+          "end": 36.74,
+          "confidence": 0.44
+        }
+      ]
+    },
+    {
+      "start": 37.02,
+      "end": 39.36,
+      "text": " Born in the north, it's warm to entertain ya",
+      "confidence": 0.72,
+      "words": [
+        {
+          "text": "Born",
+          "start": 37.02,
+          "end": 37.3,
+          "confidence": 0.85
+        },
+        {
+          "text": "in",
+          "start": 37.3,
+          "end": 37.54,
+          "confidence": 0.99
+        },
+        {
+          "text": "the",
+          "start": 37.54,
+          "end": 37.72,
+          "confidence": 0.94
+        },
+        {
+          "text": "north,",
+          "start": 37.72,
+          "end": 37.96,
+          "confidence": 0.36
+        },
+        {
+          "text": "it's",
+          "start": 37.98,
+          "end": 38.26,
+          "confidence": 0.71
+        },
+        {
+          "text": "warm",
+          "start": 38.26,
+          "end": 38.38,
+          "confidence": 0.27
+        },
+        {
+          "text": "to",
+          "start": 38.38,
+          "end": 38.66,
+          "confidence": 0.99
+        },
+        {
+          "text": "entertain",
+          "start": 38.66,
+          "end": 39.16,
+          "confidence": 1.0
+        },
+        {
+          "text": "ya",
+          "start": 39.16,
+          "end": 39.36,
+          "confidence": 0.93
+        }
+      ]
+    },
+    {
+      "start": 39.72,
+      "end": 41.42,
+      "text": " Cause I'm down for the state of Pennsylvania",
+      "confidence": 0.94,
+      "words": [
+        {
+          "text": "Cause",
+          "start": 39.72,
+          "end": 39.98,
+          "confidence": 0.65
+        },
+        {
+          "text": "I'm",
+          "start": 39.98,
+          "end": 40.22,
+          "confidence": 0.99
+        },
+        {
+          "text": "down",
+          "start": 40.22,
+          "end": 40.38,
+          "confidence": 0.99
+        },
+        {
+          "text": "for",
+          "start": 40.38,
+          "end": 40.6,
+          "confidence": 0.94
+        },
+        {
+          "text": "the",
+          "start": 40.6,
+          "end": 40.78,
+          "confidence": 0.99
+        },
+        {
+          "text": "state",
+          "start": 40.78,
+          "end": 40.92,
+          "confidence": 0.98
+        },
+        {
+          "text": "of",
+          "start": 40.92,
+          "end": 41.1,
+          "confidence": 1.0
+        },
+        {
+          "text": "Pennsylvania",
+          "start": 41.1,
+          "end": 41.42,
+          "confidence": 0.99
+        }
+      ]
+    },
+    {
+      "start": 41.88,
+      "end": 44.3,
+      "text": " I try not to whine but I must warn ya",
+      "confidence": 0.91,
+      "words": [
+        {
+          "text": "I",
+          "start": 41.88,
+          "end": 42.04,
+          "confidence": 0.95
+        },
+        {
+          "text": "try",
+          "start": 42.04,
+          "end": 42.14,
+          "confidence": 0.95
+        },
+        {
+          "text": "not",
+          "start": 42.14,
+          "end": 42.38,
+          "confidence": 0.99
+        },
+        {
+          "text": "to",
+          "start": 42.38,
+          "end": 42.64,
+          "confidence": 1.0
+        },
+        {
+          "text": "whine",
+          "start": 42.64,
+          "end": 42.84,
+          "confidence": 0.98
+        },
+        {
+          "text": "but",
+          "start": 42.84,
+          "end": 43.16,
+          "confidence": 0.59
+        },
+        {
+          "text": "I",
+          "start": 43.16,
+          "end": 43.48,
+          "confidence": 0.71
+        },
+        {
+          "text": "must",
+          "start": 43.48,
+          "end": 43.74,
+          "confidence": 0.99
+        },
+        {
+          "text": "warn",
+          "start": 43.74,
+          "end": 44.08,
+          "confidence": 1.0
+        },
+        {
+          "text": "ya",
+          "start": 44.08,
+          "end": 44.3,
+          "confidence": 0.97
+        }
+      ]
+    },
+    {
+      "start": 44.68,
+      "end": 46.08,
+      "text": " About the motherfuckers of California",
+      "confidence": 0.71,
+      "words": [
+        {
+          "text": "About",
+          "start": 44.68,
+          "end": 44.88,
+          "confidence": 0.45
+        },
+        {
+          "text": "the",
+          "start": 44.88,
+          "end": 45.08,
+          "confidence": 0.97
+        },
+        {
+          "text": "motherfuckers",
+          "start": 45.08,
+          "end": 45.66,
+          "confidence": 0.73
+        },
+        {
+          "text": "of",
+          "start": 45.66,
+          "end": 45.8,
+          "confidence": 0.56
+        },
+        {
+          "text": "California",
+          "start": 45.8,
+          "end": 46.08,
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "start": 46.94,
+      "end": 49.1,
+      "text": " Alabama babysitter, hallelujah",
+      "confidence": 0.73,
+      "words": [
+        {
+          "text": "Alabama",
+          "start": 46.94,
+          "end": 47.44,
+          "confidence": 0.99
+        },
+        {
+          "text": "babysitter,",
+          "start": 47.44,
+          "end": 48.28,
+          "confidence": 0.51
+        },
+        {
+          "text": "hallelujah",
+          "start": 48.5,
+          "end": 49.1,
+          "confidence": 0.91
+        }
+      ]
+    },
+    {
+      "start": 49.6,
+      "end": 51.59,
+      "text": " Good fucker, I wish I knew ya",
+      "confidence": 0.69,
+      "words": [
+        {
+          "text": "Good",
+          "start": 49.6,
+          "end": 49.98,
+          "confidence": 0.95
+        },
+        {
+          "text": "fucker,",
+          "start": 49.98,
+          "end": 50.56,
+          "confidence": 0.29
+        },
+        {
+          "text": "I",
+          "start": 50.76,
+          "end": 50.94,
+          "confidence": 0.98
+        },
+        {
+          "text": "wish",
+          "start": 50.94,
+          "end": 51.12,
+          "confidence": 0.99
+        },
+        {
+          "text": "I",
+          "start": 51.12,
+          "end": 51.26,
+          "confidence": 0.72
+        },
+        {
+          "text": "knew",
+          "start": 51.26,
+          "end": 51.46,
+          "confidence": 0.99
+        },
+        {
+          "text": "ya",
+          "start": 51.46,
+          "end": 51.59,
+          "confidence": 0.98
+        }
+      ]
+    },
+    {
+      "start": 51.59,
+      "end": 56.58,
+      "text": " I know, I know for sure",
+      "confidence": 0.96,
+      "words": [
+        {
+          "text": "I",
+          "start": 51.59,
+          "end": 52.74,
+          "confidence": 0.87
+        },
+        {
+          "text": "know,",
+          "start": 52.74,
+          "end": 53.46,
+          "confidence": 0.99
+        },
+        {
+          "text": "I",
+          "start": 53.64,
+          "end": 54.22,
+          "confidence": 0.99
+        },
+        {
+          "text": "know",
+          "start": 54.22,
+          "end": 54.96,
+          "confidence": 1.0
+        },
+        {
+          "text": "for",
+          "start": 54.96,
+          "end": 55.36,
+          "confidence": 0.95
+        },
+        {
+          "text": "sure",
+          "start": 55.36,
+          "end": 56.58,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 57.22,
+      "end": 61.96,
+      "text": " That life is beautiful around the world",
+      "confidence": 0.98,
+      "words": [
+        {
+          "text": "That",
+          "start": 57.22,
+          "end": 57.56,
+          "confidence": 0.91
+        },
+        {
+          "text": "life",
+          "start": 57.56,
+          "end": 57.98,
+          "confidence": 0.99
+        },
+        {
+          "text": "is",
+          "start": 57.98,
+          "end": 58.36,
+          "confidence": 0.98
+        },
+        {
+          "text": "beautiful",
+          "start": 58.36,
+          "end": 59.14,
+          "confidence": 1.0
+        },
+        {
+          "text": "around",
+          "start": 59.14,
+          "end": 60.08,
+          "confidence": 0.96
+        },
+        {
+          "text": "the",
+          "start": 60.08,
+          "end": 60.56,
+          "confidence": 1.0
+        },
+        {
+          "text": "world",
+          "start": 60.56,
+          "end": 61.96,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 62.5,
+      "end": 66.88,
+      "text": " I know, I know it's you",
+      "confidence": 0.9,
+      "words": [
+        {
+          "text": "I",
+          "start": 62.5,
+          "end": 62.88,
+          "confidence": 0.58
+        },
+        {
+          "text": "know,",
+          "start": 62.88,
+          "end": 64.04,
+          "confidence": 1.0
+        },
+        {
+          "text": "I",
+          "start": 64.04,
+          "end": 64.44,
+          "confidence": 0.97
+        },
+        {
+          "text": "know",
+          "start": 64.44,
+          "end": 65.18,
+          "confidence": 1.0
+        },
+        {
+          "text": "it's",
+          "start": 65.18,
+          "end": 65.74,
+          "confidence": 0.93
+        },
+        {
+          "text": "you",
+          "start": 65.74,
+          "end": 66.88,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 67.4,
+      "end": 71.48,
+      "text": " You say hello and then I say I do",
+      "confidence": 0.89,
+      "words": [
+        {
+          "text": "You",
+          "start": 67.4,
+          "end": 67.72,
+          "confidence": 0.99
+        },
+        {
+          "text": "say",
+          "start": 67.72,
+          "end": 68.06,
+          "confidence": 0.95
+        },
+        {
+          "text": "hello",
+          "start": 68.06,
+          "end": 68.78,
+          "confidence": 0.94
+        },
+        {
+          "text": "and",
+          "start": 68.78,
+          "end": 69.16,
+          "confidence": 0.94
+        },
+        {
+          "text": "then",
+          "start": 69.16,
+          "end": 69.42,
+          "confidence": 0.93
+        },
+        {
+          "text": "I",
+          "start": 69.42,
+          "end": 69.7,
+          "confidence": 0.99
+        },
+        {
+          "text": "say",
+          "start": 69.7,
+          "end": 70.14,
+          "confidence": 0.98
+        },
+        {
+          "text": "I",
+          "start": 70.14,
+          "end": 70.68,
+          "confidence": 0.48
+        },
+        {
+          "text": "do",
+          "start": 70.68,
+          "end": 71.48,
+          "confidence": 0.99
+        }
+      ]
+    },
+    {
+      "start": 74.58,
+      "end": 76.74,
+      "text": " Come back baby cause I like to say",
+      "confidence": 0.84,
+      "words": [
+        {
+          "text": "Come",
+          "start": 74.58,
+          "end": 74.94,
+          "confidence": 0.98
+        },
+        {
+          "text": "back",
+          "start": 74.94,
+          "end": 75.2,
+          "confidence": 0.97
+        },
+        {
+          "text": "baby",
+          "start": 75.2,
+          "end": 75.5,
+          "confidence": 0.74
+        },
+        {
+          "text": "cause",
+          "start": 75.5,
+          "end": 75.78,
+          "confidence": 0.66
+        },
+        {
+          "text": "I",
+          "start": 75.78,
+          "end": 75.94,
+          "confidence": 0.98
+        },
+        {
+          "text": "like",
+          "start": 75.94,
+          "end": 76.2,
+          "confidence": 0.55
+        },
+        {
+          "text": "to",
+          "start": 76.2,
+          "end": 76.56,
+          "confidence": 1.0
+        },
+        {
+          "text": "say",
+          "start": 76.56,
+          "end": 76.74,
+          "confidence": 0.99
+        }
+      ]
+    },
+    {
+      "start": 77.0,
+      "end": 79.26,
+      "text": " I've been around the world back from Bombay",
+      "confidence": 0.93,
+      "words": [
+        {
+          "text": "I've",
+          "start": 77.0,
+          "end": 77.3,
+          "confidence": 0.95
+        },
+        {
+          "text": "been",
+          "start": 77.3,
+          "end": 77.42,
+          "confidence": 1.0
+        },
+        {
+          "text": "around",
+          "start": 77.42,
+          "end": 77.68,
+          "confidence": 0.98
+        },
+        {
+          "text": "the",
+          "start": 77.68,
+          "end": 77.88,
+          "confidence": 1.0
+        },
+        {
+          "text": "world",
+          "start": 77.88,
+          "end": 78.04,
+          "confidence": 1.0
+        },
+        {
+          "text": "back",
+          "start": 78.04,
+          "end": 78.34,
+          "confidence": 0.57
+        },
+        {
+          "text": "from",
+          "start": 78.34,
+          "end": 78.74,
+          "confidence": 0.99
+        },
+        {
+          "text": "Bombay",
+          "start": 78.74,
+          "end": 79.26,
+          "confidence": 0.98
+        }
+      ]
+    },
+    {
+      "start": 79.58,
+      "end": 81.7,
+      "text": " Fox or love, pop in your face",
+      "confidence": 0.6,
+      "words": [
+        {
+          "text": "Fox",
+          "start": 79.58,
+          "end": 79.94,
+          "confidence": 0.78
+        },
+        {
+          "text": "or",
+          "start": 79.94,
+          "end": 80.3,
+          "confidence": 0.35
+        },
+        {
+          "text": "love,",
+          "start": 80.3,
+          "end": 80.54,
+          "confidence": 0.45
+        },
+        {
+          "text": "pop",
+          "start": 80.72,
+          "end": 80.84,
+          "confidence": 0.26
+        },
+        {
+          "text": "in",
+          "start": 80.84,
+          "end": 81.08,
+          "confidence": 0.95
+        },
+        {
+          "text": "your",
+          "start": 81.08,
+          "end": 81.3,
+          "confidence": 0.91
+        },
+        {
+          "text": "face",
+          "start": 81.3,
+          "end": 81.7,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 82.08,
+      "end": 84.34,
+      "text": " Livin' in and out of a big fat suitcase",
+      "confidence": 0.9,
+      "words": [
+        {
+          "text": "Livin'",
+          "start": 82.08,
+          "end": 82.56,
+          "confidence": 0.74
+        },
+        {
+          "text": "in",
+          "start": 82.56,
+          "end": 82.68,
+          "confidence": 0.99
+        },
+        {
+          "text": "and",
+          "start": 82.68,
+          "end": 82.86,
+          "confidence": 0.94
+        },
+        {
+          "text": "out",
+          "start": 82.86,
+          "end": 83.08,
+          "confidence": 1.0
+        },
+        {
+          "text": "of",
+          "start": 83.08,
+          "end": 83.28,
+          "confidence": 0.99
+        },
+        {
+          "text": "a",
+          "start": 83.28,
+          "end": 83.48,
+          "confidence": 0.98
+        },
+        {
+          "text": "big",
+          "start": 83.48,
+          "end": 83.68,
+          "confidence": 0.95
+        },
+        {
+          "text": "fat",
+          "start": 83.68,
+          "end": 83.96,
+          "confidence": 0.87
+        },
+        {
+          "text": "suitcase",
+          "start": 83.96,
+          "end": 84.34,
+          "confidence": 0.99
+        }
+      ]
+    },
+    {
+      "start": 84.54,
+      "end": 86.94,
+      "text": " Bonafide, I step aside, my Johnson",
+      "confidence": 0.53,
+      "words": [
+        {
+          "text": "Bonafide,",
+          "start": 84.54,
+          "end": 85.22,
+          "confidence": 0.76
+        },
+        {
+          "text": "I",
+          "start": 85.42,
+          "end": 85.48,
+          "confidence": 0.17
+        },
+        {
+          "text": "step",
+          "start": 85.48,
+          "end": 85.76,
+          "confidence": 0.55
+        },
+        {
+          "text": "aside,",
+          "start": 85.76,
+          "end": 86.1,
+          "confidence": 0.78
+        },
+        {
+          "text": "my",
+          "start": 86.24,
+          "end": 86.54,
+          "confidence": 0.22
+        },
+        {
+          "text": "Johnson",
+          "start": 86.54,
+          "end": 86.94,
+          "confidence": 0.82
+        }
+      ]
+    },
+    {
+      "start": 87.36,
+      "end": 89.3,
+      "text": " Yes I could, in the woods of Wisconsin",
+      "confidence": 0.89,
+      "words": [
+        {
+          "text": "Yes",
+          "start": 87.36,
+          "end": 87.58,
+          "confidence": 0.98
+        },
+        {
+          "text": "I",
+          "start": 87.58,
+          "end": 87.68,
+          "confidence": 0.77
+        },
+        {
+          "text": "could,",
+          "start": 87.68,
+          "end": 87.94,
+          "confidence": 1.0
+        },
+        {
+          "text": "in",
+          "start": 88.16,
+          "end": 88.24,
+          "confidence": 0.97
+        },
+        {
+          "text": "the",
+          "start": 88.24,
+          "end": 88.4,
+          "confidence": 0.98
+        },
+        {
+          "text": "woods",
+          "start": 88.4,
+          "end": 88.54,
+          "confidence": 0.66
+        },
+        {
+          "text": "of",
+          "start": 88.54,
+          "end": 88.68,
+          "confidence": 0.82
+        },
+        {
+          "text": "Wisconsin",
+          "start": 88.68,
+          "end": 89.3,
+          "confidence": 0.99
+        }
+      ]
+    },
+    {
+      "start": 89.46,
+      "end": 92.0,
+      "text": " I wake up the cake at the lake, she's kissin' me",
+      "confidence": 0.92,
+      "words": [
+        {
+          "text": "I",
+          "start": 89.46,
+          "end": 89.62,
+          "confidence": 0.94
+        },
+        {
+          "text": "wake",
+          "start": 89.62,
+          "end": 89.8,
+          "confidence": 0.94
+        },
+        {
+          "text": "up",
+          "start": 89.8,
+          "end": 90.02,
+          "confidence": 0.99
+        },
+        {
+          "text": "the",
+          "start": 90.02,
+          "end": 90.24,
+          "confidence": 0.77
+        },
+        {
+          "text": "cake",
+          "start": 90.24,
+          "end": 90.44,
+          "confidence": 0.67
+        },
+        {
+          "text": "at",
+          "start": 90.44,
+          "end": 90.66,
+          "confidence": 0.84
+        },
+        {
+          "text": "the",
+          "start": 90.66,
+          "end": 90.84,
+          "confidence": 0.99
+        },
+        {
+          "text": "lake,",
+          "start": 90.84,
+          "end": 90.98,
+          "confidence": 0.98
+        },
+        {
+          "text": "she's",
+          "start": 91.02,
+          "end": 91.44,
+          "confidence": 0.99
+        },
+        {
+          "text": "kissin'",
+          "start": 91.44,
+          "end": 91.9,
+          "confidence": 0.94
+        },
+        {
+          "text": "me",
+          "start": 91.9,
+          "end": 92.0,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 92.3,
+      "end": 93.9,
+      "text": " As we do when they do in Sicily",
+      "confidence": 0.87,
+      "words": [
+        {
+          "text": "As",
+          "start": 92.3,
+          "end": 92.52,
+          "confidence": 0.98
+        },
+        {
+          "text": "we",
+          "start": 92.52,
+          "end": 92.72,
+          "confidence": 0.62
+        },
+        {
+          "text": "do",
+          "start": 92.72,
+          "end": 92.88,
+          "confidence": 0.99
+        },
+        {
+          "text": "when",
+          "start": 92.88,
+          "end": 93.12,
+          "confidence": 0.69
+        },
+        {
+          "text": "they",
+          "start": 93.12,
+          "end": 93.34,
+          "confidence": 0.83
+        },
+        {
+          "text": "do",
+          "start": 93.34,
+          "end": 93.56,
+          "confidence": 0.99
+        },
+        {
+          "text": "in",
+          "start": 93.56,
+          "end": 93.88,
+          "confidence": 0.83
+        },
+        {
+          "text": "Sicily",
+          "start": 93.88,
+          "end": 93.9,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 93.9,
+      "end": 98.9,
+      "text": " I know, I know for sure",
+      "confidence": 1.0,
+      "words": [
+        {
+          "text": "I",
+          "start": 93.9,
+          "end": 95.34,
+          "confidence": 0.99
+        },
+        {
+          "text": "know,",
+          "start": 95.34,
+          "end": 96.14,
+          "confidence": 1.0
+        },
+        {
+          "text": "I",
+          "start": 96.14,
+          "end": 96.92,
+          "confidence": 1.0
+        },
+        {
+          "text": "know",
+          "start": 96.92,
+          "end": 97.62,
+          "confidence": 1.0
+        },
+        {
+          "text": "for",
+          "start": 97.62,
+          "end": 98.08,
+          "confidence": 0.99
+        },
+        {
+          "text": "sure",
+          "start": 98.08,
+          "end": 98.9,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 99.92,
+      "end": 104.12,
+      "text": " That life is beautiful around the world",
+      "confidence": 1.0,
+      "words": [
+        {
+          "text": "That",
+          "start": 99.92,
+          "end": 100.22,
+          "confidence": 1.0
+        },
+        {
+          "text": "life",
+          "start": 100.22,
+          "end": 100.68,
+          "confidence": 1.0
+        },
+        {
+          "text": "is",
+          "start": 100.68,
+          "end": 101.22,
+          "confidence": 1.0
+        },
+        {
+          "text": "beautiful",
+          "start": 101.22,
+          "end": 101.84,
+          "confidence": 1.0
+        },
+        {
+          "text": "around",
+          "start": 101.84,
+          "end": 102.78,
+          "confidence": 1.0
+        },
+        {
+          "text": "the",
+          "start": 102.78,
+          "end": 103.3,
+          "confidence": 1.0
+        },
+        {
+          "text": "world",
+          "start": 103.3,
+          "end": 104.12,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 105.22,
+      "end": 108.72,
+      "text": " I know, I know it's you",
+      "confidence": 0.99,
+      "words": [
+        {
+          "text": "I",
+          "start": 105.22,
+          "end": 105.56,
+          "confidence": 0.96
+        },
+        {
+          "text": "know,",
+          "start": 105.56,
+          "end": 106.46,
+          "confidence": 1.0
+        },
+        {
+          "text": "I",
+          "start": 106.8,
+          "end": 107.06,
+          "confidence": 1.0
+        },
+        {
+          "text": "know",
+          "start": 107.06,
+          "end": 107.92,
+          "confidence": 1.0
+        },
+        {
+          "text": "it's",
+          "start": 107.92,
+          "end": 108.52,
+          "confidence": 0.99
+        },
+        {
+          "text": "you",
+          "start": 108.52,
+          "end": 108.72,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 110.16,
+      "end": 114.0,
+      "text": " You say hello and then I say I do",
+      "confidence": 0.99,
+      "words": [
+        {
+          "text": "You",
+          "start": 110.16,
+          "end": 110.4,
+          "confidence": 0.99
+        },
+        {
+          "text": "say",
+          "start": 110.4,
+          "end": 110.8,
+          "confidence": 0.99
+        },
+        {
+          "text": "hello",
+          "start": 110.8,
+          "end": 111.48,
+          "confidence": 1.0
+        },
+        {
+          "text": "and",
+          "start": 111.48,
+          "end": 111.92,
+          "confidence": 0.98
+        },
+        {
+          "text": "then",
+          "start": 111.92,
+          "end": 112.18,
+          "confidence": 0.98
+        },
+        {
+          "text": "I",
+          "start": 112.18,
+          "end": 112.54,
+          "confidence": 1.0
+        },
+        {
+          "text": "say",
+          "start": 112.54,
+          "end": 112.86,
+          "confidence": 1.0
+        },
+        {
+          "text": "I",
+          "start": 112.86,
+          "end": 113.32,
+          "confidence": 1.0
+        },
+        {
+          "text": "do",
+          "start": 113.32,
+          "end": 114.0,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 139.44,
+      "end": 141.48,
+      "text": " Where you wanna go, who you wanna be",
+      "confidence": 0.94,
+      "words": [
+        {
+          "text": "Where",
+          "start": 139.44,
+          "end": 139.62,
+          "confidence": 0.97
+        },
+        {
+          "text": "you",
+          "start": 139.62,
+          "end": 139.82,
+          "confidence": 0.85
+        },
+        {
+          "text": "wanna",
+          "start": 139.82,
+          "end": 140.04,
+          "confidence": 0.86
+        },
+        {
+          "text": "go,",
+          "start": 140.04,
+          "end": 140.38,
+          "confidence": 0.99
+        },
+        {
+          "text": "who",
+          "start": 140.7,
+          "end": 140.88,
+          "confidence": 0.99
+        },
+        {
+          "text": "you",
+          "start": 140.88,
+          "end": 141.04,
+          "confidence": 0.99
+        },
+        {
+          "text": "wanna",
+          "start": 141.04,
+          "end": 141.3,
+          "confidence": 0.96
+        },
+        {
+          "text": "be",
+          "start": 141.3,
+          "end": 141.48,
+          "confidence": 0.96
+        }
+      ]
+    },
+    {
+      "start": 141.86,
+      "end": 143.98,
+      "text": " What you wanna do, just come with me",
+      "confidence": 0.91,
+      "words": [
+        {
+          "text": "What",
+          "start": 141.86,
+          "end": 142.08,
+          "confidence": 0.49
+        },
+        {
+          "text": "you",
+          "start": 142.08,
+          "end": 142.32,
+          "confidence": 0.98
+        },
+        {
+          "text": "wanna",
+          "start": 142.32,
+          "end": 142.56,
+          "confidence": 0.97
+        },
+        {
+          "text": "do,",
+          "start": 142.56,
+          "end": 142.8,
+          "confidence": 1.0
+        },
+        {
+          "text": "just",
+          "start": 142.86,
+          "end": 143.14,
+          "confidence": 0.99
+        },
+        {
+          "text": "come",
+          "start": 143.14,
+          "end": 143.44,
+          "confidence": 1.0
+        },
+        {
+          "text": "with",
+          "start": 143.44,
+          "end": 143.72,
+          "confidence": 1.0
+        },
+        {
+          "text": "me",
+          "start": 143.72,
+          "end": 143.98,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 144.36,
+      "end": 146.48,
+      "text": " I saw God, then I saw the fountains",
+      "confidence": 0.75,
+      "words": [
+        {
+          "text": "I",
+          "start": 144.36,
+          "end": 144.72,
+          "confidence": 0.32
+        },
+        {
+          "text": "saw",
+          "start": 144.72,
+          "end": 145.0,
+          "confidence": 0.48
+        },
+        {
+          "text": "God,",
+          "start": 145.0,
+          "end": 145.36,
+          "confidence": 0.89
+        },
+        {
+          "text": "then",
+          "start": 145.54,
+          "end": 145.64,
+          "confidence": 0.59
+        },
+        {
+          "text": "I",
+          "start": 145.64,
+          "end": 145.8,
+          "confidence": 0.99
+        },
+        {
+          "text": "saw",
+          "start": 145.8,
+          "end": 146.1,
+          "confidence": 1.0
+        },
+        {
+          "text": "the",
+          "start": 146.1,
+          "end": 146.28,
+          "confidence": 0.97
+        },
+        {
+          "text": "fountains",
+          "start": 146.28,
+          "end": 146.48,
+          "confidence": 0.91
+        }
+      ]
+    },
+    {
+      "start": 146.92,
+      "end": 149.18,
+      "text": " You and me, well sittin' in the Swiss mountains",
+      "confidence": 0.81,
+      "words": [
+        {
+          "text": "You",
+          "start": 146.92,
+          "end": 147.14,
+          "confidence": 0.99
+        },
+        {
+          "text": "and",
+          "start": 147.14,
+          "end": 147.28,
+          "confidence": 0.97
+        },
+        {
+          "text": "me,",
+          "start": 147.28,
+          "end": 147.54,
+          "confidence": 0.99
+        },
+        {
+          "text": "well",
+          "start": 147.66,
+          "end": 147.76,
+          "confidence": 0.38
+        },
+        {
+          "text": "sittin'",
+          "start": 147.76,
+          "end": 148.2,
+          "confidence": 0.69
+        },
+        {
+          "text": "in",
+          "start": 148.2,
+          "end": 148.32,
+          "confidence": 0.98
+        },
+        {
+          "text": "the",
+          "start": 148.32,
+          "end": 148.46,
+          "confidence": 0.99
+        },
+        {
+          "text": "Swiss",
+          "start": 148.46,
+          "end": 148.68,
+          "confidence": 0.96
+        },
+        {
+          "text": "mountains",
+          "start": 148.68,
+          "end": 149.18,
+          "confidence": 0.92
+        }
+      ]
+    },
+    {
+      "start": 149.3,
+      "end": 151.46,
+      "text": " Me oh my oh, me and I oh",
+      "confidence": 0.71,
+      "words": [
+        {
+          "text": "Me",
+          "start": 149.3,
+          "end": 149.7,
+          "confidence": 0.96
+        },
+        {
+          "text": "oh",
+          "start": 149.7,
+          "end": 150.04,
+          "confidence": 0.37
+        },
+        {
+          "text": "my",
+          "start": 150.04,
+          "end": 150.3,
+          "confidence": 0.73
+        },
+        {
+          "text": "oh,",
+          "start": 150.3,
+          "end": 150.5,
+          "confidence": 0.91
+        },
+        {
+          "text": "me",
+          "start": 150.74,
+          "end": 150.94,
+          "confidence": 0.98
+        },
+        {
+          "text": "and",
+          "start": 150.94,
+          "end": 151.22,
+          "confidence": 0.96
+        },
+        {
+          "text": "I",
+          "start": 151.22,
+          "end": 151.44,
+          "confidence": 0.31
+        },
+        {
+          "text": "oh",
+          "start": 151.44,
+          "end": 151.46,
+          "confidence": 0.98
+        }
+      ]
+    },
+    {
+      "start": 151.78,
+      "end": 153.48,
+      "text": " Freer than a bird cause we're rockin' oh",
+      "confidence": 0.77,
+      "words": [
+        {
+          "text": "Freer",
+          "start": 151.78,
+          "end": 152.16,
+          "confidence": 0.7
+        },
+        {
+          "text": "than",
+          "start": 152.16,
+          "end": 152.38,
+          "confidence": 0.97
+        },
+        {
+          "text": "a",
+          "start": 152.38,
+          "end": 152.58,
+          "confidence": 0.94
+        },
+        {
+          "text": "bird",
+          "start": 152.58,
+          "end": 152.72,
+          "confidence": 0.99
+        },
+        {
+          "text": "cause",
+          "start": 152.72,
+          "end": 152.94,
+          "confidence": 0.67
+        },
+        {
+          "text": "we're",
+          "start": 152.94,
+          "end": 153.16,
+          "confidence": 0.6
+        },
+        {
+          "text": "rockin'",
+          "start": 153.16,
+          "end": 153.38,
+          "confidence": 0.96
+        },
+        {
+          "text": "oh",
+          "start": 153.38,
+          "end": 153.48,
+          "confidence": 0.45
+        }
+      ]
+    },
+    {
+      "start": 153.74,
+      "end": 156.48,
+      "text": " I hope around the world I feel dutiful",
+      "confidence": 0.83,
+      "words": [
+        {
+          "text": "I",
+          "start": 153.74,
+          "end": 154.04,
+          "confidence": 0.52
+        },
+        {
+          "text": "hope",
+          "start": 154.04,
+          "end": 154.4,
+          "confidence": 0.84
+        },
+        {
+          "text": "around",
+          "start": 154.4,
+          "end": 154.8,
+          "confidence": 0.7
+        },
+        {
+          "text": "the",
+          "start": 154.8,
+          "end": 155.06,
+          "confidence": 1.0
+        },
+        {
+          "text": "world",
+          "start": 155.06,
+          "end": 155.4,
+          "confidence": 1.0
+        },
+        {
+          "text": "I",
+          "start": 155.4,
+          "end": 155.8,
+          "confidence": 0.64
+        },
+        {
+          "text": "feel",
+          "start": 155.8,
+          "end": 156.12,
+          "confidence": 0.97
+        },
+        {
+          "text": "dutiful",
+          "start": 156.12,
+          "end": 156.48,
+          "confidence": 0.92
+        }
+      ]
+    },
+    {
+      "start": 157.02,
+      "end": 159.1,
+      "text": " Take a wife cause life is dutiful",
+      "confidence": 0.77,
+      "words": [
+        {
+          "text": "Take",
+          "start": 157.02,
+          "end": 157.28,
+          "confidence": 0.99
+        },
+        {
+          "text": "a",
+          "start": 157.28,
+          "end": 157.48,
+          "confidence": 0.77
+        },
+        {
+          "text": "wife",
+          "start": 157.48,
+          "end": 157.62,
+          "confidence": 0.22
+        },
+        {
+          "text": "cause",
+          "start": 157.62,
+          "end": 157.94,
+          "confidence": 0.91
+        },
+        {
+          "text": "life",
+          "start": 157.94,
+          "end": 158.28,
+          "confidence": 0.99
+        },
+        {
+          "text": "is",
+          "start": 158.28,
+          "end": 158.56,
+          "confidence": 0.78
+        },
+        {
+          "text": "dutiful",
+          "start": 158.56,
+          "end": 159.1,
+          "confidence": 0.95
+        }
+      ]
+    },
+    {
+      "start": 159.16,
+      "end": 164.04,
+      "text": " I know, I know for sure",
+      "confidence": 0.96,
+      "words": [
+        {
+          "text": "I",
+          "start": 159.16,
+          "end": 160.16,
+          "confidence": 0.82
+        },
+        {
+          "text": "know,",
+          "start": 160.16,
+          "end": 161.18,
+          "confidence": 1.0
+        },
+        {
+          "text": "I",
+          "start": 161.2,
+          "end": 161.6,
+          "confidence": 1.0
+        },
+        {
+          "text": "know",
+          "start": 161.6,
+          "end": 162.38,
+          "confidence": 1.0
+        },
+        {
+          "text": "for",
+          "start": 162.38,
+          "end": 162.74,
+          "confidence": 0.93
+        },
+        {
+          "text": "sure",
+          "start": 162.74,
+          "end": 164.04,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 164.54,
+      "end": 168.3,
+      "text": " Bing bang dong dong, bing bang dong dong, bing bang",
+      "confidence": 0.76,
+      "words": [
+        {
+          "text": "Bing",
+          "start": 164.54,
+          "end": 165.04,
+          "confidence": 0.54
+        },
+        {
+          "text": "bang",
+          "start": 165.04,
+          "end": 165.32,
+          "confidence": 0.52
+        },
+        {
+          "text": "dong",
+          "start": 165.32,
+          "end": 165.6,
+          "confidence": 0.33
+        },
+        {
+          "text": "dong,",
+          "start": 165.6,
+          "end": 165.88,
+          "confidence": 0.68
+        },
+        {
+          "text": "bing",
+          "start": 166.1,
+          "end": 166.32,
+          "confidence": 0.91
+        },
+        {
+          "text": "bang",
+          "start": 166.32,
+          "end": 166.58,
+          "confidence": 0.89
+        },
+        {
+          "text": "dong",
+          "start": 166.58,
+          "end": 166.96,
+          "confidence": 0.97
+        },
+        {
+          "text": "dong,",
+          "start": 166.96,
+          "end": 167.36,
+          "confidence": 0.91
+        },
+        {
+          "text": "bing",
+          "start": 167.36,
+          "end": 167.86,
+          "confidence": 0.97
+        },
+        {
+          "text": "bang",
+          "start": 167.86,
+          "end": 168.3,
+          "confidence": 0.99
+        }
+      ]
+    },
+    {
+      "start": 170.02,
+      "end": 173.93,
+      "text": " I know, I know it's you",
+      "confidence": 0.91,
+      "words": [
+        {
+          "text": "I",
+          "start": 170.02,
+          "end": 170.4,
+          "confidence": 0.54
+        },
+        {
+          "text": "know,",
+          "start": 170.4,
+          "end": 170.78,
+          "confidence": 1.0
+        },
+        {
+          "text": "I",
+          "start": 170.88,
+          "end": 171.72,
+          "confidence": 1.0
+        },
+        {
+          "text": "know",
+          "start": 171.72,
+          "end": 172.56,
+          "confidence": 1.0
+        },
+        {
+          "text": "it's",
+          "start": 172.56,
+          "end": 173.18,
+          "confidence": 0.98
+        },
+        {
+          "text": "you",
+          "start": 173.18,
+          "end": 173.93,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 173.93,
+      "end": 178.44,
+      "text": " Bing bang dong dong, bing bang dong dong, bing bang",
+      "confidence": 0.99,
+      "words": [
+        {
+          "text": "Bing",
+          "start": 173.93,
+          "end": 175.16,
+          "confidence": 0.99
+        },
+        {
+          "text": "bang",
+          "start": 175.16,
+          "end": 175.44,
+          "confidence": 0.97
+        },
+        {
+          "text": "dong",
+          "start": 175.44,
+          "end": 175.66,
+          "confidence": 0.99
+        },
+        {
+          "text": "dong,",
+          "start": 175.66,
+          "end": 176.0,
+          "confidence": 0.99
+        },
+        {
+          "text": "bing",
+          "start": 176.2,
+          "end": 176.42,
+          "confidence": 1.0
+        },
+        {
+          "text": "bang",
+          "start": 176.42,
+          "end": 176.66,
+          "confidence": 0.98
+        },
+        {
+          "text": "dong",
+          "start": 176.66,
+          "end": 176.94,
+          "confidence": 0.99
+        },
+        {
+          "text": "dong,",
+          "start": 176.94,
+          "end": 177.48,
+          "confidence": 0.99
+        },
+        {
+          "text": "bing",
+          "start": 177.76,
+          "end": 178.04,
+          "confidence": 1.0
+        },
+        {
+          "text": "bang",
+          "start": 178.04,
+          "end": 178.44,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 179.84,
+      "end": 182.08,
+      "text": " Mother Russia's too dark so far",
+      "confidence": 0.43,
+      "words": [
+        {
+          "text": "Mother",
+          "start": 179.84,
+          "end": 180.2,
+          "confidence": 0.52
+        },
+        {
+          "text": "Russia's",
+          "start": 180.2,
+          "end": 180.96,
+          "confidence": 0.5
+        },
+        {
+          "text": "too",
+          "start": 180.96,
+          "end": 181.18,
+          "confidence": 0.33
+        },
+        {
+          "text": "dark",
+          "start": 181.18,
+          "end": 181.38,
+          "confidence": 0.66
+        },
+        {
+          "text": "so",
+          "start": 181.38,
+          "end": 181.78,
+          "confidence": 0.48
+        },
+        {
+          "text": "far",
+          "start": 181.78,
+          "end": 182.08,
+          "confidence": 0.21
+        }
+      ]
+    },
+    {
+      "start": 182.38,
+      "end": 184.28,
+      "text": " I know you're fallin' up",
+      "confidence": 0.79,
+      "words": [
+        {
+          "text": "I",
+          "start": 182.38,
+          "end": 182.8,
+          "confidence": 0.97
+        },
+        {
+          "text": "know",
+          "start": 182.8,
+          "end": 183.0,
+          "confidence": 0.96
+        },
+        {
+          "text": "you're",
+          "start": 183.0,
+          "end": 183.52,
+          "confidence": 0.95
+        },
+        {
+          "text": "fallin'",
+          "start": 183.52,
+          "end": 184.0,
+          "confidence": 0.73
+        },
+        {
+          "text": "up",
+          "start": 184.0,
+          "end": 184.28,
+          "confidence": 0.46
+        }
+      ]
+    },
+    {
+      "start": 184.3,
+      "end": 186.26,
+      "text": " Up in the round the world",
+      "confidence": 0.53,
+      "words": [
+        {
+          "text": "Up",
+          "start": 184.3,
+          "end": 184.76,
+          "confidence": 0.27
+        },
+        {
+          "text": "in",
+          "start": 184.76,
+          "end": 185.1,
+          "confidence": 0.8
+        },
+        {
+          "text": "the",
+          "start": 185.1,
+          "end": 185.4,
+          "confidence": 0.5
+        },
+        {
+          "text": "round",
+          "start": 185.4,
+          "end": 185.58,
+          "confidence": 0.23
+        },
+        {
+          "text": "the",
+          "start": 185.58,
+          "end": 185.88,
+          "confidence": 0.92
+        },
+        {
+          "text": "world",
+          "start": 185.88,
+          "end": 186.26,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 186.4,
+      "end": 189.4,
+      "text": " And I have seen your love",
+      "confidence": 0.86,
+      "words": [
+        {
+          "text": "And",
+          "start": 186.4,
+          "end": 186.68,
+          "confidence": 0.94
+        },
+        {
+          "text": "I",
+          "start": 186.68,
+          "end": 186.86,
+          "confidence": 0.99
+        },
+        {
+          "text": "have",
+          "start": 186.86,
+          "end": 187.1,
+          "confidence": 0.52
+        },
+        {
+          "text": "seen",
+          "start": 187.1,
+          "end": 187.78,
+          "confidence": 0.99
+        },
+        {
+          "text": "your",
+          "start": 187.78,
+          "end": 188.3,
+          "confidence": 0.97
+        },
+        {
+          "text": "love",
+          "start": 188.3,
+          "end": 189.4,
+          "confidence": 0.9
+        }
+      ]
+    },
+    {
+      "start": 190.18,
+      "end": 194.6,
+      "text": " I know, I know it's you",
+      "confidence": 0.97,
+      "words": [
+        {
+          "text": "I",
+          "start": 190.18,
+          "end": 190.68,
+          "confidence": 0.84
+        },
+        {
+          "text": "know,",
+          "start": 190.68,
+          "end": 191.58,
+          "confidence": 1.0
+        },
+        {
+          "text": "I",
+          "start": 191.58,
+          "end": 192.04,
+          "confidence": 1.0
+        },
+        {
+          "text": "know",
+          "start": 192.04,
+          "end": 192.82,
+          "confidence": 1.0
+        },
+        {
+          "text": "it's",
+          "start": 192.82,
+          "end": 193.46,
+          "confidence": 0.98
+        },
+        {
+          "text": "you",
+          "start": 193.46,
+          "end": 194.6,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 195.02,
+      "end": 199.14,
+      "text": " You say hello and then I say I do",
+      "confidence": 0.99,
+      "words": [
+        {
+          "text": "You",
+          "start": 195.02,
+          "end": 195.32,
+          "confidence": 0.99
+        },
+        {
+          "text": "say",
+          "start": 195.32,
+          "end": 195.72,
+          "confidence": 0.99
+        },
+        {
+          "text": "hello",
+          "start": 195.72,
+          "end": 196.3,
+          "confidence": 1.0
+        },
+        {
+          "text": "and",
+          "start": 196.3,
+          "end": 196.78,
+          "confidence": 0.99
+        },
+        {
+          "text": "then",
+          "start": 196.78,
+          "end": 197.06,
+          "confidence": 0.98
+        },
+        {
+          "text": "I",
+          "start": 197.06,
+          "end": 197.4,
+          "confidence": 1.0
+        },
+        {
+          "text": "say",
+          "start": 197.4,
+          "end": 197.66,
+          "confidence": 1.0
+        },
+        {
+          "text": "I",
+          "start": 197.66,
+          "end": 198.14,
+          "confidence": 1.0
+        },
+        {
+          "text": "do",
+          "start": 198.14,
+          "end": 199.14,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 220.0,
+      "end": 224.99,
+      "text": " I know, I know for sure",
+      "confidence": 0.57,
+      "words": [
+        {
+          "text": "I",
+          "start": 220.0,
+          "end": 221.2,
+          "confidence": 0.09
+        },
+        {
+          "text": "know,",
+          "start": 221.2,
+          "end": 221.22,
+          "confidence": 0.47
+        },
+        {
+          "text": "I",
+          "start": 221.22,
+          "end": 221.24,
+          "confidence": 0.98
+        },
+        {
+          "text": "know",
+          "start": 221.24,
+          "end": 221.62,
+          "confidence": 0.99
+        },
+        {
+          "text": "for",
+          "start": 221.62,
+          "end": 222.48,
+          "confidence": 0.8
+        },
+        {
+          "text": "sure",
+          "start": 222.48,
+          "end": 224.99,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 224.99,
+      "end": 229.22,
+      "text": " Bing bang dong dong, bing bang dong dong, bing bang",
+      "confidence": 0.94,
+      "words": [
+        {
+          "text": "Bing",
+          "start": 224.99,
+          "end": 226.58,
+          "confidence": 0.59
+        },
+        {
+          "text": "bang",
+          "start": 226.58,
+          "end": 226.6,
+          "confidence": 0.99
+        },
+        {
+          "text": "dong",
+          "start": 226.6,
+          "end": 226.62,
+          "confidence": 0.98
+        },
+        {
+          "text": "dong,",
+          "start": 226.62,
+          "end": 226.86,
+          "confidence": 0.9
+        },
+        {
+          "text": "bing",
+          "start": 226.88,
+          "end": 227.76,
+          "confidence": 1.0
+        },
+        {
+          "text": "bang",
+          "start": 227.76,
+          "end": 228.48,
+          "confidence": 1.0
+        },
+        {
+          "text": "dong",
+          "start": 228.48,
+          "end": 228.5,
+          "confidence": 0.98
+        },
+        {
+          "text": "dong,",
+          "start": 228.5,
+          "end": 228.52,
+          "confidence": 0.9
+        },
+        {
+          "text": "bing",
+          "start": 228.62,
+          "end": 229.2,
+          "confidence": 1.0
+        },
+        {
+          "text": "bang",
+          "start": 229.2,
+          "end": 229.22,
+          "confidence": 0.99
+        }
+      ]
+    },
+    {
+      "start": 229.7,
+      "end": 234.3,
+      "text": " I know, I know for sure",
+      "confidence": 0.94,
+      "words": [
+        {
+          "text": "I",
+          "start": 229.7,
+          "end": 231.5,
+          "confidence": 0.84
+        },
+        {
+          "text": "know,",
+          "start": 231.5,
+          "end": 231.68,
+          "confidence": 0.99
+        },
+        {
+          "text": "I",
+          "start": 231.7,
+          "end": 231.84,
+          "confidence": 0.99
+        },
+        {
+          "text": "know",
+          "start": 231.84,
+          "end": 232.1,
+          "confidence": 1.0
+        },
+        {
+          "text": "for",
+          "start": 232.1,
+          "end": 233.16,
+          "confidence": 0.82
+        },
+        {
+          "text": "sure",
+          "start": 233.16,
+          "end": 234.3,
+          "confidence": 1.0
+        }
+      ]
+    },
+    {
+      "start": 234.96,
+      "end": 239.0,
+      "text": " Bing bang dong dong, bing bang dong dong, bing bang",
+      "confidence": 0.95,
+      "words": [
+        {
+          "text": "Bing",
+          "start": 234.96,
+          "end": 235.26,
+          "confidence": 0.71
+        },
+        {
+          "text": "bang",
+          "start": 235.26,
+          "end": 235.62,
+          "confidence": 1.0
+        },
+        {
+          "text": "dong",
+          "start": 235.62,
+          "end": 236.24,
+          "confidence": 0.98
+        },
+        {
+          "text": "dong,",
+          "start": 236.24,
+          "end": 236.86,
+          "confidence": 0.95
+        },
+        {
+          "text": "bing",
+          "start": 236.86,
+          "end": 237.68,
+          "confidence": 1.0
+        },
+        {
+          "text": "bang",
+          "start": 237.68,
+          "end": 237.7,
+          "confidence": 1.0
+        },
+        {
+          "text": "dong",
+          "start": 237.7,
+          "end": 238.38,
+          "confidence": 0.95
+        },
+        {
+          "text": "dong,",
+          "start": 238.38,
+          "end": 238.54,
+          "confidence": 0.9
+        },
+        {
+          "text": "bing",
+          "start": 238.54,
+          "end": 238.76,
+          "confidence": 1.0
+        },
+        {
+          "text": "bang",
+          "start": 238.76,
+          "end": 239.0,
+          "confidence": 0.98
+        }
+      ]
+    }
+  ],
+  "language": "en"
+}
