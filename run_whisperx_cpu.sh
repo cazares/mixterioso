@@ -1,33 +1,31 @@
 #!/bin/bash
 # run_whisperx_cpu.sh
-# Full WhisperX pipeline in CPU float32 mode
-# Outputs a complete, pretty JSON alignment
+# Legacy-compatible WhisperX CPU run with safe 30s chunking
 
 set -e
 
-# ---------------------- CONFIG ---------------------- #
 export PYANNOTE_AUDIO_NO_PREPROCESSING=1
 export CTRANSLATE2_FORCE_CPU=1
+export WHISPERX_FORCE_CPU=1
 
 AUDIO="songs/Red_Hot_Chili_Peppers_Around_the_World.mp3"
 OUT_JSON="lyrics/Red_Hot_Chili_Peppers_Around_the_World_full.json"
 
-# ---------------------- RUN ---------------------- #
 python3 - <<'PYCODE'
 import whisperx, json, os
 
 audio = "songs/Red_Hot_Chili_Peppers_Around_the_World.mp3"
 out_json = "lyrics/Red_Hot_Chili_Peppers_Around_the_World_full.json"
 
-print("🔧 Loading WhisperX (float32 CPU mode)...")
+print("🔧 Loading WhisperX (float32 CPU mode, legacy-safe)...")
 model = whisperx.load_model("small", device="cpu", compute_type="float32")
 
-print("🎙️ Transcribing full audio (chunk_size=120s, no VAD)...")
+print("🎙️ Transcribing with fixed 30s chunks (no VAD)...")
+# forcibly process in 30s windows to match expected model input
 result = model.transcribe(
     audio,
     language="en",
-    vad_method=None,
-    chunk_size=120
+    chunk_size=30,
 )
 
 print("🔩 Aligning with WAV2VEC2_ASR_LARGE_LV60K_960H...")
