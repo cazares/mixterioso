@@ -114,7 +114,6 @@ def srt_time(t: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 def write_ass(path: Path, w: int, h: int, size: int, lines, starts, offset, hold):
-    # Force embed NotoColorEmoji font
     ensure_dir(Path("assets"))
     font_path = Path("assets/NotoColorEmoji.ttf")
     if not font_path.exists():
@@ -140,11 +139,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for i, line in enumerate(lines):
             st = starts[i] + offset
             en = starts[i + 1] + offset - 0.15 if i < len(lines) - 1 else st + hold
-            f.write(f"Dialogue: 0,{srt_time(st)},{srt_time(en)},Default,,0,0,0,,{line}\n")
+            f.write(f"Dialogue: 0,{srt_time(st)},{srt_time(en)},Default,,0,0,0,,{{\\an5}}{line}\n")
     info(f"🖋️  Wrote ASS {path}")
 
 def handle_youtube_download(url: str, lyrics_path: Path):
-    """Download from YouTube but always use lyrics basename for output folder and file naming."""
     ensure_dir(Path("songs"))
     human_base = sanitize_basename(lyrics_path)
     out_mp3 = Path("songs") / f"{human_base}.mp3"

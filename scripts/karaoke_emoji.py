@@ -1,79 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-karaoke_emoji.py – render emoji overlays as PNGs and feed ffmpeg overlay chain.
+karaoke_emoji.py – render per-line emoji strips to PNG and generate ffmpeg overlay filters.
 
-Key properties:
-- Guaranteed color emoji using Twemoji PNGs.
-- Each unique PNG emoji is only added to ffmpeg once.
-  We then reuse its same input index for all overlay windows.
-- Overlay specs are returned for karaoke_audio_video.py to build filter_complex.
-
-Output contract:
-build_emoji_overlays(...) returns:
-  filter_cmds: [
-     { "png_stream_index": <int>, "x": <int>, "y": <int>,
-       "start": <float>, "end": <float> },
-     ...
-  ]
-  extra_inputs: [ "/abs/or/rel/path/to/emoji1.png",
-                  "/abs/or/rel/path/to/emoji2.png",
-                  ... ]
-The caller:
-  - does `-i` for audio first
-  - then `-i` for each path in extra_inputs (in given order)
-  That means:
-    audio is input #0
-    first PNG in extra_inputs is input #1
-    second PNG is input #2
-    etc.
-So for ffmpeg overlay we will reference `[1:v]`, `[2:v]`, `[3:v]`, etc.
-
-IMPORTANT:
-karaoke_audio_video.py assumed input_idx_start = 2.
-We will change that assumption here. We'll lock it to 1 so math is simpler.
-Then karaoke_audio_video.py must stop assuming "2" and just trust png_stream_index.
-We'll handle that there after this.
+New version (grid layout + scale factor):
+- Each line is split by \N into stacked rows.
+- Each character is rendered separately if it’s an emoji (Twemoji PNG).
+- font_px acts as scale factor; emojis scale proportionally.
+- Centered horizontally and vertically on the video canvas.
 """
 
 from pathlib import Path
-from typing import List, Tuple, Dict
-from PIL import ImageFont, Image, ImageDraw
-import urllib.request, re
+from typing import List, Tuple
+from PIL import Image
+import math
+import emoji
 import karaoke_core as kc
 
 
-def fetch_twemoji_png(char: str, out_dir: Path) -> Path:
-    """
-    Download a Twemoji PNG (72x72) for a single emoji codepoint sequence.
-    Cache it in out_dir/twemoji_<codepoints>.png
-    """
-    codepoints = "-".join([f"{ord(c):x}" for c in char])
-    out_dir.mkdir(parents=True, exist_ok=True)
-    local_path = out_dir / f"twemoji_{codepoints}.png"
-    if not local_path.exists():
-        url = f"https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/{codepoints}.png"
-        try:
-            with urllib.request.urlopen(url) as r:
-                local_path.write_bytes(r.read())
-            kc.info(f"🧩 Downloaded Twemoji {char} ({codepoints})")
-        except Exception:
-            kc.warn(f"⚠️ Could not fetch Twemoji for {char} ({url})")
-    return local_path
+def is_emoji(ch: str) -> bool:
+    """Rough test for emoji."""
+    return ch in emoji.EMOJI_DATA
 
 
-def line_needs_color_render(line: str) -> bool:
-    """
-    Heuristic: if line has any non-basic-ASCII char we consider it emoji/needs overlay.
-    """
-    for ch in line:
-        code = ord(ch)
-        if code < 0x20:
-            continue
-        if 0x20 <= code <= 0x7E:
-            continue
-        return True
-    return False
+def twemoji_png_path(ch: str, out_dir: Path) -> Path:
+    """Return cached Twemoji PNG path for this emoji codepoint."""
+    codepoints = "-".join([f"{ord(c):x}" for c in ch])
+    fn = f"twemoji_{codepoints}.png"
+    return out_dir / "emoji_png" / fn
+
+
+def download_twemoji_png(ch: str, out_dir: Path):
+    """Download a Twemoji PNG for this emoji to assets."""
+    import requests
+    kc.ensure_dir(out_dir / "emoji_png")
+    codepoints = "-".join([f"{ord(c):x}" for c in ch])
+    fn = f"twemoji_{codepoints}.png"
+    path = out_dir / "emoji_png" / fn
+    if path.exists():
+        return path
+    url = f"https://github.com/twitter/twemoji/raw/master/assets/72x72/{codepoints}.png"
+    r = requests.get(url, timeout=10)
+    if r.status_code == 200:
+        with open(path, "wb") as f:
+            f.write(r.content)
+    else:
+        kc.warn(f"Missing Twemoji asset for {ch} ({url})")
+    return path
 
 
 def build_emoji_overlays(
@@ -84,96 +57,74 @@ def build_emoji_overlays(
     canvas_h: int,
     font_px: int,
     out_dir: Path,
-) -> Tuple[List[Dict], List[str]]:
+) -> Tuple[List[dict], List[str]]:
     """
-    Strategy now:
-    - We IGNORE font rendering. We only do Twemoji PNGs.
-    - We gather all emojis per line (regex range 1F300-1FAFF).
-    - Each unique emoji PNG path is added once to extra_inputs.
-    - We reuse its assigned index for all overlay times.
-
-    We return:
-      filter_cmds: list of dicts with {png_stream_index,x,y,start,end}
-      extra_inputs: ordered PNG paths corresponding to stream indexes
-
-    ffmpeg input layout we guarantee:
-      0 = audio (handled by caller)
-      1 = first PNG in extra_inputs
-      2 = second PNG in extra_inputs
-      ...
-    So png_stream_index is 1-based for PNGs.
+    Build list of overlay specs and PNG input list.
+    Each emoji becomes a separate overlay with scaling.
     """
-
     kc.ensure_dir(out_dir / "emoji_png")
-
-    # compute line end times like in karaoke_core.write_ass
+    overlays = []
+    png_inputs = []
     ends = []
+
     n = len(lines)
     for i in range(n):
         st = starts[i] + offset
-        if i < n - 1:
-            en = starts[i + 1] + offset - 0.15
-            if en <= st:
-                en = st + 0.15
-        else:
-            en = st + 3.0
+        en = starts[i + 1] + offset - 0.15 if i < n - 1 else st + 3.0
         ends.append(en)
 
-    # We will build:
-    #   extra_inputs = [png_path_0, png_path_1, ...]
-    # and a lookup:
-    #   png_path -> stream_index_for_ffmpeg
-    # where stream_index_for_ffmpeg is 1-based because audio is 0.
-    extra_inputs: List[str] = []
-    png_index_map: Dict[str, int] = {}
+    scale_factor = font_px / 72.0
+    line_height = int(font_px * 1.1)
 
-    filter_cmds: List[Dict] = []
-
-    kc.info("🧩 Using Twemoji PNG overlay mode")
-
+    # pass 1: compute all overlays
     for i, text in enumerate(lines):
-        if not line_needs_color_render(text):
+        if not any(is_emoji(ch) for ch in text):
             continue
 
-        st = starts[i] + offset
-        en = ends[i]
+        line_rows = text.split("\\N")
+        total_height = len(line_rows) * line_height
+        y0 = (canvas_h - total_height) // 2
 
-        # pull emojis in this line
-        emojis = re.findall(r'[\U0001F300-\U0001FAFF]', text)
-        if not emojis:
-            continue
-
-        # We'll drop all emojis for this line at a single position on screen.
-        # Simple centering guess. You can tune this if you want nicer layout.
-        x = int(canvas_w * 0.45)
-        y = int(canvas_h * 0.4)
-
-        for e in emojis:
-            png_path_obj = fetch_twemoji_png(e, out_dir / "emoji_png")
-            if not png_path_obj.exists():
+        for row_idx, row in enumerate(line_rows):
+            emojis_in_row = [ch for ch in row if is_emoji(ch)]
+            if not emojis_in_row:
                 continue
+            row_w = int(len(emojis_in_row) * font_px)
+            x0 = (canvas_w - row_w) // 2
+            y = y0 + row_idx * line_height
 
-            png_path = str(png_path_obj)
+            for col_idx, ch in enumerate(emojis_in_row):
+                png = download_twemoji_png(ch, out_dir)
+                if str(png) not in png_inputs:
+                    png_inputs.append(str(png))
+                idx = png_inputs.index(str(png)) + 1  # +1 because audio is 0
+                x = x0 + int(col_idx * font_px)
+                y_scaled = y
+                overlays.append({
+                    "png_stream_index": idx + 0,
+                    "x": x,
+                    "y": y_scaled,
+                    "start": starts[i] + offset,
+                    "end": ends[i],
+                    "scale": scale_factor,
+                })
 
-            # assign stable index for this PNG if first time
-            if png_path not in png_index_map:
-                extra_inputs.append(png_path)
-                # index is position in extra_inputs + 1 because audio is #0
-                png_index_map[png_path] = len(extra_inputs)
+    return overlays, png_inputs
 
-            stream_idx = png_index_map[png_path]  # 1-based
 
-            filter_cmds.append({
-                "png_stream_index": stream_idx,
-                "x": x,
-                "y": y,
-                "start": st,
-                "end": en,
-            })
-
-    # Done. No out-of-range index possible because:
-    # max png_stream_index == len(extra_inputs)
-    # Caller will pass exactly len(extra_inputs) PNGs after audio.
-    return filter_cmds, extra_inputs
-
+def render_scaled_pngs(png_inputs: List[str], scale_factor: float, out_dir: Path) -> List[str]:
+    """Pre-scale Twemoji PNGs if needed."""
+    scaled_paths = []
+    for src in png_inputs:
+        src_path = Path(src)
+        dst_path = out_dir / f"scaled_{src_path.name}"
+        if dst_path.exists():
+            scaled_paths.append(str(dst_path))
+            continue
+        img = Image.open(src_path).convert("RGBA")
+        new_size = (int(img.width * scale_factor), int(img.height * scale_factor))
+        img = img.resize(new_size, Image.LANCZOS)
+        img.save(dst_path)
+        scaled_paths.append(str(dst_path))
+    return scaled_paths
 # end of karaoke_emoji.py
