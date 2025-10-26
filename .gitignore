@@ -19,3 +19,8 @@ merged_output/
 ouput/
 separated/
 songs/
+*.png
+*.yml
+*.svg
+assets/
+lyrics/
