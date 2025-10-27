@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # car_karaoke_time.py
 # Single-call pipeline:
-# - Detect URL in first line of lyrics, download MP3 via yt-dlp, ignore that line for display
-# - Manual timing (or reuse CSV), render video-only once, then mux 3 finals:
-#     1) 100% vocals: original MP3, no Demucs, no audio processing besides AAC mux
-#     2) 25% vocals: Demucs 6-stem, vocals at 0.25 over instrumental
-#     3) 0%  vocals: Demucs 6-stem, instrumental only
+# - Detect URL in first line of lyrics (if present), download MP3 via yt-dlp, ignore that line for display
+# - Manual timing (or reuse CSV), render video-only once, optionally append end-duration,
+#   then mux three finals:
+#     1) 100% vocals: original MP3, no Demucs
+#     2) 25% vocals: Demucs 4-stem, vocals at 0.25 over instrumental
+#     3) 0%  vocals: Demucs 4-stem, instrumental only
 # - --resync-offset: fast re-mux path
 # - default: open output folder; disable via --skip-open-dir
 # - --reuse-existing-timings: reuse CSV after editing lyrics text
@@ -50,7 +51,8 @@ def sanitize_lyrics_and_detect_url(lyrics_path: Path, tmp_dir: Path) -> tuple[Pa
 def ffprobe_has_audio(path: Path) -> bool:
     try:
         out = subprocess.check_output(
-            ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
             stderr=subprocess.STDOUT
         ).decode().strip()
         return bool(out)
@@ -67,6 +69,8 @@ def build_args():
     ap.add_argument("--seconds-per-slide", type=float, help="Used only if --timings not given")
     ap.add_argument("--offset-video", type=float, default=0.0,
                     help="Seconds to delay the VIDEO vs AUDIO during mux. Positive delays video.")
+    ap.add_argument("--append-end-duration", type=float, default=3.0,
+                    help="Extra seconds to freeze the final frame at the end of the video render (for credits). 0 disables.")
     ap.add_argument("--resync-offset", type=float,
                     help="Shortcut: reuse existing render and only re-mux with this offset. Implies --mux-only.")
     ap.add_argument("--reuse-existing-timings", action="store_true",
@@ -91,17 +95,17 @@ def build_args():
     ap.add_argument("--only-100", action="store_true",
                     help="Skip Demucs variants; produce only the full-vocals output")
     ap.add_argument("--demucs-model", default="htdemucs",
-                    help="Demucs model name for 6-stem separation")
+                    help="Demucs model name (default 4-stem: htdemucs).")
     ap.add_argument("--demucs-overlap", type=float, default=0.25,
                     help="Demucs overlap fraction (higher = better, slower)")
-    ap.add_argument("--demucs-seg", type=int, default=6,
+    ap.add_argument("--demucs-seg", type=int, default=10,
                     help="Demucs segment length seconds (smaller = better, slower)")
     return ap.parse_args()
 
 def main():
     args = build_args()
 
-    # Apply aliases and shortcuts
+    # Aliases and shortcuts
     if args.rerender_lyrics:
         args.reuse_existing_timings = True
     if args.resync_offset is not None:
@@ -125,8 +129,8 @@ def main():
         print(f"Info: detected URL in first line of lyrics, will use it: {detected_url}")
         args.url = detected_url
 
-    base = args.basename or derive_base(lyrics_src_path)   # base from original name (stable for outputs)
-    render_base = derive_base(lyrics_path)                  # may be *_sanitized
+    base = args.basename or derive_base(lyrics_src_path)   # output naming uses original name
+    render_base = derive_base(lyrics_path)                  # renderer may use sanitized name
 
     outdir = Path(args.outdir).resolve()
     timings_outdir = Path(args.timings_outdir).resolve()
@@ -135,17 +139,21 @@ def main():
     ensure_dir(outdir); ensure_dir(timings_outdir); ensure_dir(songs_dir); ensure_dir(sep_root)
 
     timings_csv = Path(args.timings).resolve() if args.timings else (timings_outdir / f"{base}.csv")
-    rendered_mp4 = outdir / f"{render_base}_chrome_static.mp4"  # video-only render path
-    # Final outputs:
-    mp4_full   = outdir / f"{base}_chrome_static_with_audio_sync.mp4"          # 100% vocals (unchanged)
-    mp4_v25    = outdir / f"{base}_vocals25_chrome_static_with_audio_sync.mp4" # 25% vocals
-    mp4_novox  = outdir / f"{base}_no_vocals_chrome_static_with_audio_sync.mp4" # 0% vocals
-
-    # Fallback if sanitized name was used earlier by renderer
+    rendered_mp4 = outdir / f"{render_base}_chrome_static.mp4"  # video-only render
+    # If sanitized name used earlier:
     if not rendered_mp4.exists():
         alt = outdir / f"{base}_sanitized_chrome_static.mp4"
         if alt.exists():
             rendered_mp4 = alt
+
+    # Extended video if we append end duration
+    extended_mp4 = outdir / f"{render_base}_chrome_static_ext.mp4"
+    video_for_mux = rendered_mp4  # default
+
+    # Final outputs:
+    mp4_full   = outdir / f"{base}_chrome_static_with_audio_sync.mp4"            # 100% vocals
+    mp4_v25    = outdir / f"{base}_vocals25_chrome_static_with_audio_sync.mp4"   # 25% vocals
+    mp4_novox  = outdir / f"{base}_no_vocals_chrome_static_with_audio_sync.mp4"  # 0%  vocals
 
     # Deps
     if shutil.which("ffmpeg") is None:
@@ -194,8 +202,6 @@ def main():
         cmds.append(ytdlp_cmd)
 
     # Step 1: timings
-    # - Normal: generate if not provided and no fixed seconds-per-slide
-    # - --reuse-existing-timings: skip timings generation but require an existing timings CSV
     need_timings = False
     if args.reuse_existing_timings:
         if not timings_csv.exists():
@@ -230,12 +236,32 @@ def main():
             krc += ["--seconds-per-slide", str(args.seconds_per_slide)]
         cmds.append(krc)
 
+    # Step 2.5: optionally append end duration by freezing the last frame (re-encode once)
+    # Do this even in --mux-only if requested.
+    need_extend = args.append_end_duration and args.append_end_duration > 0
+    if need_extend:
+        # build once from current rendered_mp4
+        extend_cmd = [
+            "ffmpeg", "-y",
+            "-i", str(rendered_mp4),
+            "-filter:v", f"tpad=stop_mode=clone:stop_duration={args.append_end_duration}",
+            "-an",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(extended_mp4),
+        ]
+        cmds.append(extend_cmd)
+        video_for_mux = extended_mp4
+    else:
+        video_for_mux = rendered_mp4
+
     # --- Step 3: mux 100% vocals (unchanged) ---
     if not args.render_only:
         ff_full = [
             "ffmpeg", "-y",
             "-itsoffset", str(args.offset_video),
-            "-i", str(rendered_mp4),
+            "-i", str(video_for_mux),
             "-i", str(audio_path),
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
@@ -261,7 +287,7 @@ def main():
         ]
         cmds.append(demucs_cmd)
 
-        # Paths to stems
+        # Stems directory
         stems_dir = stems_out / args.demucs_model / base
         vocals_wav  = stems_dir / "vocals.wav"
         drums_wav   = stems_dir / "drums.wav"
@@ -270,15 +296,22 @@ def main():
         guitar_wav  = stems_dir / "guitar.wav"
         piano_wav   = stems_dir / "piano.wav"
 
-        # Build instrumental: sum all non-vocal stems
+        # Build instrumental dynamically from available non-vocal stems (4- or 6-stem)
+        stem_list = [drums_wav, bass_wav, other_wav]
+        if guitar_wav.exists(): stem_list.append(guitar_wav)
+        if piano_wav.exists():  stem_list.append(piano_wav)
+
         instrumental_wav = stems_dir / f"{base}_instrumental_mix.wav"
-        # Use amix with equal weights, normalization off to preserve headroom
+        fc_inputs = []
+        ff_inputs = []
+        for idx, pth in enumerate(stem_list):
+            ff_inputs += ["-i", str(pth)]
+            fc_inputs.append(f"[{idx}:a]")
+        amix = f"{''.join(fc_inputs)}amix=inputs={len(stem_list)}:normalize=0[a]"
         ff_instr = [
             "ffmpeg", "-y",
-            "-i", str(drums_wav), "-i", str(bass_wav), "-i", str(other_wav),
-            "-i", str(guitar_wav), "-i", str(piano_wav),
-            "-filter_complex",
-            "[0:a][1:a][2:a][3:a][4:a]amix=inputs=5:normalize=0[a];[a]dynaudnorm[aout]",
+            *ff_inputs,
+            "-filter_complex", amix + ";[a]dynaudnorm[aout]",
             "-map", "[aout]",
             "-c:a", "pcm_s16le",
             str(instrumental_wav),
@@ -289,7 +322,7 @@ def main():
         ff_novox = [
             "ffmpeg", "-y",
             "-itsoffset", str(args.offset_video),
-            "-i", str(rendered_mp4),
+            "-i", str(video_for_mux),
             "-i", str(instrumental_wav),
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
@@ -313,7 +346,7 @@ def main():
         ff_v25_mux = [
             "ffmpeg", "-y",
             "-itsoffset", str(args.offset_video),
-            "-i", str(rendered_mp4),
+            "-i", str(video_for_mux),
             "-i", str(v25_wav),
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
@@ -330,6 +363,8 @@ def main():
     print("\nOutputs:")
     if not args.render_only and not args.mux_only:
         print(" - Video-only render:", rendered_mp4)
+        if need_extend:
+            print(" - Extended video   :", extended_mp4)
     print(" - 100% vocals:", mp4_full)
     if not args.only_100 and not args.mux_only:
         print(" - 25% vocals:", mp4_v25)
