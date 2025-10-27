@@ -1,156 +1,109 @@
 #!/usr/bin/env python3
 """
 karaoke_render_chrome.py
-Generates static lyric slides (1920x1080) with emoji and text rendering.
-Supports multiple rendering modes.
+Stable 1080p text+emoji renderer.
 """
 
 import os
 import sys
 import argparse
-import html
-from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
+import textwrap
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from PIL import Image
+import time
 
-# ---------- Utility ----------
+def render_text_to_png(lines, output_dir, font_size):
+    os.makedirs(output_dir, exist_ok=True)
+    width, height = 1920, 1080
 
-def html_escape(s: str) -> str:
-    return html.escape(s)
-
-def split_text_and_emojis(text: str):
-    """Splits a string into (is_emoji, token) tuples."""
-    import regex
-    emoji_pattern = regex.compile(r'\X', regex.UNICODE)
-    tokens = []
-    for grapheme in emoji_pattern.findall(text):
-        if any(ord(ch) > 10000 for ch in grapheme):
-            tokens.append((True, grapheme))
-        else:
-            tokens.append((False, grapheme))
-    return tokens
-
-# ---------- Mode 4 (fixed) ----------
-
-def html_for_mode4_placeholder_split(text: str, font_size: int) -> str:
+    html_template = """
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <style>
+      body {{
+        margin: 0;
+        padding: 0;
+        width: {w}px;
+        height: {h}px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: black;
+      }}
+      .text {{
+        color: white;
+        font-size: {fs}px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        text-align: center;
+        white-space: pre-wrap;
+        line-height: 1.2;
+        word-break: break-word;
+      }}
+    </style>
+    </head>
+    <body>
+      <div class="text">{text}</div>
+    </body>
+    </html>
     """
-    Mode 4: baseline with hidden placeholders and absolutely positioned emoji spans.
-    Supports word wrapping and centered alignment.
-    """
-    per_line = text.split("\n")
-    emoji_overlays = []
-    rendered_lines = []
-    emoji_counter = 0
-    char_w_px = int(font_size * 0.6)
-    line_height_px = int(font_size * 1.1)
 
-    for line_idx, line in enumerate(per_line):
-        tokens = split_text_and_emojis(line)
-        baseline_chunks = []
-        col_index = 0
-        for is_emo, tok in tokens:
-            if is_emo:
-                ph = f"[[E{emoji_counter}]]"
-                baseline_chunks.append(f'<span class="ph">{ph}</span>')
-                emoji_overlays.append({
-                    "id": emoji_counter,
-                    "emo": tok,
-                    "line_idx": line_idx,
-                    "col_index": col_index,
-                })
-                col_index += 2
-                emoji_counter += 1
-            else:
-                baseline_chunks.append(html_escape(tok))
-                col_index += len(tok)
-        rendered_lines.append("".join(baseline_chunks))
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--hide-scrollbars")
+    chrome_options.add_argument(f"--window-size={width},{height}")
+    chrome_options.binary_location = "/Applications/Chromium.app/Contents/MacOS/Chromium"
 
-    baseline_html = "<br/>".join(rendered_lines)
-    emoji_span_html = []
-    for e in emoji_overlays:
-        x_px = e["col_index"] * char_w_px
-        y_px = e["line_idx"] * line_height_px
-        emoji_span_html.append(
-            f'<div class="emo" style="left:{x_px}px; top:{y_px}px;">{html_escape(e["emo"])}</div>'
-        )
+    driver = webdriver.Chrome(options=chrome_options)
 
-    emoji_layer_html = "\n".join(emoji_span_html)
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<style>
-  html, body {{
-    margin: 0;
-    width: 1920px;
-    height: 1080px;
-    background: black;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }}
-  .stage {{
-    position: relative;
-    width: 90%;
-    max-width: 90%;
-    color: white;
-    text-align: center;
-    font-size: {font_size}px;
-    line-height: {line_height_px}px;
-    font-family: Arial, sans-serif;
-    word-wrap: break-word;
-    white-space: pre-wrap;
-  }}
-  .ph {{
-    visibility: hidden;
-  }}
-  .emo {{
-    position: absolute;
-    font-size: {font_size}px;
-  }}
-</style>
-</head>
-<body>
-  <div class="stage">
-    <div class="baseline">{baseline_html}</div>
-    {emoji_layer_html}
-  </div>
-</body>
-</html>
-"""
+    for i, raw_line in enumerate(lines):
+        text = raw_line.replace("\\N", "\n").replace("\r", "")
+        html = html_template.format(w=width, h=height, fs=font_size, text=text)
+        tmp_file = f"/tmp/karaoke_render_{i}.html"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            f.write(html)
 
-# ---------- Rendering engine ----------
+        driver.get("file://" + tmp_file)
+        time.sleep(0.15)
 
-def generate_html_frames(lyrics_path: str, out_dir: str, mode: str, font_size: int):
-    """Generate one HTML file per lyric line for Chrome capture."""
-    os.makedirs(out_dir, exist_ok=True)
-    lines = Path(lyrics_path).read_text(encoding="utf-8").splitlines()
+        png_path = os.path.join(output_dir, f"frame_{i:04d}.png")
+        driver.save_screenshot(png_path)
 
-    for i, line in enumerate(lines, start=1):
-        line = line.strip()
-        if not line:
-            continue
-        html_content = html_for_mode4_placeholder_split(line, font_size)
-        out_path = Path(out_dir) / f"slide_{i:03d}.html"
-        out_path.write_text(html_content, encoding="utf-8")
-        print(f"✅ wrote {out_path}")
+    driver.quit()
 
-    print(f"\nAll {len(lines)} slides ready at: {out_dir}")
-
-# ---------- Main ----------
 
 def main():
-    parser = argparse.ArgumentParser(description="Render karaoke slides with emoji support.")
-    parser.add_argument("--lyrics", required=True, help="Path to lyrics text file")
-    parser.add_argument("--font-size", type=int, default=100, help="Base font size")
-    parser.add_argument("--modes", nargs="+", default=["mode4_placeholder_split"], help="Render modes to run")
+    parser = argparse.ArgumentParser(description="Render static text+emoji slides to PNGs using Chrome.")
+    parser.add_argument("--lyrics", required=True, help="Path to lyrics .txt file")
+    parser.add_argument("--font-size", type=int, default=100, help="Font size (default: 100)")
     args = parser.parse_args()
 
-    base_out_dir = Path("output/frames_chrome")
-    for mode in args.modes:
-        out_dir = base_out_dir / mode
-        print(f"\n🎬 Rendering {mode} → {out_dir}")
-        generate_html_frames(args.lyrics, out_dir, mode, args.font_size)
+    if not os.path.exists(args.lyrics):
+        sys.exit(f"FATAL: lyrics file not found: {args.lyrics}")
+
+    output_dir = "output/frames_chrome"
+    os.makedirs(output_dir, exist_ok=True)
+
+    with open(args.lyrics, "r", encoding="utf-8") as f:
+        text = f.read().strip()
+
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+
+    print(f"🎬 Rendering {len(lines)} slides to {output_dir}/ ...")
+    render_text_to_png(lines, output_dir, args.font_size)
+    print("✅ Done rendering PNGs. Now run ffmpeg:")
+
+    print(f"""
+ffmpeg -y -framerate 1/1.5 \\
+  -pattern_type glob \\
+  -i "{output_dir}/*.png" \\
+  -c:v libx264 -r 30 -pix_fmt yuv420p \\
+  output/chrome_rendered_mp4s/{os.path.basename(args.lyrics).replace('.txt','')}_chrome_static.mp4
+    """)
+
 
 if __name__ == "__main__":
     main()
+
 # end of karaoke_render_chrome.py
