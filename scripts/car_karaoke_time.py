@@ -99,7 +99,7 @@ def main():
             "--lyrics", str(lyrics_path),
             "--font-size", str(args.font_size),
         ]
-        if args.remove-cache: krc.append("--remove-cache")
+        if args.remove_cache: krc.append("--remove-cache")
         if args.timings or need_timings:
             krc += ["--timings", str(timings_csv), "--last-slide-hold", str(args.last_slide_hold)]
         else:
