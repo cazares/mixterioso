@@ -104,6 +104,7 @@ def main():
         args.url = detected_url
 
     base = args.basename or derive_base(lyrics_src_path)  # base from original name
+    render_base = derive_base(lyrics_path)
 
     outdir = Path(args.outdir).resolve()
     timings_outdir = Path(args.timings_outdir).resolve()
@@ -111,8 +112,14 @@ def main():
     ensure_dir(outdir); ensure_dir(timings_outdir); ensure_dir(songs_dir)
 
     timings_csv = Path(args.timings).resolve() if args.timings else (timings_outdir / f"{base}.csv")
-    rendered_mp4 = outdir / f"{base}_chrome_static.mp4"
+    rendered_mp4 = outdir / f"{render_base}_chrome_static.mp4"
     muxed_mp4 = outdir / f"{base}_chrome_static_with_audio_sync.mp4"
+
+    # Fallback if sanitized name was used earlier
+    if not rendered_mp4.exists():
+        alt = outdir / f"{base}_sanitized_chrome_static.mp4"
+        if alt.exists():
+            rendered_mp4 = alt
 
     # Deps
     if shutil.which("ffmpeg") is None:
@@ -197,6 +204,12 @@ def main():
                 print("ERROR: provide --timings or --seconds-per-slide"); sys.exit(7)
             krc += ["--seconds-per-slide", str(args.seconds_per_slide)]
         cmds.append(krc)
+
+    # Fallback: if expected render missing but *_sanitized_* exists, use it
+    if not rendered_mp4.exists():
+        alt = outdir / f"{base}_sanitized_chrome_static.mp4"
+        if alt.exists():
+            rendered_mp4 = alt
 
     # Step 3: mux
     if not args.render_only:
