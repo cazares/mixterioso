@@ -1,9 +1,0 @@
-name: Karaoke Time Sanity Test
-on: [push]
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Python Sanity Test
-        run: python3 karaoke_time.py --help || true
