@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # scripts/car_karaoke_time.py
 
-import argparse, sys, subprocess, shlex, shutil, tempfile, os
+import argparse, sys, subprocess, shlex, shutil, tempfile, os, csv
 from pathlib import Path
 
 def run(cmd, cwd: Path | None = None, check: bool = True):
@@ -37,6 +37,26 @@ def sanitize_lyrics_and_detect_url(lyrics_path: Path, tmp_dir: Path) -> tuple[Pa
         return out, detected_url
     return lyrics_path, None
 
+def csv_to_lyrics(csv_path: Path, tmp_dir: Path) -> Path:
+    """
+    Build a temporary lyrics.txt from a timings CSV that contains lyric text.
+    Heuristic: use last column as the lyric line. Ignore blank lines.
+    """
+    out = tmp_dir / f"{csv_path.stem}_lyrics_from_csv.txt"
+    lines_out = []
+    with csv_path.open("r", encoding="utf-8", errors="ignore") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row: continue
+            text = row[-1].strip()
+            if not text: continue
+            # Handle escaped \N used by some pipelines to mean newline
+            text = text.replace("\\N", "\n")
+            lines_out.append(text)
+    with out.open("w", encoding="utf-8") as g:
+        g.write("\n".join(lines_out))
+    return out
+
 def ffprobe_has_audio(path: Path) -> bool:
     try:
         out = subprocess.check_output(
@@ -51,36 +71,45 @@ def ffprobe_has_audio(path: Path) -> bool:
 def build_args():
     ap = argparse.ArgumentParser(description="Car Karaoke pipeline runner")
     ap.add_argument("--repo-root", default=".", help="Repo root where scripts/ lives")
-    ap.add_argument("--lyrics", required=True, help="Path to lyrics .txt")
+    ap.add_argument("--lyrics", help="Path to lyrics .txt (optional if --timings provided)")
     ap.add_argument("--audio", help="Path to song audio (e.g., .mp3)")
     ap.add_argument("--url", help="YouTube URL. If given and --audio not set, downloads MP3 via yt-dlp")
     ap.add_argument("--timings", help="Existing timings CSV. If absent, will generate (unless --seconds-per-slide).")
     ap.add_argument("--seconds-per-slide", type=float, help="Used only if --timings not given")
-    ap.add_argument("--offset-video", type=float, default=0.0, help="Seconds to delay VIDEO vs AUDIO during mux. Positive delays video.")
-    ap.add_argument("--append-end-duration", type=float, default=3.0, help="Freeze last frame for N seconds. 0 disables.")
-    ap.add_argument("--resync-offset", type=float, help="Reuse existing render and only re-mux with this offset. Implies --mux-only.")
-    ap.add_argument("--reuse-existing-timings", action="store_true", help="Reuse timings CSV and re-render with updated lyrics, then mux.")
-    ap.add_argument("--font-size", type=int, default=100)
+
+    ap.add_argument("--offset-video", type=float, default=0.0,
+                    help="Seconds to delay VIDEO vs AUDIO during mux. Positive delays video.")
+    ap.add_argument("--append-end-duration", type=float, default=3.0,
+                    help="Freeze last frame for N seconds. 0 disables.")
+    ap.add_argument("--resync-offset", type=float,
+                    help="Reuse existing render and only re-mux with this offset. Implies --mux-only.")
+
+    ap.add_argument("--font-size", type=int, default=110)
     ap.add_argument("--last-slide-hold", type=float, default=3.0)
     ap.add_argument("--aac-kbps", type=int, default=192)
-    ap.add_argument("--remove-cache", action="store_true", help="Pass --remove-cache to the Chrome renderer (fresh render).")
-    ap.add_argument("--keep-intermediates", action="store_true", help="Keep video-only render files; default removes them after mux.")
-    ap.add_argument("--skip-open-dir", action="store_true", help="Do not open the output folder.")
+
+    ap.add_argument("--remove-cache", action="store_true",
+                    help="Pass --remove-cache to the Chrome renderer (fresh render).")
+    ap.add_argument("--keep-intermediates", action="store_true",
+                    help="Keep video-only render files; default removes them after mux.")
+    ap.add_argument("--skip-open-dir", action="store_true",
+                    help="Do not open the output folder.")
     ap.add_argument("--outdir", default="output/chrome_rendered_mp4s")
     ap.add_argument("--timings-outdir", default="output/timings")
     ap.add_argument("--songs-dir", default="songs", help="Where to place downloaded MP3s")
-    ap.add_argument("--basename", help="Override output base name (defaults to lyrics filename)")
+    ap.add_argument("--basename", help="Override output base name (defaults to lyrics filename or timings name)")
     ap.add_argument("--render-only", action="store_true")
     ap.add_argument("--mux-only", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
 
     # Demucs and mixing
-    ap.add_argument("--only-100", action="store_true", help="Skip Demucs variants; produce only the full-vocals output")
     ap.add_argument("--high-quality", action="store_true", help="Use 6-stem Demucs (htdemucs_6s)")
-    ap.add_argument("--demucs-model", default="htdemucs", help="Demucs model (default 4-stem: htdemucs). Overridden by --high-quality.")
+    ap.add_argument("--demucs-model", default="htdemucs",
+                    help="Demucs model (default 4-stem: htdemucs). Overridden by --high-quality.")
     ap.add_argument("--demucs-overlap", type=float, default=0.25, help="Demucs overlap (higher = better, slower)")
     ap.add_argument("--demucs-seg", type=int, default=6, help="Demucs segment seconds (Transformer models must be <= ~7.8)")
     ap.add_argument("--vocal-pcts", nargs="*", type=float, help="Space-separated vocal percentages, e.g. --vocal-pcts 0 25 100")
+    ap.add_argument("--force-demucs", action="store_true", help="Ignore cached stems and re-run Demucs")
     return ap.parse_args()
 
 def main():
@@ -98,20 +127,54 @@ def main():
     repo_root = Path(args.repo_root).resolve()
     scripts_dir = repo_root / "scripts"
 
-    lyrics_src_path = Path(args.lyrics).resolve()
-    if not lyrics_src_path.exists():
-        print("ERROR: --lyrics not found:", lyrics_src_path); sys.exit(2)
+    # Base name resolution: prefer lyrics, else timings
+    if args.lyrics:
+        lyrics_src_path = Path(args.lyrics).resolve()
+        if not lyrics_src_path.exists():
+            print("ERROR: --lyrics not found:", lyrics_src_path); sys.exit(2)
+    else:
+        lyrics_src_path = None
 
-    # URL in first line (optional)
+    timings_csv = Path(args.timings).resolve() if args.timings else None
+    if timings_csv and not timings_csv.exists():
+        print("ERROR: --timings not found:", timings_csv); sys.exit(2)
+
+    # If no lyrics and no timings, we can't proceed
+    if not lyrics_src_path and not timings_csv:
+        print("ERROR: provide --lyrics or --timings."); sys.exit(2)
+
+    # Output base
+    if args.basename:
+        base = args.basename
+    else:
+        seed_path = lyrics_src_path or timings_csv
+        base = derive_base(seed_path)
+
+    # URL-in-first-line for lyrics if present
     tmp_dir = Path(tempfile.gettempdir()) / "car_karaoke_time_tmp"
     ensure_dir(tmp_dir)
-    lyrics_path, detected_url = sanitize_lyrics_and_detect_url(lyrics_src_path, tmp_dir)
+
+    detected_url = None
+    if lyrics_src_path:
+        lyrics_path, detected_url = sanitize_lyrics_and_detect_url(lyrics_src_path, tmp_dir)
+    else:
+        lyrics_path = None
+
+    # If timings provided, confirm reuse; if no lyrics, generate lyrics from CSV
+    if timings_csv:
+        try:
+            ans = input(f"Reuse timings at {timings_csv}? [Y/n]: ").strip().lower()
+        except EOFError:
+            ans = "y"
+        if ans in ("n", "no"):
+            timings_csv = None  # will regenerate below
+        if not lyrics_path:
+            lyrics_path = csv_to_lyrics(Path(args.timings), tmp_dir)
+
+    # Prefer explicit --url, else URL detected in lyrics first line
     if not args.url and detected_url:
         print(f"Info: detected URL in first line of lyrics, will use it: {detected_url}")
         args.url = detected_url
-
-    base = args.basename or derive_base(lyrics_src_path)   # stable for outputs
-    render_base = derive_base(lyrics_path)                  # may be *_sanitized
 
     outdir = Path(args.outdir).resolve()
     timings_outdir = Path(args.timings_outdir).resolve()
@@ -129,18 +192,12 @@ def main():
         vocal_pcts = [float(x) for x in raw.split()] if raw else []
     if not vocal_pcts:
         print("ERROR: no vocal percentages provided."); sys.exit(13)
-
-    # clamp and normalize
-    cleaned = []
-    for p in vocal_pcts:
-        if p < 0: p = 0.0
-        if p > 200: p = 200.0  # hard cap
-        cleaned.append(p)
-    vocal_pcts = cleaned
+    # clamp
+    vocal_pcts = [0.0 if p < 0 else 200.0 if p > 200 else p for p in vocal_pcts]
 
     # Intermediates
     tmp_video_dir = Path(tempfile.mkdtemp(prefix="cktmp_"))
-    timings_csv = Path(args.timings).resolve() if args.timings else (timings_outdir / f"{base}.csv")
+    render_base = derive_base(lyrics_path) if lyrics_path else base
     rendered_mp4 = tmp_video_dir / f"{render_base}_chrome_static.mp4"
     extended_mp4 = tmp_video_dir / f"{render_base}_chrome_static_ext.mp4"
     video_for_mux = rendered_mp4
@@ -151,10 +208,11 @@ def main():
     if not (scripts_dir / "karaoke_render_chrome.py").exists():
         print("ERROR: scripts/karaoke_render_chrome.py not found at", scripts_dir); sys.exit(4)
     if (not args.mux_only
+        and not timings_csv
         and not (scripts_dir / "make_timing_csv.py").exists()
-        and args.timings is None
-        and not args.reuse_existing_timings):
-        print("WARN: scripts/make_timing_csv.py not found; will proceed only if --timings provided or --seconds-per-slide used, or --reuse-existing-timings specified.")
+        and args.seconds_per_slide is None):
+        print("ERROR: need scripts/make_timing_csv.py to auto-generate timings, or provide --timings or --seconds-per-slide.")
+        sys.exit(4)
 
     # Audio source
     audio_path = Path(args.audio).resolve() if args.audio else None
@@ -184,18 +242,20 @@ def main():
             run(ytdlp_cmd)
 
         # Timings
-        if args.reuse_existing_timings:
-            if not timings_csv.exists():
-                print("ERROR: --reuse-existing-timings needs", timings_csv); sys.exit(10)
-        elif not args.mux_only:
-            need_timings = args.timings is None and args.seconds_per_slide is None
-            if need_timings:
-                run([
-                    sys.executable, str(scripts_dir / "make_timing_csv.py"),
-                    "--lyrics", str(lyrics_path),
-                    "--audio", str(audio_path),
-                    "--out", str(timings_csv),
-                ])
+        if not args.mux_only:
+            if not timings_csv:
+                # Need to generate timings
+                if not lyrics_path:
+                    print("ERROR: no lyrics available to generate timings."); sys.exit(15)
+                need_timings = args.seconds_per_slide is None
+                if need_timings:
+                    run([
+                        sys.executable, str(scripts_dir / "make_timing_csv.py"),
+                        "--lyrics", str(lyrics_path),
+                        "--audio", str(audio_path),
+                        "--out", str(timings_outdir / f"{base}.csv"),
+                    ])
+                    timings_csv = timings_outdir / f"{base}.csv"
 
         # Render video-only (renderer writes to outdir; we move to tmp)
         if not args.mux_only:
@@ -207,7 +267,7 @@ def main():
             ]
             if args.remove_cache:
                 krc.append("--remove-cache")
-            if args.reuse_existing_timings or args.timings or (args.timings is None and args.seconds_per_slide is None):
+            if timings_csv:
                 krc += ["--timings", str(timings_csv), "--last-slide-hold", str(args.last_slide_hold)]
             else:
                 if args.seconds_per_slide is None:
@@ -240,13 +300,13 @@ def main():
         print("Rendered video path will be:", rendered_mp4)
 
     # === Phase B: Produce requested mixes ===
-    # If any pct != 100 => need Demucs stems
+    # Any pct != 100 => need stems
     need_demucs = any(abs(p - 100.0) > 1e-6 for p in vocal_pcts)
-    stems_dir = None
-    vocals_wav = drums_wav = bass_wav = other_wav = guitar_wav = piano_wav = None
-    instrumental_wav = None
+    stems_dir = (repo_root / "separated" / args.demucs_model / base)
+    def have_stems(d: Path) -> bool:
+        return (d / "vocals.wav").exists() and (d / "drums.wav").exists() and (d / "bass.wav").exists() and (d / "other.wav").exists()
 
-    # 100% first if requested (opens folder early)
+    # 100% first if requested
     if 100.0 in vocal_pcts and not args.render_only:
         out_100 = outdir / f"{base}_vocals_100.mp4"
         run([
@@ -263,19 +323,23 @@ def main():
         if not args.skip_open_dir:
             open_in_explorer(outdir)
 
-    # Demucs path for any non-100
+    # Demucs if needed
+    vocals_wav = drums_wav = bass_wav = other_wav = guitar_wav = piano_wav = None
+    instrumental_wav = None
     if need_demucs and not args.mux_only:
-        if shutil.which("demucs") is None:
-            print("ERROR: demucs not found on PATH but non-100 vocal % requested"); sys.exit(11)
-        run([
-            "demucs",
-            "-n", args.demucs_model,
-            "--overlap", str(args.demucs_overlap),
-            "--segment", str(args.demucs_seg),
-            "-o", str(sep_root),
-            str(audio_path),
-        ])
-        stems_dir = sep_root / args.demucs_model / base
+        if not args.force_demucs and have_stems(stems_dir):
+            print(f"Reusing existing stems at {stems_dir}")
+        else:
+            if shutil.which("demucs") is None:
+                print("ERROR: demucs not found and stems missing."); sys.exit(11)
+            run([
+                "demucs",
+                "-n", args.demucs_model,
+                "--overlap", str(args.demucs_overlap),
+                "--segment", str(args.demucs_seg),
+                "-o", str(repo_root / "separated"),
+                str(audio_path),
+            ])
         vocals_wav  = stems_dir / "vocals.wav"
         drums_wav   = stems_dir / "drums.wav"
         bass_wav    = stems_dir / "bass.wav"
@@ -283,7 +347,7 @@ def main():
         guitar_wav  = stems_dir / "guitar.wav"
         piano_wav   = stems_dir / "piano.wav"
 
-        # Build instrumental from available non-vocal stems
+        # Instrumental from available non-vocal stems
         stem_list = [drums_wav, bass_wav, other_wav]
         if guitar_wav.exists(): stem_list.append(guitar_wav)
         if piano_wav.exists():  stem_list.append(piano_wav)
@@ -309,10 +373,8 @@ def main():
         out_path = outdir / f"{base}_vocals_{pct_int}.mp4"
 
         if abs(p - 100.0) <= 1e-6:
-            # already produced above; skip duplicate
-            if out_path.exists():
-                continue
-            # if not produced yet and in mux-only mode, still produce
+            # already produced above or will be skipped if exists
+            if out_path.exists(): continue
             if args.mux_only and not args.render_only:
                 run([
                     "ffmpeg", "-y",
@@ -347,7 +409,6 @@ def main():
 
         # p in (0,100): build scaled-vocals mix
         mix_wav = stems_dir / f"{base}_vocal{pct_int}_mix.wav"
-        # weights: instrumental=1, vocals=scale
         scale = p / 100.0
         run([
             "ffmpeg", "-y",
@@ -379,7 +440,7 @@ def main():
     if not args.skip_open_dir:
         open_in_explorer(outdir)
 
-    print("\nDone. Outputs requested:", " ".join([f"{int(round(p))}%" for p in vocal_pcts]))
+    print("\nDone. Outputs:", " ".join([f"{int(round(p))}%" for p in vocal_pcts]))
 
 if __name__ == "__main__":
     main()
