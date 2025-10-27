@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# car_karaoke_time.py
+# scripts/car_karaoke_time.py
 
 import argparse, sys, subprocess, shlex, shutil, tempfile
 from pathlib import Path
@@ -59,21 +59,23 @@ def build_args():
     ap.add_argument("--seconds-per-slide", type=float, help="Used only if --timings not given")
 
     ap.add_argument("--offset-video", type=float, default=0.0,
-                    help="Seconds to delay the VIDEO vs AUDIO during mux. Positive delays video.")
+                    help="Seconds to delay VIDEO vs AUDIO during mux. Positive delays video.")
     ap.add_argument("--append-end-duration", type=float, default=3.0,
-                    help="Freeze last frame of video for N seconds. 0 disables.")
+                    help="Freeze last frame for N seconds. 0 disables.")
 
     ap.add_argument("--resync-offset", type=float,
-                    help="Shortcut: reuse existing render and only re-mux with this offset. Implies --mux-only.")
+                    help="Reuse existing render and only re-mux with this offset. Implies --mux-only.")
     ap.add_argument("--reuse-existing-timings", action="store_true",
-                    help="Reuse existing timings CSV and re-render with updated lyrics, then mux.")
+                    help="Reuse timings CSV and re-render with updated lyrics, then mux.")
+
     ap.add_argument("--font-size", type=int, default=100)
     ap.add_argument("--last-slide-hold", type=float, default=3.0)
     ap.add_argument("--aac-kbps", type=int, default=192)
-    ap.add_argument("--remove-cache", action="store_true")
 
+    ap.add_argument("--remove-cache", action="store_true",
+                    help="Pass --remove-cache to the Chrome renderer (fresh render).")
     ap.add_argument("--skip-open-dir", action="store_true",
-                    help="Do not open the output folder when finished")
+                    help="Do not open the output folder.")
     ap.add_argument("--outdir", default="output/chrome_rendered_mp4s")
     ap.add_argument("--timings-outdir", default="output/timings")
     ap.add_argument("--songs-dir", default="songs", help="Where to place downloaded MP3s")
@@ -82,32 +84,30 @@ def build_args():
     ap.add_argument("--mux-only", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
 
-    # Demucs controls
+    # Demucs
     ap.add_argument("--only-100", action="store_true",
                     help="Skip Demucs variants; produce only the full-vocals output")
     ap.add_argument("--high-quality", action="store_true",
-                    help="Use 6-stem Demucs (htdemucs_6s) for higher quality mixes")
+                    help="Use 6-stem Demucs (htdemucs_6s)")
     ap.add_argument("--demucs-model", default="htdemucs",
-                    help="Demucs model name (default 4-stem: htdemucs). Overridden by --high-quality.")
+                    help="Demucs model (default 4-stem: htdemucs). Overridden by --high-quality.")
     ap.add_argument("--demucs-overlap", type=float, default=0.25,
-                    help="Demucs overlap fraction (higher = better, slower)")
+                    help="Demucs overlap (higher = better, slower)")
     ap.add_argument("--demucs-seg", type=int, default=6,
-                    help="Demucs segment length seconds (Transformer models must be <= ~7.8)")
+                    help="Demucs segment seconds (Transformer models must be <= ~7.8)")
     return ap.parse_args()
 
 def main():
     args = build_args()
 
-    # Flags interplay
+    # Flag interplay
     if args.resync_offset is not None:
         args.offset_video = args.resync_offset
         args.mux_only = True
     if args.high_quality:
         args.demucs_model = "htdemucs_6s"
-
-    # Clamp segment for transformer models like htdemucs/htdemucs_6s
     if "htdemucs" in args.demucs_model and args.demucs_seg > 7:
-        args.demucs_seg = 6  # safe
+        args.demucs_seg = 6  # safe for Transformer models
 
     repo_root = Path(args.repo_root).resolve()
     scripts_dir = repo_root / "scripts"
@@ -116,7 +116,7 @@ def main():
     if not lyrics_src_path.exists():
         print("ERROR: --lyrics not found:", lyrics_src_path); sys.exit(2)
 
-    # Temp dir and URL-in-first-line handling
+    # URL in first line (optional)
     tmp_dir = Path(tempfile.gettempdir()) / "car_karaoke_time_tmp"
     ensure_dir(tmp_dir)
     lyrics_path, detected_url = sanitize_lyrics_and_detect_url(lyrics_src_path, tmp_dir)
@@ -142,10 +142,10 @@ def main():
     extended_mp4 = outdir / f"{render_base}_chrome_static_ext.mp4"
     video_for_mux = rendered_mp4
 
-    # Final outputs
-    mp4_full  = outdir / f"{base}_chrome_static_with_audio_sync.mp4"            # 100%
-    mp4_v25   = outdir / f"{base}_vocals25_chrome_static_with_audio_sync.mp4"   # 25%
-    mp4_novox = outdir / f"{base}_no_vocals_chrome_static_with_audio_sync.mp4"  # 0%
+    # Finals (all include audio)
+    mp4_full  = outdir / f"{base}_chrome_static_with_audio_sync.mp4"            # 100% vocals
+    mp4_v25   = outdir / f"{base}_vocals25_chrome_static_with_audio_sync.mp4"   # 25% vocals
+    mp4_novox = outdir / f"{base}_no_vocals_chrome_static_with_audio_sync.mp4"  # 0% vocals
 
     # Deps
     if shutil.which("ffmpeg") is None:
@@ -158,12 +158,12 @@ def main():
         and not args.reuse_existing_timings):
         print("WARN: scripts/make_timing_csv.py not found; will proceed only if --timings provided or --seconds-per-slide used, or --reuse-existing-timings specified.")
 
-    # Audio selection
+    # Audio source
     audio_path = Path(args.audio).resolve() if args.audio else None
     if audio_path and not audio_path.exists():
         print("ERROR: --audio not found:", audio_path); sys.exit(6)
 
-    # Auto-download if needed
+    # Auto-download
     if not audio_path and args.url and not args.mux_only:
         if shutil.which("yt-dlp") is None:
             print("ERROR: yt-dlp not found on PATH but --url was provided"); sys.exit(7)
@@ -179,23 +179,21 @@ def main():
     if not args.render_only and not audio_path:
         print("ERROR: need --audio or --url"); sys.exit(5)
 
-    # Ensure render exists in mux-only path
+    # Ensure render exists in mux-only
     if args.mux_only and not rendered_mp4.exists():
         print("ERROR: expected rendered video missing:", rendered_mp4)
-        print("Run a render first without --mux-only.")
-        sys.exit(9)
+        print("Run a render first without --mux-only."); sys.exit(9)
 
-    # === PHASE A: prep and render ===
+    # === Phase A: Prep ===
     if not args.dry_run:
-        # Download audio if planned and missing
+        # Download if planned and missing
         if not args.render_only and args.url and audio_path and not audio_path.exists():
             run(ytdlp_cmd)
 
         # Timings
         if args.reuse_existing_timings:
             if not timings_csv.exists():
-                print("ERROR: --reuse-existing-timings requires existing timings CSV at", timings_csv)
-                sys.exit(10)
+                print("ERROR: --reuse-existing-timings needs", timings_csv); sys.exit(10)
         elif not args.mux_only:
             need_timings = args.timings is None and args.seconds_per_slide is None
             if need_timings:
@@ -206,7 +204,7 @@ def main():
                     "--out", str(timings_csv),
                 ])
 
-        # Render (video-only)
+        # Render video-only
         if not args.mux_only:
             krc = [
                 sys.executable, str(scripts_dir / "karaoke_render_chrome.py"),
@@ -238,13 +236,11 @@ def main():
             video_for_mux = extended_mp4
         else:
             video_for_mux = rendered_mp4
-
     else:
-        # Dry-run summary
         print("\nDry-run. Plan only.")
         print("Rendered video path will be:", rendered_mp4)
 
-    # === PHASE B: 100% vocals first, then open dir immediately ===
+    # === Phase B: 100% vocals (always has audio track) ===
     if not args.render_only:
         run([
             "ffmpeg", "-y",
@@ -259,9 +255,9 @@ def main():
         if not ffprobe_has_audio(mp4_full):
             print("WARN: 100% vocals output missing audio stream.")
         if not args.skip_open_dir:
-            open_in_explorer(outdir)  # open early, right after first MP4 is ready
+            open_in_explorer(outdir)  # open after first MP4
 
-    # === PHASE C: Demucs variants (optional) ===
+    # === Phase C: Demucs variants (also have audio tracks) ===
     if not args.only_100 and not args.mux_only:
         if shutil.which("demucs") is None:
             print("ERROR: demucs not found on PATH but Demucs variants requested"); sys.exit(11)
@@ -304,7 +300,7 @@ def main():
             str(instrumental_wav),
         ])
 
-        # 0% vocals
+        # 0% vocals (instrumental)
         run([
             "ffmpeg", "-y",
             "-itsoffset", str(args.offset_video),
@@ -315,8 +311,10 @@ def main():
             "-shortest", "-movflags", "+faststart",
             str(mp4_novox),
         ])
+        if not ffprobe_has_audio(mp4_novox):
+            print("WARN: 0%% vocals output missing audio stream.")
 
-        # 25% vocals mix: instrumental + vocals * 0.25
+        # 25% vocals: instrumental + vocals*0.25, then mux
         v25_wav = stems_dir / f"{base}_vocal25_mix.wav"
         run([
             "ffmpeg", "-y",
@@ -336,8 +334,10 @@ def main():
             "-shortest", "-movflags", "+faststart",
             str(mp4_v25),
         ])
+        if not ffprobe_has_audio(mp4_v25):
+            print("WARN: 25%% vocals output missing audio stream.")
 
-    # Final open (safe to do again)
+    # Final open
     if not args.skip_open_dir:
         open_in_explorer(outdir)
 
