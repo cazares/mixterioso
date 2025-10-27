@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # scripts/car_karaoke_time.py
 
-import argparse, sys, subprocess, shlex, shutil, tempfile
+import argparse, sys, subprocess, shlex, shutil, tempfile, os
 from pathlib import Path
 
 def run(cmd, cwd: Path | None = None, check: bool = True):
@@ -21,8 +21,7 @@ def open_in_explorer(path: Path):
     except Exception:
         pass
 
-def derive_base(p: Path) -> str:
-    return p.stem
+def derive_base(p: Path) -> str: return p.stem
 
 def sanitize_lyrics_and_detect_url(lyrics_path: Path, tmp_dir: Path) -> tuple[Path, str | None]:
     """If first line starts with https:// treat it as URL and strip it from the lyrics."""
@@ -74,6 +73,8 @@ def build_args():
 
     ap.add_argument("--remove-cache", action="store_true",
                     help="Pass --remove-cache to the Chrome renderer (fresh render).")
+    ap.add_argument("--keep-intermediates", action="store_true",
+                    help="Keep video-only render files; default removes them after mux.")
     ap.add_argument("--skip-open-dir", action="store_true",
                     help="Do not open the output folder.")
     ap.add_argument("--outdir", default="output/chrome_rendered_mp4s")
@@ -133,19 +134,17 @@ def main():
     sep_root = repo_root / "separated"
     ensure_dir(outdir); ensure_dir(timings_outdir); ensure_dir(songs_dir); ensure_dir(sep_root)
 
-    timings_csv = Path(args.timings).resolve() if args.timings else (timings_outdir / f"{base}.csv")
-    rendered_mp4 = outdir / f"{render_base}_chrome_static.mp4"
-    if not rendered_mp4.exists():
-        alt = outdir / f"{base}_sanitized_chrome_static.mp4"
-        if alt.exists():
-            rendered_mp4 = alt
-    extended_mp4 = outdir / f"{render_base}_chrome_static_ext.mp4"
-    video_for_mux = rendered_mp4
+    # Finals (short names, all include audio)
+    mp4_full  = outdir / f"{base}_vocals_100.mp4"
+    mp4_v25   = outdir / f"{base}_vocals_25.mp4"
+    mp4_novox = outdir / f"{base}_vocals_0.mp4"
 
-    # Finals (all include audio)
-    mp4_full  = outdir / f"{base}_chrome_static_with_audio_sync.mp4"            # 100% vocals
-    mp4_v25   = outdir / f"{base}_vocals25_chrome_static_with_audio_sync.mp4"   # 25% vocals
-    mp4_novox = outdir / f"{base}_no_vocals_chrome_static_with_audio_sync.mp4"  # 0% vocals
+    # Intermediates live in temp by default
+    tmp_video_dir = Path(tempfile.mkdtemp(prefix="cktmp_"))
+    timings_csv = Path(args.timings).resolve() if args.timings else (timings_outdir / f"{base}.csv")
+    rendered_mp4 = tmp_video_dir / f"{render_base}_chrome_static.mp4"
+    extended_mp4 = tmp_video_dir / f"{render_base}_chrome_static_ext.mp4"
+    video_for_mux = rendered_mp4
 
     # Deps
     if shutil.which("ffmpeg") is None:
@@ -179,11 +178,6 @@ def main():
     if not args.render_only and not audio_path:
         print("ERROR: need --audio or --url"); sys.exit(5)
 
-    # Ensure render exists in mux-only
-    if args.mux_only and not rendered_mp4.exists():
-        print("ERROR: expected rendered video missing:", rendered_mp4)
-        print("Run a render first without --mux-only."); sys.exit(9)
-
     # === Phase A: Prep ===
     if not args.dry_run:
         # Download if planned and missing
@@ -204,8 +198,10 @@ def main():
                     "--out", str(timings_csv),
                 ])
 
-        # Render video-only
+        # Render video-only (goes to outdir by default; we’ll move it to tmp_video_dir)
         if not args.mux_only:
+            # renderer writes to: outdir / f"{render_base}_chrome_static.mp4"
+            render_out_path = outdir / f"{render_base}_chrome_static.mp4"
             krc = [
                 sys.executable, str(scripts_dir / "karaoke_render_chrome.py"),
                 "--lyrics", str(lyrics_path),
@@ -220,13 +216,19 @@ def main():
                     print("ERROR: provide --timings or --seconds-per-slide"); sys.exit(7)
                 krc += ["--seconds-per-slide", str(args.seconds_per_slide)]
             run(krc)
+            # move to temp so we don't litter outdir with intermediates
+            if render_out_path.exists():
+                ensure_dir(tmp_video_dir)
+                shutil.move(str(render_out_path), str(rendered_mp4))
+            else:
+                print("ERROR: expected render missing:", render_out_path); sys.exit(9)
 
-        # Optional end freeze
+        # Optional end freeze — normalize PTS to avoid a head gap
         if args.append_end_duration and args.append_end_duration > 0:
             run([
                 "ffmpeg", "-y",
                 "-i", str(rendered_mp4),
-                "-filter:v", f"tpad=stop_mode=clone:stop_duration={args.append_end_duration}",
+                "-filter:v", f"setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={args.append_end_duration}",
                 "-an",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                 "-pix_fmt", "yuv420p",
@@ -240,11 +242,12 @@ def main():
         print("\nDry-run. Plan only.")
         print("Rendered video path will be:", rendered_mp4)
 
-    # === Phase B: 100% vocals (always has audio track) ===
+    # === Phase B: 100% vocals (has audio), normalize timestamps at mux ===
     if not args.render_only:
         run([
             "ffmpeg", "-y",
-            "-itsoffset", str(args.offset_video),
+            "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+            "-itsoffset", str(args.offset_video),  # delays VIDEO if positive
             "-i", str(video_for_mux),
             "-i", str(audio_path),
             "-map", "0:v:0", "-map", "1:a:0",
@@ -253,11 +256,11 @@ def main():
             str(mp4_full),
         ])
         if not ffprobe_has_audio(mp4_full):
-            print("WARN: 100% vocals output missing audio stream.")
+            print("WARN: vocals_100 output missing audio stream.")
         if not args.skip_open_dir:
             open_in_explorer(outdir)  # open after first MP4
 
-    # === Phase C: Demucs variants (also have audio tracks) ===
+    # === Phase C: Demucs variants (also with audio) ===
     if not args.only_100 and not args.mux_only:
         if shutil.which("demucs") is None:
             print("ERROR: demucs not found on PATH but Demucs variants requested"); sys.exit(11)
@@ -300,9 +303,10 @@ def main():
             str(instrumental_wav),
         ])
 
-        # 0% vocals (instrumental)
+        # 0% vocals
         run([
             "ffmpeg", "-y",
+            "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
             "-itsoffset", str(args.offset_video),
             "-i", str(video_for_mux),
             "-i", str(instrumental_wav),
@@ -312,9 +316,9 @@ def main():
             str(mp4_novox),
         ])
         if not ffprobe_has_audio(mp4_novox):
-            print("WARN: 0%% vocals output missing audio stream.")
+            print("WARN: vocals_0 output missing audio stream.")
 
-        # 25% vocals: instrumental + vocals*0.25, then mux
+        # 25% vocals: instrumental + vocals*0.25
         v25_wav = stems_dir / f"{base}_vocal25_mix.wav"
         run([
             "ffmpeg", "-y",
@@ -326,6 +330,7 @@ def main():
         ])
         run([
             "ffmpeg", "-y",
+            "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
             "-itsoffset", str(args.offset_video),
             "-i", str(video_for_mux),
             "-i", str(v25_wav),
@@ -335,7 +340,14 @@ def main():
             str(mp4_v25),
         ])
         if not ffprobe_has_audio(mp4_v25):
-            print("WARN: 25%% vocals output missing audio stream.")
+            print("WARN: vocals_25 output missing audio stream.")
+
+    # Cleanup intermediates
+    if not args.keep_intermediates:
+        try:
+            shutil.rmtree(tmp_video_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     # Final open
     if not args.skip_open_dir:
