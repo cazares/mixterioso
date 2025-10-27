@@ -1,183 +1,323 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""
-Chrome emoji renderer → PNG frames → MP4
-- 1920x1080 fixed canvas
-- Centers lines horizontally and vertically
-- Preserves explicit line breaks (\N -> \n) per slide
-- Neutral spacing: no flex on the text node, no justify, word/letter spacing reset
-- Requires: Google Chrome or Chromium in PATH (as "chrome", "chromium", or "google-chrome"), and ffmpeg
-"""
+
+from __future__ import annotations
 
 import argparse
+import csv
 import html
-import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from fractions import Fraction
 from pathlib import Path
+from typing import List, Tuple, Optional
 
-HERE = Path(__file__).resolve().parent
-PROJECT = HERE.parent if (HERE.name == "scripts") else HERE
-OUT_DIR = PROJECT / "output" / "frames_chrome"
-MP4_DIR = PROJECT / "output" / "chrome_rendered_mp4s"
+# ---------- args ----------
 
-HTML_TEMPLATE = """<!doctype html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  html,body {{
-    margin:0; padding:0; width:100%; height:100%;
-    background:#000;
-  }}
-  /* Outer canvas forced to 1920x1080 for consistent screenshots */
-  .canvas {{
-    position:relative;
-    width:1920px; height:1080px;
-    background:#000;
-    display:grid;
-    place-items:center;
-  }}
-  /* A centered block that stacks lines */
-  .vbox {{
-    display:block;
-    max-width: 86%;
-    text-align:center;
-  }}
-  /* Each line is its own block to ensure no justification artifacts */
-  .line {{
-    display:block;
-    margin: 22px 0;
-    color:#fff;
-    font-family: "Helvetica Neue", Helvetica, Arial, "Apple Color Emoji", "Noto Color Emoji", "Segoe UI Emoji", sans-serif;
-    font-size:{font_size}px;
-    line-height:1.20;
-    letter-spacing: normal;
-    word-spacing: normal;
-    white-space: pre-wrap;   /* respect \n */
-    text-align: center;
-    text-rendering: optimizeLegibility;
-    font-kerning: normal;
-    -webkit-font-smoothing: antialiased;
-    -webkit-text-size-adjust: 100%;
-  }}
-</style>
-<div class="canvas">
-  <div class="vbox">
-{lines_html}
-  </div>
-</div>
-"""
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Render emoji-safe lyric slides with headless Chrome.")
+    p.add_argument("--lyrics", required=True, help="Path to UTF-8 .txt lyrics file (slash format: '/' => \\n)")
+    p.add_argument("--font-size", type=int, default=100, help="Base font size px")
+    p.add_argument("--width", type=int, default=1920, help="Output width")
+    p.add_argument("--height", type=int, default=1080, help="Output height")
+    p.add_argument("--seconds-per-slide", type=float, default=1.5, help="Fallback seconds per slide if no CSV")
+    p.add_argument("--timings", type=str, default=None, help="CSV with columns: line,start")
+    p.add_argument("--last-slide-hold", type=float, default=2.5, help="Hold for last slide if CSV used")
+    p.add_argument("--frames-dir", default="output/frames_chrome", help="Directory for PNG frames")
+    p.add_argument("--out-mp4-dir", default="output/chrome_rendered_mp4s", help="Directory for final MP4")
+    p.add_argument("--remove-cache", action="store_true", help="Delete prior frames/MP4 before rendering")
+    return p.parse_args()
 
-def find_chrome_binary() -> str:
+# ---------- utils ----------
+
+def fail(msg: str) -> None:
+    print(f"FATAL: {msg}", file=sys.stderr); sys.exit(1)
+
+def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check)
+
+def which_browser() -> str:
     candidates = [
-        "chrome",
-        "google-chrome",
-        "chromium",
-        "chromium-browser",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        shutil.which("google-chrome"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("chrome"),
     ]
     for c in candidates:
-        if shutil.which(c):
-            return shutil.which(c)
-        if os.path.exists(c) and os.access(c, os.X_OK):
+        if c and Path(c).exists():
             return c
-    print("FATAL: Chrome/Chromium binary not found. Install with: brew install --cask chromium", file=sys.stderr)
-    sys.exit(1)
+    fail("Chrome/Chromium not found.")
+    return ""
 
-def assert_ffmpeg():
-    if not shutil.which("ffmpeg"):
-        print("FATAL: ffmpeg not found. Install with: brew install ffmpeg", file=sys.stderr)
-        sys.exit(1)
+def ensure_dirs(*dirs: str) -> None:
+    for d in dirs:
+        Path(d).mkdir(parents=True, exist_ok=True)
 
-def read_lyrics(path: Path) -> list[str]:
-    if not path.exists():
-        print(f"FATAL: lyrics file not found: {path}", file=sys.stderr)
-        sys.exit(1)
-    raw = path.read_text(encoding="utf-8")
-    # Normalize CRLF and convert literal \N to actual newlines
-    raw = raw.replace("\r\n", "\n").replace("\\N", "\n")
-    # Split into slides by blank line (one “screen” per non-empty paragraph block)
-    blocks = [b.strip("\n") for b in re.split(r"\n{2,}", raw)]
-    return [b for b in blocks if b.strip() != ""]
+def cleanup(paths: List[Path]) -> None:
+    for p in paths:
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        elif p.exists():
+            try: p.unlink()
+            except Exception: pass
 
-def render_slide_html(slide_text: str, font_size: int) -> str:
-    # Each line in slide_text is already separated by real \n
-    lines = slide_text.split("\n")
-    lines_html = []
+def sanitize_basename(p: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", p.stem).strip("_") or "song"
+
+# ---------- parsing ----------
+
+def split_screens_slash(raw_text: str) -> List[str]:
+    """
+    One screen per non-empty line.
+    Inside a screen: "/" group => that many '\n' ("/" -> \n, "//" -> \n\n, ...).
+    Literal slash: '\/'.
+    """
+    text = raw_text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+
+    out = []
     for ln in lines:
-        # Escape HTML but keep emoji as-is
-        safe = html.escape(ln, quote=False)
-        lines_html.append(f'    <div class="line">{safe}</div>')
-    return HTML_TEMPLATE.format(font_size=font_size, lines_html="\n".join(lines_html))
+        s = ln.replace(r"\/", "\uE000")
+        s = re.sub(r"/{1,}", lambda m: "\n" * len(m.group(0)), s)
+        s = s.replace("\uE000", "/").strip("\n")
+        out.append(s)
+    return out
 
-def screenshot_frame(chrome_bin: str, html_str: str, out_png: Path):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as f:
-        f.write(html_str.encode("utf-8"))
-        tmp_html = f.name
-    try:
-        # Force a 1920x1080 viewport and capture PNG
+def load_timings_csv(csv_path: Path) -> List[Tuple[str, float]]:
+    rows: List[Tuple[str,float]] = []
+    with csv_path.open("r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        if "line" not in r.fieldnames or "start" not in r.fieldnames:
+            fail("timings CSV must have headers: line,start")
+        for row in r:
+            line = row["line"]
+            try:
+                st = float(row["start"])
+            except Exception:
+                continue
+            rows.append((line, st))
+    if not rows:
+        fail("timings CSV had no usable rows.")
+    return rows
+
+def compute_durations_from_starts(starts: List[float], last_hold: float) -> List[float]:
+    durs: List[float] = []
+    n = len(starts)
+    for i in range(n):
+        if i < n-1:
+            d = max(0.01, starts[i+1] - starts[i])
+        else:
+            d = max(0.01, last_hold)
+        durs.append(d)
+    return durs
+
+# ---------- HTML ----------
+
+def screen_to_html(screen_text: str, font_px: int) -> str:
+    safe = html.escape(screen_text).replace("\n", "<br/>")
+    css = (
+        "html,body{margin:0;padding:0;width:100%;height:100%;background:#000}"
+        ".container{width:100vw;height:100vh;display:flex;align-items:center;justify-content:center}"
+        f".content{{color:#fff;font-size:{font_px}px;line-height:1.25;text-align:center;"
+        "white-space:pre-wrap;overflow-wrap:anywhere;word-wrap:break-word;word-break:normal;"
+        "letter-spacing:0;word-spacing:normal;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;"
+        "font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Helvetica,Arial,"
+        "'Apple Color Emoji','Noto Color Emoji','Segoe UI Emoji',sans-serif;"
+        "max-width:90vw;max-height:90vh}}"
+    )
+    return (
+        "<!doctype html><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<style>{css}</style>"
+        "<div class='container'><div class='content'>"
+        f"{safe}"
+        "</div></div>"
+    )
+
+# ---------- render ----------
+
+def render_screens_to_pngs(
+    screens: List[str],
+    browser_bin: str,
+    frames_dir: Path,
+    width: int,
+    height: int,
+    font_size: int,
+) -> None:
+    ensure_dirs(str(frames_dir))
+    for idx, text in enumerate(screens, 1):
+        html_doc = screen_to_html(text, font_size)
+        with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as tmp:
+            tmp.write(html_doc)
+            tmp_path = Path(tmp.name)
+        out_png = frames_dir / f"{idx:04d}.png"
         cmd = [
-            chrome_bin,
-            "--headless=new",
-            "--disable-gpu",
-            f"--window-size=1920,1080",
-            f"--screenshot={str(out_png)}",
-            f"file://{tmp_html}",
+            browser_bin, "--headless=new", "--disable-gpu",
+            f"--window-size={width},{height}",
+            "--hide-scrollbars",
+            f"--screenshot={out_png}",
+            f"file://{tmp_path}",
         ]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    finally:
-        try:
-            os.unlink(tmp_html)
-        except OSError:
-            pass
+        run(cmd)
+        try: tmp_path.unlink()
+        except Exception: pass
 
-def encode_mp4_from_frames(pattern_glob: str, out_mp4: Path):
-    # Ensure even dimensions and 1080p canvas without stretching content
+# ---------- encoding ----------
+
+def write_ffconcat(
+    frames_dir: Path,
+    durations: List[float],
+) -> Path:
+    files = sorted(frames_dir.glob("*.png"))
+    if not files:
+        fail(f"No frames found in {frames_dir}")
+    if len(durations) != len(files):
+        m = min(len(durations), len(files))
+        durations = durations[:m]
+        files = files[:m]
+    concat_path = frames_dir / "slides.ffconcat"
+    with concat_path.open("w", encoding="utf-8") as f:
+        f.write("ffconcat version 1.0\n")
+        for i, (fp, dur) in enumerate(zip(files, durations)):
+            f.write(f"file '{fp.resolve()}'\n")
+            f.write(f"duration {max(0.01, float(dur)):.6f}\n")
+        # repeat last file once to honor its duration
+        f.write(f"file '{files[-1].resolve()}'\n")
+    return concat_path
+
+def encode_mp4_concat(
+    concat_file: Path,
+    out_mp4_dir: Path,
+    basename: str,
+    width: int,
+    height: int,
+) -> Path:
+    ensure_dirs(str(out_mp4_dir))
+    out_mp4 = out_mp4_dir / f"{basename}.mp4"
+    vf = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+    )
     cmd = [
         "ffmpeg", "-y",
-        "-framerate", "1/1.5",
-        "-pattern_type", "glob", "-i", pattern_glob,
-        "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black",
-        "-c:v", "libx264", "-r", "30", "-pix_fmt", "yuv420p",
-        str(out_mp4)
+        "-safe", "0",
+        "-f", "concat",
+        "-i", str(concat_file),
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-r", "30",
+        "-pix_fmt", "yuv420p",
+        str(out_mp4),
     ]
-    subprocess.run(cmd, check=True)
+    run(cmd)
+    return out_mp4
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--lyrics", required=True, help="Path to .txt")
-    p.add_argument("--font-size", type=int, default=100)
-    args = p.parse_args()
+def encode_mp4_constant_rate(
+    frames_dir: Path,
+    out_mp4_dir: Path,
+    basename: str,
+    sec_per_slide: float,
+    width: int,
+    height: int,
+) -> Path:
+    ensure_dirs(str(out_mp4_dir))
+    out_mp4 = out_mp4_dir / f"{basename}.mp4"
+    files = sorted(frames_dir.glob("*.png"))
+    if not files:
+        fail(f"No frames found in {frames_dir}")
 
-    chrome = find_chrome_binary()
-    assert_ffmpeg()
+    fr = Fraction.from_float(1.0 / max(0.1, float(sec_per_slide))).limit_denominator(1000)
+    vf = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+    )
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", f"{fr.numerator}/{fr.denominator}",
+        "-pattern_type", "glob",
+        "-i", str(frames_dir / "*.png"),
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-r", "30",
+        "-pix_fmt", "yuv420p",
+        str(out_mp4),
+    ]
+    run(cmd)
+    return out_mp4
+
+# ---------- main ----------
+
+def main() -> None:
+    args = parse_args()
 
     lyrics_path = Path(args.lyrics)
-    slides = read_lyrics(lyrics_path)
+    if not lyrics_path.exists():
+        alt = Path(__file__).resolve().parent.parent / args.lyrics
+        if alt.exists():
+            lyrics_path = alt
+        else:
+            fail(f"lyrics file not found: {args.lyrics}")
 
-    # Prepare output dirs
-    if OUT_DIR.exists():
-        shutil.rmtree(OUT_DIR)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    MP4_DIR.mkdir(parents=True, exist_ok=True)
+    frames_dir = Path(args.frames_dir)
+    out_mp4_dir = Path(args.out_mp4_dir)
 
-    # Render frames
-    print("ℹ️ Rendering PNG frames with Chrome...")
-    for i, slide in enumerate(slides, start=1):
-        html_str = render_slide_html(slide, args.font_size)
-        out_png = OUT_DIR / f"{i:03d}.png"
-        screenshot_frame(chrome, html_str, out_png)
-        print(f"  ✓ frame {i:03d}")
+    if args.remove_cache:
+        cleanup([frames_dir, out_mp4_dir])
 
-    # Encode MP4
-    base = lyrics_path.stem
-    out_mp4 = MP4_DIR / f"{base}_chrome_static.mp4"
-    print("ℹ️ Encoding MP4...")
-    encode_mp4_from_frames(str(OUT_DIR / "*.png"), out_mp4)
+    ensure_dirs(str(frames_dir), str(out_mp4_dir))
+
+    raw_text = lyrics_path.read_text(encoding="utf-8")
+    screens = split_screens_slash(raw_text)
+    if not screens:
+        fail("No screens parsed from lyrics.")
+
+    browser = which_browser()
+
+    # render stills
+    render_screens_to_pngs(
+        screens=screens,
+        browser_bin=browser,
+        frames_dir=frames_dir,
+        width=args.width,
+        height=args.height,
+        font_size=args.font_size,
+    )
+
+    base = sanitize_basename(lyrics_path) + "_chrome_static"
+
+    # durations: CSV or constant
+    if args.timings:
+        csv_path = Path(args.timings)
+        if not csv_path.exists():
+            alt_csv = Path("output/timings") / (sanitize_basename(lyrics_path) + ".csv")
+            if alt_csv.exists():
+                csv_path = alt_csv
+            else:
+                fail(f"timings CSV not found: {args.timings}")
+
+        rows = load_timings_csv(csv_path)
+        # assume rows are in correct order; trim to available screens
+        starts = [st for (_, st) in rows][:len(screens)]
+        if not starts:
+            fail("timings CSV had no starts.")
+        durations = compute_durations_from_starts(starts, last_hold=float(args.last_slide_hold))
+        concat_file = write_ffconcat(frames_dir, durations)
+        out_mp4 = encode_mp4_concat(concat_file, out_mp4_dir, base, args.width, args.height)
+    else:
+        out_mp4 = encode_mp4_constant_rate(
+            frames_dir=frames_dir,
+            out_mp4_dir=out_mp4_dir,
+            basename=base,
+            sec_per_slide=float(args.seconds-per-slide) if hasattr(args, "seconds-per-slide") else float(args.seconds_per_slide),
+            width=args.width,
+            height=args.height,
+        )
+
     print(f"✅ Done: {out_mp4}")
 
 if __name__ == "__main__":

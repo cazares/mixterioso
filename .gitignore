@@ -26,3 +26,4 @@ assets/
 lyrics/
 *.html
 *.pkg
+*ffconcat*
