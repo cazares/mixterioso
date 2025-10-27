@@ -1,109 +1,184 @@
 #!/usr/bin/env python3
-"""
-karaoke_render_chrome.py
-Stable 1080p text+emoji renderer.
+# -*- coding: utf-8 -*-
+r"""
+Chrome emoji renderer → PNG frames → MP4
+- 1920x1080 fixed canvas
+- Centers lines horizontally and vertically
+- Preserves explicit line breaks (\N -> \n) per slide
+- Neutral spacing: no flex on the text node, no justify, word/letter spacing reset
+- Requires: Google Chrome or Chromium in PATH (as "chrome", "chromium", or "google-chrome"), and ffmpeg
 """
 
-import os
-import sys
 import argparse
-import textwrap
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from PIL import Image
-import time
+import html
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
-def render_text_to_png(lines, output_dir, font_size):
-    os.makedirs(output_dir, exist_ok=True)
-    width, height = 1920, 1080
+HERE = Path(__file__).resolve().parent
+PROJECT = HERE.parent if (HERE.name == "scripts") else HERE
+OUT_DIR = PROJECT / "output" / "frames_chrome"
+MP4_DIR = PROJECT / "output" / "chrome_rendered_mp4s"
 
-    html_template = """
-    <html>
-    <head>
-    <meta charset="utf-8">
-    <style>
-      body {{
-        margin: 0;
-        padding: 0;
-        width: {w}px;
-        height: {h}px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background-color: black;
-      }}
-      .text {{
-        color: white;
-        font-size: {fs}px;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        text-align: center;
-        white-space: pre-wrap;
-        line-height: 1.2;
-        word-break: break-word;
-      }}
-    </style>
-    </head>
-    <body>
-      <div class="text">{text}</div>
-    </body>
-    </html>
-    """
+HTML_TEMPLATE = """<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html,body {{
+    margin:0; padding:0; width:100%; height:100%;
+    background:#000;
+  }}
+  /* Outer canvas forced to 1920x1080 for consistent screenshots */
+  .canvas {{
+    position:relative;
+    width:1920px; height:1080px;
+    background:#000;
+    display:grid;
+    place-items:center;
+  }}
+  /* A centered block that stacks lines */
+  .vbox {{
+    display:block;
+    max-width: 86%;
+    text-align:center;
+  }}
+  /* Each line is its own block to ensure no justification artifacts */
+  .line {{
+    display:block;
+    margin: 22px 0;
+    color:#fff;
+    font-family: "Helvetica Neue", Helvetica, Arial, "Apple Color Emoji", "Noto Color Emoji", "Segoe UI Emoji", sans-serif;
+    font-size:{font_size}px;
+    line-height:1.20;
+    letter-spacing: normal;
+    word-spacing: normal;
+    white-space: pre-wrap;   /* respect \n */
+    text-align: center;
+    text-rendering: optimizeLegibility;
+    font-kerning: normal;
+    -webkit-font-smoothing: antialiased;
+    -webkit-text-size-adjust: 100%;
+  }}
+</style>
+<div class="canvas">
+  <div class="vbox">
+{lines_html}
+  </div>
+</div>
+"""
 
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--hide-scrollbars")
-    chrome_options.add_argument(f"--window-size={width},{height}")
-    chrome_options.binary_location = "/Applications/Chromium.app/Contents/MacOS/Chromium"
+def find_chrome_binary() -> str:
+    candidates = [
+        "chrome",
+        "google-chrome",
+        "chromium",
+        "chromium-browser",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ]
+    for c in candidates:
+        if shutil.which(c):
+            return shutil.which(c)
+        if os.path.exists(c) and os.access(c, os.X_OK):
+            return c
+    print("FATAL: Chrome/Chromium binary not found. Install with: brew install --cask chromium", file=sys.stderr)
+    sys.exit(1)
 
-    driver = webdriver.Chrome(options=chrome_options)
+def assert_ffmpeg():
+    if not shutil.which("ffmpeg"):
+        print("FATAL: ffmpeg not found. Install with: brew install ffmpeg", file=sys.stderr)
+        sys.exit(1)
 
-    for i, raw_line in enumerate(lines):
-        text = raw_line.replace("\\N", "\n").replace("\r", "")
-        html = html_template.format(w=width, h=height, fs=font_size, text=text)
-        tmp_file = f"/tmp/karaoke_render_{i}.html"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            f.write(html)
+def read_lyrics(path: Path) -> list[str]:
+    if not path.exists():
+        print(f"FATAL: lyrics file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    raw = path.read_text(encoding="utf-8")
+    # Normalize CRLF and convert literal \N to actual newlines
+    raw = raw.replace("\r\n", "\n").replace("\\N", "\n")
+    # Split into slides by blank line (one “screen” per non-empty paragraph block)
+    blocks = [b.strip("\n") for b in re.split(r"\n{2,}", raw)]
+    return [b for b in blocks if b.strip() != ""]
 
-        driver.get("file://" + tmp_file)
-        time.sleep(0.15)
+def render_slide_html(slide_text: str, font_size: int) -> str:
+    # Each line in slide_text is already separated by real \n
+    lines = slide_text.split("\n")
+    lines_html = []
+    for ln in lines:
+        # Escape HTML but keep emoji as-is
+        safe = html.escape(ln, quote=False)
+        lines_html.append(f'    <div class="line">{safe}</div>')
+    return HTML_TEMPLATE.format(font_size=font_size, lines_html="\n".join(lines_html))
 
-        png_path = os.path.join(output_dir, f"frame_{i:04d}.png")
-        driver.save_screenshot(png_path)
+def screenshot_frame(chrome_bin: str, html_str: str, out_png: Path):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as f:
+        f.write(html_str.encode("utf-8"))
+        tmp_html = f.name
+    try:
+        # Force a 1920x1080 viewport and capture PNG
+        cmd = [
+            chrome_bin,
+            "--headless=new",
+            "--disable-gpu",
+            f"--window-size=1920,1080",
+            f"--screenshot={str(out_png)}",
+            f"file://{tmp_html}",
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    finally:
+        try:
+            os.unlink(tmp_html)
+        except OSError:
+            pass
 
-    driver.quit()
-
+def encode_mp4_from_frames(pattern_glob: str, out_mp4: Path):
+    # Ensure even dimensions and 1080p canvas without stretching content
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", "1/1.5",
+        "-pattern_type", "glob", "-i", pattern_glob,
+        "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black",
+        "-c:v", "libx264", "-r", "30", "-pix_fmt", "yuv420p",
+        str(out_mp4)
+    ]
+    subprocess.run(cmd, check=True)
 
 def main():
-    parser = argparse.ArgumentParser(description="Render static text+emoji slides to PNGs using Chrome.")
-    parser.add_argument("--lyrics", required=True, help="Path to lyrics .txt file")
-    parser.add_argument("--font-size", type=int, default=100, help="Font size (default: 100)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--lyrics", required=True, help="Path to .txt")
+    p.add_argument("--font-size", type=int, default=100)
+    args = p.parse_args()
 
-    if not os.path.exists(args.lyrics):
-        sys.exit(f"FATAL: lyrics file not found: {args.lyrics}")
+    chrome = find_chrome_binary()
+    assert_ffmpeg()
 
-    output_dir = "output/frames_chrome"
-    os.makedirs(output_dir, exist_ok=True)
+    lyrics_path = Path(args.lyrics)
+    slides = read_lyrics(lyrics_path)
 
-    with open(args.lyrics, "r", encoding="utf-8") as f:
-        text = f.read().strip()
+    # Prepare output dirs
+    if OUT_DIR.exists():
+        shutil.rmtree(OUT_DIR)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    MP4_DIR.mkdir(parents=True, exist_ok=True)
 
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    # Render frames
+    print("ℹ️ Rendering PNG frames with Chrome...")
+    for i, slide in enumerate(slides, start=1):
+        html_str = render_slide_html(slide, args.font_size)
+        out_png = OUT_DIR / f"{i:03d}.png"
+        screenshot_frame(chrome, html_str, out_png)
+        print(f"  ✓ frame {i:03d}")
 
-    print(f"🎬 Rendering {len(lines)} slides to {output_dir}/ ...")
-    render_text_to_png(lines, output_dir, args.font_size)
-    print("✅ Done rendering PNGs. Now run ffmpeg:")
-
-    print(f"""
-ffmpeg -y -framerate 1/1.5 \\
-  -pattern_type glob \\
-  -i "{output_dir}/*.png" \\
-  -c:v libx264 -r 30 -pix_fmt yuv420p \\
-  output/chrome_rendered_mp4s/{os.path.basename(args.lyrics).replace('.txt','')}_chrome_static.mp4
-    """)
-
+    # Encode MP4
+    base = lyrics_path.stem
+    out_mp4 = MP4_DIR / f"{base}_chrome_static.mp4"
+    print("ℹ️ Encoding MP4...")
+    encode_mp4_from_frames(str(OUT_DIR / "*.png"), out_mp4)
+    print(f"✅ Done: {out_mp4}")
 
 if __name__ == "__main__":
     main()
-
-# end of karaoke_render_chrome.py
