@@ -90,9 +90,9 @@ def build_args():
     # Demucs controls (used only for 25% and 0% variants)
     ap.add_argument("--only-100", action="store_true",
                     help="Skip Demucs variants; produce only the full-vocals output")
-    ap.add_argument("--demucs-model", default="htdemucs_6s",
+    ap.add_argument("--demucs-model", default="htdemucs",
                     help="Demucs model name for 6-stem separation")
-    ap.add_argument("--demucs-overlap", type=float, default=0.99,
+    ap.add_argument("--demucs-overlap", type=float, default=0.25,
                     help="Demucs overlap fraction (higher = better, slower)")
     ap.add_argument("--demucs-seg", type=int, default=6,
                     help="Demucs segment length seconds (smaller = better, slower)")
