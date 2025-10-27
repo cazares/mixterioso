@@ -56,27 +56,16 @@ def build_args():
     ap.add_argument("--url", help="YouTube URL. If given and --audio not set, downloads MP3 via yt-dlp")
     ap.add_argument("--timings", help="Existing timings CSV. If absent, will generate (unless --seconds-per-slide).")
     ap.add_argument("--seconds-per-slide", type=float, help="Used only if --timings not given")
-
-    ap.add_argument("--offset-video", type=float, default=0.0,
-                    help="Seconds to delay VIDEO vs AUDIO during mux. Positive delays video.")
-    ap.add_argument("--append-end-duration", type=float, default=3.0,
-                    help="Freeze last frame for N seconds. 0 disables.")
-
-    ap.add_argument("--resync-offset", type=float,
-                    help="Reuse existing render and only re-mux with this offset. Implies --mux-only.")
-    ap.add_argument("--reuse-existing-timings", action="store_true",
-                    help="Reuse timings CSV and re-render with updated lyrics, then mux.")
-
+    ap.add_argument("--offset-video", type=float, default=0.0, help="Seconds to delay VIDEO vs AUDIO during mux. Positive delays video.")
+    ap.add_argument("--append-end-duration", type=float, default=3.0, help="Freeze last frame for N seconds. 0 disables.")
+    ap.add_argument("--resync-offset", type=float, help="Reuse existing render and only re-mux with this offset. Implies --mux-only.")
+    ap.add_argument("--reuse-existing-timings", action="store_true", help="Reuse timings CSV and re-render with updated lyrics, then mux.")
     ap.add_argument("--font-size", type=int, default=100)
     ap.add_argument("--last-slide-hold", type=float, default=3.0)
     ap.add_argument("--aac-kbps", type=int, default=192)
-
-    ap.add_argument("--remove-cache", action="store_true",
-                    help="Pass --remove-cache to the Chrome renderer (fresh render).")
-    ap.add_argument("--keep-intermediates", action="store_true",
-                    help="Keep video-only render files; default removes them after mux.")
-    ap.add_argument("--skip-open-dir", action="store_true",
-                    help="Do not open the output folder.")
+    ap.add_argument("--remove-cache", action="store_true", help="Pass --remove-cache to the Chrome renderer (fresh render).")
+    ap.add_argument("--keep-intermediates", action="store_true", help="Keep video-only render files; default removes them after mux.")
+    ap.add_argument("--skip-open-dir", action="store_true", help="Do not open the output folder.")
     ap.add_argument("--outdir", default="output/chrome_rendered_mp4s")
     ap.add_argument("--timings-outdir", default="output/timings")
     ap.add_argument("--songs-dir", default="songs", help="Where to place downloaded MP3s")
@@ -85,23 +74,19 @@ def build_args():
     ap.add_argument("--mux-only", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
 
-    # Demucs
-    ap.add_argument("--only-100", action="store_true",
-                    help="Skip Demucs variants; produce only the full-vocals output")
-    ap.add_argument("--high-quality", action="store_true",
-                    help="Use 6-stem Demucs (htdemucs_6s)")
-    ap.add_argument("--demucs-model", default="htdemucs",
-                    help="Demucs model (default 4-stem: htdemucs). Overridden by --high-quality.")
-    ap.add_argument("--demucs-overlap", type=float, default=0.25,
-                    help="Demucs overlap (higher = better, slower)")
-    ap.add_argument("--demucs-seg", type=int, default=6,
-                    help="Demucs segment seconds (Transformer models must be <= ~7.8)")
+    # Demucs and mixing
+    ap.add_argument("--only-100", action="store_true", help="Skip Demucs variants; produce only the full-vocals output")
+    ap.add_argument("--high-quality", action="store_true", help="Use 6-stem Demucs (htdemucs_6s)")
+    ap.add_argument("--demucs-model", default="htdemucs", help="Demucs model (default 4-stem: htdemucs). Overridden by --high-quality.")
+    ap.add_argument("--demucs-overlap", type=float, default=0.25, help="Demucs overlap (higher = better, slower)")
+    ap.add_argument("--demucs-seg", type=int, default=6, help="Demucs segment seconds (Transformer models must be <= ~7.8)")
+    ap.add_argument("--vocal-pcts", nargs="*", type=float, help="Space-separated vocal percentages, e.g. --vocal-pcts 0 25 100")
     return ap.parse_args()
 
 def main():
     args = build_args()
 
-    # Flag interplay
+    # Flags interplay
     if args.resync_offset is not None:
         args.offset_video = args.resync_offset
         args.mux_only = True
@@ -134,12 +119,26 @@ def main():
     sep_root = repo_root / "separated"
     ensure_dir(outdir); ensure_dir(timings_outdir); ensure_dir(songs_dir); ensure_dir(sep_root)
 
-    # Finals (short names, all include audio)
-    mp4_full  = outdir / f"{base}_vocals_100.mp4"
-    mp4_v25   = outdir / f"{base}_vocals_25.mp4"
-    mp4_novox = outdir / f"{base}_vocals_0.mp4"
+    # Determine requested vocal percentages
+    vocal_pcts = args.vocal_pcts
+    if not vocal_pcts or len(vocal_pcts) == 0:
+        try:
+            raw = input("Enter vocal percentages separated by spaces (e.g., '0 25 100'): ").strip()
+        except EOFError:
+            print("ERROR: --vocal-pcts not provided and no stdin available."); sys.exit(12)
+        vocal_pcts = [float(x) for x in raw.split()] if raw else []
+    if not vocal_pcts:
+        print("ERROR: no vocal percentages provided."); sys.exit(13)
 
-    # Intermediates live in temp by default
+    # clamp and normalize
+    cleaned = []
+    for p in vocal_pcts:
+        if p < 0: p = 0.0
+        if p > 200: p = 200.0  # hard cap
+        cleaned.append(p)
+    vocal_pcts = cleaned
+
+    # Intermediates
     tmp_video_dir = Path(tempfile.mkdtemp(prefix="cktmp_"))
     timings_csv = Path(args.timings).resolve() if args.timings else (timings_outdir / f"{base}.csv")
     rendered_mp4 = tmp_video_dir / f"{render_base}_chrome_static.mp4"
@@ -198,9 +197,8 @@ def main():
                     "--out", str(timings_csv),
                 ])
 
-        # Render video-only (goes to outdir by default; we’ll move it to tmp_video_dir)
+        # Render video-only (renderer writes to outdir; we move to tmp)
         if not args.mux_only:
-            # renderer writes to: outdir / f"{render_base}_chrome_static.mp4"
             render_out_path = outdir / f"{render_base}_chrome_static.mp4"
             krc = [
                 sys.executable, str(scripts_dir / "karaoke_render_chrome.py"),
@@ -216,14 +214,13 @@ def main():
                     print("ERROR: provide --timings or --seconds-per-slide"); sys.exit(7)
                 krc += ["--seconds-per-slide", str(args.seconds_per_slide)]
             run(krc)
-            # move to temp so we don't litter outdir with intermediates
             if render_out_path.exists():
                 ensure_dir(tmp_video_dir)
                 shutil.move(str(render_out_path), str(rendered_mp4))
             else:
                 print("ERROR: expected render missing:", render_out_path); sys.exit(9)
 
-        # Optional end freeze — normalize PTS to avoid a head gap
+        # Optional end freeze — normalize PTS
         if args.append_end_duration and args.append_end_duration > 0:
             run([
                 "ffmpeg", "-y",
@@ -242,30 +239,34 @@ def main():
         print("\nDry-run. Plan only.")
         print("Rendered video path will be:", rendered_mp4)
 
-    # === Phase B: 100% vocals (has audio), normalize timestamps at mux ===
-    if not args.render_only:
+    # === Phase B: Produce requested mixes ===
+    # If any pct != 100 => need Demucs stems
+    need_demucs = any(abs(p - 100.0) > 1e-6 for p in vocal_pcts)
+    stems_dir = None
+    vocals_wav = drums_wav = bass_wav = other_wav = guitar_wav = piano_wav = None
+    instrumental_wav = None
+
+    # 100% first if requested (opens folder early)
+    if 100.0 in vocal_pcts and not args.render_only:
+        out_100 = outdir / f"{base}_vocals_100.mp4"
         run([
             "ffmpeg", "-y",
             "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
-            "-itsoffset", str(args.offset_video),  # delays VIDEO if positive
+            "-itsoffset", str(args.offset_video),
             "-i", str(video_for_mux),
             "-i", str(audio_path),
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
             "-shortest", "-movflags", "+faststart",
-            str(mp4_full),
+            str(out_100),
         ])
-        if not ffprobe_has_audio(mp4_full):
-            print("WARN: vocals_100 output missing audio stream.")
         if not args.skip_open_dir:
-            open_in_explorer(outdir)  # open after first MP4
+            open_in_explorer(outdir)
 
-    # === Phase C: Demucs variants (also with audio) ===
-    if not args.only_100 and not args.mux_only:
+    # Demucs path for any non-100
+    if need_demucs and not args.mux_only:
         if shutil.which("demucs") is None:
-            print("ERROR: demucs not found on PATH but Demucs variants requested"); sys.exit(11)
-
-        # Separate stems
+            print("ERROR: demucs not found on PATH but non-100 vocal % requested"); sys.exit(11)
         run([
             "demucs",
             "-n", args.demucs_model,
@@ -274,7 +275,6 @@ def main():
             "-o", str(sep_root),
             str(audio_path),
         ])
-
         stems_dir = sep_root / args.demucs_model / base
         vocals_wav  = stems_dir / "vocals.wav"
         drums_wav   = stems_dir / "drums.wav"
@@ -283,7 +283,7 @@ def main():
         guitar_wav  = stems_dir / "guitar.wav"
         piano_wav   = stems_dir / "piano.wav"
 
-        # Instrumental from available non-vocal stems
+        # Build instrumental from available non-vocal stems
         stem_list = [drums_wav, bass_wav, other_wav]
         if guitar_wav.exists(): stem_list.append(guitar_wav)
         if piano_wav.exists():  stem_list.append(piano_wav)
@@ -303,44 +303,71 @@ def main():
             str(instrumental_wav),
         ])
 
-        # 0% vocals
-        run([
-            "ffmpeg", "-y",
-            "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
-            "-itsoffset", str(args.offset_video),
-            "-i", str(video_for_mux),
-            "-i", str(instrumental_wav),
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
-            "-shortest", "-movflags", "+faststart",
-            str(mp4_novox),
-        ])
-        if not ffprobe_has_audio(mp4_novox):
-            print("WARN: vocals_0 output missing audio stream.")
+    # For each requested pct, create and mux
+    for p in vocal_pcts:
+        pct_int = int(round(p))
+        out_path = outdir / f"{base}_vocals_{pct_int}.mp4"
 
-        # 25% vocals: instrumental + vocals*0.25
-        v25_wav = stems_dir / f"{base}_vocal25_mix.wav"
+        if abs(p - 100.0) <= 1e-6:
+            # already produced above; skip duplicate
+            if out_path.exists():
+                continue
+            # if not produced yet and in mux-only mode, still produce
+            if args.mux_only and not args.render_only:
+                run([
+                    "ffmpeg", "-y",
+                    "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+                    "-itsoffset", str(args.offset_video),
+                    "-i", str(video_for_mux),
+                    "-i", str(audio_path),
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
+                    "-shortest", "-movflags", "+faststart",
+                    str(out_path),
+                ])
+            continue
+
+        if args.mux_only:
+            print(f"ERROR: cannot build {pct_int}% mix in --mux-only without stems."); sys.exit(14)
+
+        if abs(p) <= 1e-6:
+            # 0% = instrumental only
+            run([
+                "ffmpeg", "-y",
+                "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+                "-itsoffset", str(args.offset_video),
+                "-i", str(video_for_mux),
+                "-i", str(instrumental_wav),
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
+                "-shortest", "-movflags", "+faststart",
+                str(out_path),
+            ])
+            continue
+
+        # p in (0,100): build scaled-vocals mix
+        mix_wav = stems_dir / f"{base}_vocal{pct_int}_mix.wav"
+        # weights: instrumental=1, vocals=scale
+        scale = p / 100.0
         run([
             "ffmpeg", "-y",
             "-i", str(instrumental_wav), "-i", str(vocals_wav),
-            "-filter_complex", "[0:a][1:a]amix=inputs=2:weights=1 0.25:normalize=0[aout]",
+            "-filter_complex", f"[0:a][1:a]amix=inputs=2:weights=1 {scale}:normalize=0[aout]",
             "-map", "[aout]",
             "-c:a", "pcm_s16le",
-            str(v25_wav),
+            str(mix_wav),
         ])
         run([
             "ffmpeg", "-y",
             "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
             "-itsoffset", str(args.offset_video),
             "-i", str(video_for_mux),
-            "-i", str(v25_wav),
+            "-i", str(mix_wav),
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
             "-shortest", "-movflags", "+faststart",
-            str(mp4_v25),
+            str(out_path),
         ])
-        if not ffprobe_has_audio(mp4_v25):
-            print("WARN: vocals_25 output missing audio stream.")
 
     # Cleanup intermediates
     if not args.keep_intermediates:
@@ -349,16 +376,12 @@ def main():
         except Exception:
             pass
 
-    # Final open
     if not args.skip_open_dir:
         open_in_explorer(outdir)
 
-    print("\nDone.")
-    if not args.render_only:
-        print("100% :", mp4_full)
-    if not args.only_100 and not args.mux_only:
-        print("25% :", mp4_v25)
-        print("0%  :", mp4_novox)
+    print("\nDone. Outputs requested:", " ".join([f"{int(round(p))}%" for p in vocal_pcts]))
 
 if __name__ == "__main__":
     main()
+
+# end of car_karaoke_time.py
