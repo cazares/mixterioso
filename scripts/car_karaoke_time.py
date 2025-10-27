@@ -59,7 +59,7 @@ def main():
         print("ERROR: ffmpeg not found on PATH"); sys.exit(3)
     if not (scripts_dir / "karaoke_render_chrome.py").exists():
         print("ERROR: scripts/karaoke_render_chrome.py not found at", scripts_dir); sys.exit(4)
-    if not args.mux-only and not (scripts_dir / "make_timing_csv.py").exists() and args.timings is None:
+    if not args.mux_only and not (scripts_dir / "make_timing_csv.py").exists() and args.timings is None:
         print("WARN: scripts/make_timing_csv.py not found; will proceed only if --timings provided or --seconds-per-slide used.")
 
     # NEW: auto-download audio from YouTube if --url given and --audio not set
@@ -72,17 +72,17 @@ def main():
         audio_path = songs_dir / f"{base}.mp3"
         ytdlp_cmd = ["yt-dlp", "-x", "--audio-format", "mp3", "-o", str(songs_dir / f"{base}.%(ext)s"), args.url]
 
-    if not args.render-only and not audio_path:
+    if not args.render_only and not audio_path:
         print("ERROR: need --audio or --url"); sys.exit(5)
 
     cmds = []
 
     # If we will need audio and it comes from URL, put download first
-    if not args.render-only and args.url and audio_path and not (audio_path.exists()):
+    if not args.render_only and args.url and audio_path and not (audio_path.exists()):
         cmds.append(ytdlp_cmd)
 
     # Step 1: timings
-    need_timings = args.timings is None and args.seconds-per-slide is None and not args.mux-only
+    need_timings = args.timings is None and args.seconds_per_slide is None and not args.mux_only
     if need_timings:
         mtc = [
             sys.executable, str(scripts_dir / "make_timing_csv.py"),
@@ -93,7 +93,7 @@ def main():
         cmds.append(mtc)
 
     # Step 2: render
-    if not args.mux-only:
+    if not args.mux_only:
         krc = [
             sys.executable, str(scripts_dir / "karaoke_render_chrome.py"),
             "--lyrics", str(lyrics_path),
@@ -103,13 +103,13 @@ def main():
         if args.timings or need_timings:
             krc += ["--timings", str(timings_csv), "--last-slide-hold", str(args.last_slide_hold)]
         else:
-            if args.seconds-per-slide is None:
+            if args.seconds_per_slide is None:
                 print("ERROR: provide --timings or --seconds-per-slide"); sys.exit(7)
-            krc += ["--seconds-per-slide", str(args.seconds-per-slide)]
+            krc += ["--seconds-per-slide", str(args.seconds_per_slide)]
         cmds.append(krc)
 
     # Step 3: mux
-    if not args.render-only:
+    if not args.render_only:
         ff = [
             "ffmpeg", "-y",
             "-itsoffset", str(args.offset_video),
@@ -126,8 +126,8 @@ def main():
     print("\n=== Plan ===")
     for c in cmds: print(" ", " ".join(shlex.quote(x) for x in c))
     print("\nOutputs:")
-    if not args.mux-only: print(" - Rendered MP4:", rendered_mp4)
-    if not args.render-only: print(" - Muxed MP4   :", muxed_mp4)
+    if not args.mux_only: print(" - Rendered MP4:", rendered_mp4)
+    if not args.render_only: print(" - Muxed MP4   :", muxed_mp4)
     if args.timings or need_timings: print(" - Timings CSV :", timings_csv)
     if args.url: print(" - Audio MP3   :", audio_path)
 
@@ -137,7 +137,7 @@ def main():
     for c in cmds: run(c)
 
     print("\nDone.")
-    if not args.render-only: print("Final:", muxed_mp4)
+    if not args.render_only: print("Final:", muxed_mp4)
 
 if __name__ == "__main__":
     main()
