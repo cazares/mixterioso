@@ -64,13 +64,13 @@ def build_args():
 
     ap.add_argument("--offset-video", type=float, default=0.0,
                     help="Seconds to delay VIDEO vs AUDIO during mux. Positive delays video.")
-    ap.add_argument("--append-end-duration", type=float, default=3.0,
+    ap.add_argument("--append-end-duration", type=float, default=7.77,
                     help="Freeze last frame for N seconds. 0 disables.")
     ap.add_argument("--resync-offset", type=float,
                     help="Reuse existing render and only re-mux with this offset. Implies --mux-only.")
 
     ap.add_argument("--font-size", type=int, default=110)
-    ap.add_argument("--last-slide-hold", type=float, default=3.0)
+    ap.add_argument("--last-slide-hold", type=float, default=7.77)
     ap.add_argument("--aac-kbps", type=int, default=192)
 
     ap.add_argument("--remove-cache", action="store_true",
