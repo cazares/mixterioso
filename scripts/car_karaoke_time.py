@@ -48,11 +48,6 @@ def ffprobe_has_audio(path: Path) -> bool:
     except Exception:
         return False
 
-def aac_args(stereo: bool, kbps: int):
-    # Default mono unless --stereo-output is set
-    ch = "2" if stereo else "1"
-    return ["-c:a", "aac", "-b:a", f"{kbps}k", "-ac", ch]
-
 def build_args():
     ap = argparse.ArgumentParser(description="Car Karaoke pipeline runner")
     ap.add_argument("--repo-root", default=".", help="Repo root where scripts/ lives")
@@ -77,9 +72,8 @@ def build_args():
     ap.add_argument("--font-size", type=int, default=110)
     ap.add_argument("--last-slide-hold", type=float, default=7.77)
     ap.add_argument("--aac-kbps", type=int, default=192)
-    ap.add_argument("--stereo-output", action="store_true",
-                    help="Output stereo. Default is mono.")
 
+    ap.add_argument("--stereo-output", action="store_true", help="Output stereo instead of default mono AAC.")
     ap.add_argument("--remove-cache", action="store_true",
                     help="Pass --remove-cache to the Chrome renderer (fresh render).")
     ap.add_argument("--keep-intermediates", action="store_true",
@@ -222,7 +216,7 @@ def main():
             if not timings_csv.exists():
                 print("ERROR: --reuse-existing-timings needs", timings_csv); sys.exit(10)
         elif not args.mux_only:
-            need_timings = args.timings is None and args.seconds-per-slide is None  # noqa: E225 kept as user baseline
+            need_timings = args.timings is None and args.seconds_per_slide is None  # fixed
             if need_timings:
                 run([
                     sys.executable, str(scripts_dir / "make_timing_csv.py"),
@@ -241,12 +235,12 @@ def main():
             ]
             if args.remove_cache:
                 krc.append("--remove-cache")
-            if args.reuse_existing_timings or args.timings or (args.timings is None and args.seconds_per_slide is None):
+            if args.reuse_existing_timings or args.timings or (args.timings is None and args.seconds_per_slide is None):  # fixed
                 krc += ["--timings", str(timings_csv), "--last-slide-hold", str(args.last_slide_hold)]
             else:
-                if args.seconds_per_slide is None:
+                if args.seconds_per_slide is None:  # fixed
                     print("ERROR: provide --timings or --seconds-per-slide"); sys.exit(7)
-                krc += ["--seconds-per-slide", str(args.seconds_per_slide)]
+                krc += ["--seconds-per-slide", str(args.seconds_per_slide)]  # fixed
             run(krc)
             if render_out_path.exists():
                 ensure_dir(tmp_video_dir)
@@ -279,6 +273,9 @@ def main():
     # 100% first if requested
     if 100.0 in vocal_pcts and not args.render_only:
         out_100 = outdir / f"{base}_vocals_100.mp4"
+        aac_args = ["-c:a", "aac", "-b:a", f"{args.aac_kbps}k"]
+        if not args.stereo_output:
+            aac_args += ["-ac", "1"]
         run([
             "ffmpeg", "-y",
             "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
@@ -286,7 +283,7 @@ def main():
             "-i", str(video_for_mux),
             "-i", str(audio_path),
             "-map", "0:v:0", "-map", "1:a:0",
-            *aac_args(args.stereo_output, args.aac_kbps),
+            "-c:v", "copy", *aac_args,
             "-shortest", "-movflags", "+faststart",
             str(out_100),
         ])
@@ -351,6 +348,9 @@ def main():
         if abs(p - 100.0) <= 1e-6:
             if out_path.exists(): continue
             if args.mux_only and not args.render_only:
+                aac_args = ["-c:a", "aac", "-b:a", f"{args.aac_kbps}k"]
+                if not args.stereo_output:
+                    aac_args += ["-ac", "1"]
                 run([
                     "ffmpeg", "-y",
                     "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
@@ -358,7 +358,7 @@ def main():
                     "-i", str(video_for_mux),
                     "-i", str(audio_path),
                     "-map", "0:v:0", "-map", "1:a:0",
-                    *aac_args(args.stereo_output, args.aac_kbps),
+                    "-c:v", "copy", *aac_args,
                     "-shortest", "-movflags", "+faststart",
                     str(out_path),
                 ])
@@ -368,7 +368,9 @@ def main():
             print(f"ERROR: cannot build {pct_int}% mix in --mux-only without stems."); sys.exit(14)
 
         if abs(p) <= 1e-6:
-            # 0% = instrumental only
+            aac_args = ["-c:a", "aac", "-b:a", f"{args.aac_kbps}k"]
+            if not args.stereo_output:
+                aac_args += ["-ac", "1"]
             run([
                 "ffmpeg", "-y",
                 "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
@@ -376,7 +378,7 @@ def main():
                 "-i", str(video_for_mux),
                 "-i", str(instrumental_wav),
                 "-map", "0:v:0", "-map", "1:a:0",
-                *aac_args(args.stereo_output, args.aac_kbps),
+                "-c:v", "copy", *aac_args,
                 "-shortest", "-movflags", "+faststart",
                 str(out_path),
             ])
@@ -393,6 +395,9 @@ def main():
             "-c:a", "pcm_s16le",
             str(mix_wav),
         ])
+        aac_args = ["-c:a", "aac", "-b:a", f"{args.aac_kbps}k"]
+        if not args.stereo_output:
+            aac_args += ["-ac", "1"]
         run([
             "ffmpeg", "-y",
             "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
@@ -400,7 +405,7 @@ def main():
             "-i", str(video_for_mux),
             "-i", str(mix_wav),
             "-map", "0:v:0", "-map", "1:a:0",
-            *aac_args(args.stereo_output, args.aac_kbps),
+            "-c:v", "copy", *aac_args,
             "-shortest", "-movflags", "+faststart",
             str(out_path),
         ])
