@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # scripts/car_karaoke_time.py
 
-import argparse, sys, subprocess, shlex, shutil, tempfile, os, csv
+import argparse, sys, subprocess, shlex, shutil, tempfile, os
 from pathlib import Path
 
 def run(cmd, cwd: Path | None = None, check: bool = True):
@@ -48,51 +48,20 @@ def ffprobe_has_audio(path: Path) -> bool:
     except Exception:
         return False
 
-def sync_lyrics_into_csv(csv_path: Path, lyrics_path: Path):
-    """
-    Copy text from lyrics file into CSV column 'line' (column 0).
-    Do not touch 'start' times. Treat '/' as a newline for on-screen wrapping.
-    Ignore a first-line URL.
-    """
-    # Read CSV
-    with csv_path.open("r", encoding="utf-8", newline="") as f:
-        rows = list(csv.reader(f))
-    if not rows or rows[0][:2] != ["line", "start"]:
-        print("FATAL: timings CSV must have headers: line,start")
-        sys.exit(2)
-
-    # Read lyrics
-    txt = lyrics_path.read_text(encoding="utf-8").splitlines()
-    if txt and txt[0].strip().startswith("https://"):
-        txt = txt[1:]
-    txt = [t.replace("/", "\n") for t in txt]
-
-    n = min(len(txt), len(rows) - 1)
-    for i in range(1, 1 + n):
-        # Ensure row has at least two columns
-        if len(rows[i]) < 2:
-            # pad missing fields; if totally empty, line="", start="0"
-            line_val = rows[i][0] if rows[i] else ""
-            start_val = rows[i][1] if len(rows[i]) > 1 else "0"
-            rows[i] = [line_val, start_val]
-        # Overwrite the 'line' column only
-        rows[i][0] = txt[i - 1]
-
-    with csv_path.open("w", encoding="utf-8", newline="") as f:
-        csv.writer(f).writerows(rows)
-    print(f"Updated {n} rows in {csv_path}")
+def aac_args(stereo: bool, kbps: int):
+    # Default mono unless --stereo-output is set
+    ch = "2" if stereo else "1"
+    return ["-c:a", "aac", "-b:a", f"{kbps}k", "-ac", ch]
 
 def build_args():
     ap = argparse.ArgumentParser(description="Car Karaoke pipeline runner")
     ap.add_argument("--repo-root", default=".", help="Repo root where scripts/ lives")
 
-    # CSV + lyrics
+    # CSV handling reverted: lyrics required again even if timings provided
     ap.add_argument("--lyrics", required=True, help="Path to lyrics .txt")
     ap.add_argument("--timings", help="Existing timings CSV. If absent, will generate (unless --seconds-per-slide).")
     ap.add_argument("--reuse-existing-timings", action="store_true",
                     help="Reuse timings CSV and re-render with updated lyrics, then mux.")
-    ap.add_argument("--sync-lyrics-into-csv", action="store_true",
-                    help="Before render: copy text from --lyrics into column 'line' of --timings.")
     ap.add_argument("--seconds-per-slide", type=float, help="Used only if --timings not given")
 
     ap.add_argument("--audio", help="Path to song audio (e.g., .mp3)")
@@ -108,6 +77,8 @@ def build_args():
     ap.add_argument("--font-size", type=int, default=110)
     ap.add_argument("--last-slide-hold", type=float, default=7.77)
     ap.add_argument("--aac-kbps", type=int, default=192)
+    ap.add_argument("--stereo-output", action="store_true",
+                    help="Output stereo. Default is mono.")
 
     ap.add_argument("--remove-cache", action="store_true",
                     help="Pass --remove-cache to the Chrome renderer (fresh render).")
@@ -149,7 +120,7 @@ def main():
     repo_root = Path(args.repo_root).resolve()
     scripts_dir = repo_root / "scripts"
 
-    # Required lyrics
+    # Required lyrics again
     lyrics_src_path = Path(args.lyrics).resolve()
     if not lyrics_src_path.exists():
         print("ERROR: --lyrics not found:", lyrics_src_path); sys.exit(2)
@@ -207,7 +178,7 @@ def main():
     if audio_path and not audio_path.exists():
         print("ERROR: --audio not found:", audio_path); sys.exit(6)
 
-    # Auto-infer audio from songs/<base>.mp3 or prompt, else URL
+    # Auto-infer audio from songs/<base>.mp3 or prompt, else fall back to URL handling
     if not audio_path and not args.url:
         candidate = songs_dir / f"{base}.mp3"
         if candidate.exists():
@@ -242,7 +213,7 @@ def main():
 
     # === Phase A: Prep ===
     if not args.dry_run:
-        # Download if planned and missing
+        # Download if needed
         if not args.render_only and args.url and audio_path and not audio_path.exists():
             run(ytdlp_cmd)
 
@@ -251,7 +222,7 @@ def main():
             if not timings_csv.exists():
                 print("ERROR: --reuse-existing-timings needs", timings_csv); sys.exit(10)
         elif not args.mux_only:
-            need_timings = args.timings is None and args.seconds_per_slide is None
+            need_timings = args.timings is None and args.seconds-per-slide is None  # noqa: E225 kept as user baseline
             if need_timings:
                 run([
                     sys.executable, str(scripts_dir / "make_timing_csv.py"),
@@ -259,12 +230,6 @@ def main():
                     "--audio", str(audio_path),
                     "--out", str(timings_csv),
                 ])
-
-        # Optional: sync lyrics text into CSV 'line' column
-        if args.sync_lyrics_into_csv:
-            if not timings_csv.exists():
-                print("ERROR: --sync-lyrics-into-csv requires existing --timings CSV"); sys.exit(16)
-            sync_lyrics_into_csv(timings_csv, lyrics_path)
 
         # Render video-only (renderer writes to outdir; we move to tmp)
         if not args.mux_only:
@@ -321,7 +286,7 @@ def main():
             "-i", str(video_for_mux),
             "-i", str(audio_path),
             "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
+            *aac_args(args.stereo_output, args.aac_kbps),
             "-shortest", "-movflags", "+faststart",
             str(out_100),
         ])
@@ -393,7 +358,7 @@ def main():
                     "-i", str(video_for_mux),
                     "-i", str(audio_path),
                     "-map", "0:v:0", "-map", "1:a:0",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
+                    *aac_args(args.stereo_output, args.aac_kbps),
                     "-shortest", "-movflags", "+faststart",
                     str(out_path),
                 ])
@@ -411,7 +376,7 @@ def main():
                 "-i", str(video_for_mux),
                 "-i", str(instrumental_wav),
                 "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
+                *aac_args(args.stereo_output, args.aac_kbps),
                 "-shortest", "-movflags", "+faststart",
                 str(out_path),
             ])
@@ -435,7 +400,7 @@ def main():
             "-i", str(video_for_mux),
             "-i", str(mix_wav),
             "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", f"{args.aac_kbps}k",
+            *aac_args(args.stereo_output, args.aac_kbps),
             "-shortest", "-movflags", "+faststart",
             str(out_path),
         ])
