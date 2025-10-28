@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# whisper_cli_pipeline.sh
 set -euo pipefail
 
 # --- Config ---
@@ -47,7 +48,6 @@ whisper "$MP3" \
   --word_timestamps True \
   --condition_on_previous_text False \
   --temperature 0 \
-  --vad_filter True \
   --device cpu \
   --fp16 False \
   --output_format json \
@@ -67,7 +67,6 @@ if [[ "$ENABLE_DEMUCS" == "1" ]]; then
     --word_timestamps True \
     --condition_on_previous_text False \
     --temperature 0 \
-    --vad_filter True \
     --device cpu \
     --fp16 False \
     --output_format json \
