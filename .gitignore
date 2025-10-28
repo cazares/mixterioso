@@ -28,3 +28,7 @@ lyrics/
 *.pkg
 *ffconcat*
 *.txt
+*.json
+*.srt
+*.tsv
+*.vtt
