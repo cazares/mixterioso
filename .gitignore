@@ -32,3 +32,4 @@ lyrics/
 *.srt
 *.tsv
 *.vtt
+align_env/
