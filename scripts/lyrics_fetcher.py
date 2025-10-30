@@ -8,24 +8,113 @@ import argparse
 import requests
 from bs4 import BeautifulSoup
 
-UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) Python LyricsFetcher/1.0"}
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) Python LyricsFetcher/1.1"}
 
-def ascii_clean(text: str) -> str:
-    # Normalize whitespace, unescape HTML entities, strip non-ascii
+def basic_normalize(text: str) -> str:
+    """Unescape HTML entities, normalize newlines/whitespace, strip HTML tags if any sneaked in."""
     text = html.unescape(text)
-    # Remove lingering HTML-like brackets that sometimes slip through
+    # strip any accidental angle-tag fragments
     text = re.sub(r'<[^>]+>', '', text)
-    # Normalize newlines
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-    # Collapse trailing spaces on lines
-    text = "\n".join([ln.strip() for ln in text.split("\n")])
-    # Strip label lines like [Chorus], (Verse)
-    text = re.sub(r'[\(\[][^\)\]]{1,40}[\)\]]', '', text)
-    # Collapse >2 blank lines
+    # trim per-line
+    text = "\n".join(ln.strip() for ln in text.split("\n"))
+    # collapse superfluous blank lines
     text = re.sub(r'\n{3,}', '\n\n', text).strip()
-    # ASCII only
-    text = text.encode("ascii", errors="ignore").decode("ascii")
-    return text.strip()
+    return text
+
+def strip_top_noise(text: str, artist: str | None = None, title: str | None = None) -> str:
+    """
+    Remove leading non-lyric boilerplate seen on many sites:
+    - '90 Contributors', 'Translations' + language list, 'Read More', 'Embed'
+    - '<Title> Lyrics' / '<Anything> Lyrics'
+    - credits/metadata ('Produced by', 'Written by', 'Release Date', 'About', 'Album')
+    - early long multi-sentence blurbs
+    """
+    lines = text.splitlines()
+    out = []
+    started = False
+    in_translations_block = False
+    title_lc = (title or "").lower()
+
+    for i, raw in enumerate(lines):
+        s = raw.strip()
+        low = s.lower()
+
+        if not started:
+            # skip empties at the top
+            if not s:
+                continue
+
+            # explicit junk patterns
+            if re.match(r'^\d+\s+contributors?$', low):
+                continue
+
+            if low.startswith("translations"):
+                in_translations_block = True
+                continue
+
+            if in_translations_block:
+                # language codes/names often one word or two, short
+                if s and len(s) <= 20 and len(s.split()) <= 2:
+                    continue
+                # end translations block on first longer/multi-word line
+                in_translations_block = False
+                # re-evaluate the current line below (don’t continue)
+
+            if re.search(r'\bread more\b', low):
+                continue
+            if re.search(r'\bembed\b', low):
+                continue
+            if re.search(r'\byou might also like\b', low):
+                continue
+
+            if re.search(r'^(about|credits|produced by|written by|release date|album)\b', low):
+                continue
+
+            # '<Title> Lyrics' or generic '<something> lyrics'
+            if title_lc and re.match(rf'^{re.escape(title_lc)}\s+lyrics$', low):
+                continue
+            if re.match(r"^[a-z0-9 '\-]+ lyrics$", low):
+                continue
+
+            # early long descriptive paragraph (likely not a lyric line)
+            if len(s) > 140 and '.' in s:
+                continue
+
+            # otherwise: this looks like the first lyric line
+            started = True
+            out.append(s)
+        else:
+            out.append(s)
+
+    return "\n".join(out).lstrip("\n")
+
+def remove_inline_annotations(text: str) -> str:
+    """Remove bracketed/parenthetical labels like [Chorus], (Verse), etc., then re-trim."""
+    # remove standalone annotation lines
+    text = re.sub(r'^\s*[\(\[][^\)\]]{1,40}[\)\]]\s*$', '', text, flags=re.M)
+    # remove inline short annotations
+    text = re.sub(r'[\(\[][^\)\]]{1,40}[\)\]]', '', text)
+    # collapse excessive blanks again
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()
+    return text
+
+def ascii_only(text: str) -> str:
+    return text.encode("ascii", errors="ignore").decode("ascii").strip()
+
+def finalize_lyrics(raw: str, artist: str, title: str) -> str:
+    """
+    Full cleaning pipeline in the right order:
+    1) basic normalize (unescape, trim, collapse)
+    2) strip top boilerplate (headings/translations/blurbs)
+    3) remove annotations
+    4) force ASCII-only
+    """
+    t = basic_normalize(raw)
+    t = strip_top_noise(t, artist, title)
+    t = remove_inline_annotations(t)
+    t = ascii_only(t)
+    return t
 
 def slug_simple(s: str) -> str:
     return re.sub(r'[^A-Za-z0-9]+', '', s).lower()
@@ -42,7 +131,7 @@ def fetch_lyrics_lyricsovh(artist: str, title: str, retries: int = 3, delay: flo
                 data = r.json()
                 lyr = data.get("lyrics")
                 if lyr and lyr.strip():
-                    return ascii_clean(lyr)
+                    return finalize_lyrics(lyr, artist, title)
         except Exception:
             pass
         time.sleep(delay)
@@ -60,7 +149,7 @@ def fetch_lyrics_azlyrics(artist: str, title: str, retries: int = 3, delay: floa
                 comment = soup.find(string=lambda t: t and "Usage of azlyrics.com content" in t)
                 lyrics_div = comment.find_next("div") if comment else None
                 if not lyrics_div:
-                    # Fallback heuristic: first div containing <br> lines
+                    # heuristic: first div containing <br> looks like lyrics block
                     for div in soup.find_all("div"):
                         if div.find("br"):
                             lyrics_div = div
@@ -69,7 +158,7 @@ def fetch_lyrics_azlyrics(artist: str, title: str, retries: int = 3, delay: floa
                     for br in lyrics_div.find_all("br"):
                         br.replace_with("\n")
                     raw = lyrics_div.get_text("\n")
-                    cleaned = ascii_clean(raw)
+                    cleaned = finalize_lyrics(raw, artist, title)
                     if cleaned:
                         return cleaned
         except Exception:
@@ -78,7 +167,6 @@ def fetch_lyrics_azlyrics(artist: str, title: str, retries: int = 3, delay: floa
     return None
 
 def fetch_lyrics_genius_page(artist: str, title: str, retries: int = 3, delay: float = 1.0) -> str | None:
-    # Direct URL guess (no API): https://genius.com/Artist-Title-lyrics
     url = f"https://genius.com/{slug_hyphen(artist)}-{slug_hyphen(title)}-lyrics"
     for _ in range(retries):
         try:
@@ -92,7 +180,7 @@ def fetch_lyrics_genius_page(artist: str, title: str, retries: int = 3, delay: f
                         for seg in c.stripped_strings:
                             lines.append(seg)
                     raw = "\n".join(lines)
-                    cleaned = ascii_clean(raw)
+                    cleaned = finalize_lyrics(raw, artist, title)
                     if cleaned:
                         return cleaned
         except Exception:
@@ -101,10 +189,7 @@ def fetch_lyrics_genius_page(artist: str, title: str, retries: int = 3, delay: f
     return None
 
 def fetch_lyrics_genius_api(artist: str, title: str, token: str, retries: int = 3, delay: float = 1.0) -> str | None:
-    """
-    Use Genius API only to find the *correct* song URL, then scrape that page.
-    (Official API does not provide lyrics text due to licensing.)
-    """
+    """Use Genius API to find the canonical song URL, then scrape & clean."""
     hdrs = {**UA, "Authorization": f"Bearer {token}"}
     q = f"{artist} {title}"
     search_url = "https://api.genius.com/search"
@@ -114,7 +199,6 @@ def fetch_lyrics_genius_api(artist: str, title: str, token: str, retries: int = 
             if r.status_code == 200:
                 data = r.json()
                 hits = (data.get("response") or {}).get("hits") or []
-                # Prefer exact-ish matches on title & primary artist
                 def score(hit):
                     res = hit.get("result", {})
                     t = (res.get("title") or "").lower()
@@ -131,7 +215,6 @@ def fetch_lyrics_genius_api(artist: str, title: str, token: str, retries: int = 
                     url = result.get("url")
                     if not url:
                         continue
-                    # Scrape the found URL
                     try:
                         pr = requests.get(url, headers=UA, timeout=10)
                         if pr.status_code == 200:
@@ -143,7 +226,7 @@ def fetch_lyrics_genius_api(artist: str, title: str, token: str, retries: int = 
                                     for seg in c.stripped_strings:
                                         lines.append(seg)
                                 raw = "\n".join(lines)
-                                cleaned = ascii_clean(raw)
+                                cleaned = finalize_lyrics(raw, artist, title)
                                 if cleaned:
                                     return cleaned
                     except Exception:
@@ -161,33 +244,20 @@ def resolve_genius_token() -> str | None:
     )
 
 def get_lyrics(artist: str, title: str) -> str:
-    """
-    Fetch lyrics for artist/title. Prefers Genius API (if token is present)
-    to get the exact page, then falls back to lyrics.ovh, AZLyrics, and Genius page guess.
-    Always returns ASCII-only plain text, or a placeholder on failure.
-    """
-    # 0) Try Genius API-assisted lookup if token present
     token = resolve_genius_token()
     if token:
         lyr = fetch_lyrics_genius_api(artist, title, token)
         if lyr:
             return lyr
-
-    # 1) Lyrics.ovh
     lyr = fetch_lyrics_lyricsovh(artist, title)
     if lyr:
         return lyr
-
-    # 2) AZLyrics
     lyr = fetch_lyrics_azlyrics(artist, title)
     if lyr:
         return lyr
-
-    # 3) Genius direct page guess
     lyr = fetch_lyrics_genius_page(artist, title)
     if lyr:
         return lyr
-
     return "Lyrics not found."
 
 def default_outfile(artist: str, title: str) -> str:
@@ -212,7 +282,6 @@ def main():
     try:
         with open(out_path, "w", encoding="ascii", errors="ignore") as f:
             f.write(lyrics + "\n")
-        # Tiny UX hint
         sys.stderr.write(f"[saved] {out_path}\n")
     except Exception as e:
         sys.stderr.write(f"[warn] could not save to {out_path}: {e}\n")
