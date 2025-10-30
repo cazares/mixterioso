@@ -3,45 +3,38 @@
 """
 lyrics_fetcher_smart.py
 
-Drop-in replacement / upgrade for lyrics_fetcher.py.
+Safer, non-destructive lyrics fetcher.
 
-Goal:
-- Try several lyric sources (Genius API if token, then HTML sites).
-- Clean the output (strip junk headers, “read more”, translations list, contributor counts).
-- Prefer the “most complete” version.
-- Write final .txt that your pipeline (align_to_csv.py → render_from_csv.py) can consume.
+- Try multiple online sources.
+- Clean + score.
+- If nothing decent is found, FALL BACK to existing scripts/lyrics_fetcher.py.
+- If STILL nothing, DO NOT overwrite an existing lyrics file.
+- Only write placeholder if there was no file to begin with.
 
-Usage:
-    python3 scripts/lyrics_fetcher_smart.py "Jesús Adrián Romero" "Me Dice Que Me Ama" -o auto_lyrics/jesus-adrian-romero-me-dice-que-me-ama.txt
-
-Notes:
-- This stays additive: it does NOT delete your old lyrics_fetcher.py.
-- If everything fails, it will write a placeholder with a warning.
+This is made to be called by gen_video.sh like:
+    python3 scripts/lyrics_fetcher_smart.py "Artist" "Title" -o auto_lyrics/artist-title.txt
 """
 
 import os
 import re
 import sys
-import json
 import html
+import json
 import argparse
 import unicodedata
+import tempfile
+import subprocess
 from typing import List, Dict, Optional, Tuple
 
-try:
-    import requests  # your env probably has this; if not, pip install requests
-except ImportError:
-    print("[lyrics_fetcher_smart] requests not installed. Run: pip3 install requests")
-    sys.exit(1)
-
-# ------------------------------------------------------------
-# shared small utils
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# small utils
+# ---------------------------------------------------------------------
 JUNK_PREFIXES = [
-    "Translations", "Trke", "Türkçe", "Português", "Portugus", "Français",
-    "90 Contributors", "36 Contributors", "Read More", "You might also like",
-    "About", "Scar Tissue Lyrics", "Lyrics for", "Embed", "More on",
-    "Click here", "See also", "Official Video", "Lyrics powered by", "ADVERTISING"
+    "Translations", "Trke", "Türkçe", "Português", "Portugus",
+    "Français", "90 Contributors", "36 Contributors", "Read More",
+    "You might also like", "About", "Lyrics for", "Embed",
+    "Click here", "See also", "Official Video", "Lyrics powered by",
+    "ADVERTISING"
 ]
 
 SPANISH_SHORTCUTS = {
@@ -49,6 +42,9 @@ SPANISH_SHORTCUTS = {
     r"\bxq\b": "porque",
     r"\bpa\b": "para",
 }
+
+MIN_OK_CHARS = 60      # "real song" threshold (tweak)
+MIN_OK_LINES = 3
 
 def slug_hyphen(s: str) -> str:
     s = s.strip()
@@ -59,63 +55,56 @@ def slug_hyphen(s: str) -> str:
     return s
 
 def is_spanish_text(txt: str) -> bool:
-    # super dumb heuristic, good enough here
     txt_low = txt.lower()
-    hits = 0
-    for w in (" que ", " dios", " señor", " corazón", " espiritu", " espíritu", "jesus", "jesús"):
+    for w in (" que ", " dios", " señor", " corazon", " corazón", " espiritu", " espíritu", "jesus", "jesús"):
         if w in txt_low:
-            hits += 1
-    return hits >= 1
+            return True
+    return False
 
 def fix_spanish_sms_shortcuts(txt: str) -> str:
-    # Turn “q” → “que”, but only if it looks like Spanish lyrics
     if not is_spanish_text(txt):
         return txt
     for pat, repl in SPANISH_SHORTCUTS.items():
-      txt = re.sub(pat, repl, txt, flags=re.IGNORECASE)
+        txt = re.sub(pat, repl, txt, flags=re.IGNORECASE)
     return txt
 
 def normalize_lines(raw: str) -> str:
-    # unify newlines, de-dupe consecutive blanks
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
     lines = [ln.rstrip() for ln in raw.split("\n")]
-    cleaned = []
+    out = []
     last_blank = False
     for ln in lines:
         if ln.strip() == "":
             if not last_blank:
-                cleaned.append("")
+                out.append("")
             last_blank = True
         else:
-            cleaned.append(ln)
+            out.append(ln)
             last_blank = False
-    return "\n".join(cleaned).strip()
+    return "\n".join(out).strip()
 
 def strip_junk_header(text: str) -> str:
-    lines = [l for l in text.splitlines()]
-    # drop leading junk lines
-    final_lines = []
+    lines = text.splitlines()
+    final = []
     dropping = True
     for ln in lines:
         ln_stripped = ln.strip()
-        if dropping and any(ln_stripped.startswith(p) for p in JUNK_PREFIXES):
-            continue
-        # also drop empty lines at very top
-        if dropping and ln_stripped == "":
+        if dropping and (ln_stripped == "" or any(ln_stripped.startswith(p) for p in JUNK_PREFIXES)):
             continue
         dropping = False
-        final_lines.append(ln)
-    return "\n".join(final_lines).strip()
+        final.append(ln)
+    return "\n".join(final).strip()
 
 def score_lyrics(txt: str) -> Tuple[int, int]:
-    """
-    return (nonempty_lines, total_chars) for ranking.
-    we want bigger -> better.
-    """
-    lines = [l for l in txt.splitlines() if l.strip() != ""]
+    lines = [l for l in txt.splitlines() if l.strip()]
     return (len(lines), len(txt))
 
 def fetch_url(url: str, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
+    try:
+        import requests
+    except ImportError:
+        print("[lyrics_fetcher_smart] requests not installed; skipping remote sources.")
+        return None
     try:
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
@@ -124,68 +113,75 @@ def fetch_url(url: str, headers: Optional[Dict[str, str]] = None) -> Optional[st
         print(f"[lyrics_fetcher_smart] fetch failed for {url}: {e}")
     return None
 
-# ------------------------------------------------------------
-# Source 1: Genius API (if GENIUS_ACCESS_TOKEN present)
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# source: Genius (API + HTML)
+# ---------------------------------------------------------------------
 def fetch_from_genius_api(artist: str, title: str) -> Optional[str]:
     token = os.getenv("GENIUS_ACCESS_TOKEN")
     if not token:
         return None
-    query = f"{artist} {title}"
+    q = f"{artist} {title}"
     try:
-        search_url = "https://api.genius.com/search"
-        r = requests.get(search_url, params={"q": query}, headers={"Authorization": f"Bearer {token}"}, timeout=10)
-        data = r.json()
-        hits = data.get("response", {}).get("hits", [])
+        import requests
+        search = requests.get(
+            "https://api.genius.com/search",
+            params={"q": q},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        ).json()
+        hits = search.get("response", {}).get("hits", [])
         if not hits:
             return None
-        # pick first hit that matches song title-ish
+
         song_id = None
         for h in hits:
-            full_title = h["result"].get("full_title", "")
-            # simple containment check
-            if title.lower().split()[0] in full_title.lower():
+            full_title = h["result"].get("full_title", "").lower()
+            if title.split()[0].lower() in full_title:
                 song_id = h["result"]["id"]
                 break
         if not song_id:
             song_id = hits[0]["result"]["id"]
-        song_url = f"https://api.genius.com/songs/{song_id}"
-        s = requests.get(song_url, headers={"Authorization": f"Bearer {token}"}, timeout=10).json()
-        path = s.get("response", {}).get("song", {}).get("path")
+
+        song_obj = requests.get(
+            f"https://api.genius.com/songs/{song_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        ).json()
+        path = song_obj.get("response", {}).get("song", {}).get("path")
         if not path:
             return None
-        # Genius lyrics are in HTML page, not in API
-        page_url = "https://genius.com" + path
-        html_text = fetch_url(page_url)
+        html_text = fetch_url("https://genius.com" + path)
         if not html_text:
             return None
-        # Genius changed markup a few times; simplest is regex out text inside <div data-lyrics-container>
-        m = re.findall(r'<div[^>]+data-lyrics-container="true"[^>]*>(.*?)</div>', html_text, flags=re.DOTALL)
-        if not m:
+
+        # extract blocks
+        blocks = re.findall(
+            r'<div[^>]+data-lyrics-container="true"[^>]*>(.*?)</div>',
+            html_text,
+            flags=re.DOTALL,
+        )
+        if not blocks:
             return None
-        chunks = []
-        for block in m:
-            # strip tags
-            block_txt = re.sub(r"<[^>]+>", "", block)
-            block_txt = html.unescape(block_txt)
-            chunks.append(block_txt.strip())
-        joined = "\n".join(chunks)
-        return joined.strip()
+        out_parts = []
+        for b in blocks:
+            b = re.sub(r"<[^>]+>", "", b)
+            b = html.unescape(b)
+            out_parts.append(b.strip())
+        return "\n".join(out_parts).strip()
     except Exception as e:
-        print(f"[lyrics_fetcher_smart] Genius fetch failed: {e}")
+        print(f"[lyrics_fetcher_smart] Genius failed: {e}")
         return None
 
-# ------------------------------------------------------------
-# Source 2: letras.com (good for Spanish CCM)
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# source: letras.mus.br
+# ---------------------------------------------------------------------
 def fetch_from_letras(artist: str, title: str) -> Optional[str]:
-    # this is heuristic: we search using their mobile search endpoint
     q = f"{artist} {title}"
-    search_url = "https://www.letras.mus.br/?q=" + requests.utils.quote(q)
+    search_url = "https://www.letras.mus.br/?q=" + q.replace(" ", "+")
     html_text = fetch_url(search_url, headers={"User-Agent": "Mozilla/5.0"})
     if not html_text:
-      return None
-    # grab first result link to /<artist>/<song>/
+        return None
+    # try to find first song link
     m = re.search(r'href="(/[^"]+/[^"]+/)"', html_text)
     if not m:
         return None
@@ -193,29 +189,25 @@ def fetch_from_letras(artist: str, title: str) -> Optional[str]:
     song_html = fetch_url(song_url, headers={"User-Agent": "Mozilla/5.0"})
     if not song_html:
         return None
-    # letras lyrics are inside <div class="cnt-letra p402_premium">
     m = re.search(r'<div class="cnt-letra[^"]*">(.*?)</div>', song_html, flags=re.DOTALL)
     if not m:
         return None
     block = m.group(1)
-    # remove <p>, <br>, etc.
     block = re.sub(r"<br\s*/?>", "\n", block)
     block = re.sub(r"</p>", "\n", block)
     block = re.sub(r"<[^>]+>", "", block)
     block = html.unescape(block)
     return block.strip()
 
-# ------------------------------------------------------------
-# Source 3: letras.com.br alt (optional) / musica.com / generic
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# source: musica.com
+# ---------------------------------------------------------------------
 def fetch_from_musica_com(artist: str, title: str) -> Optional[str]:
-    # VERY heuristic, may fail quietly
     q = f"{artist} {title}"
-    search_url = "https://www.musica.com/letras.asp?q=" + requests.utils.quote(q)
+    search_url = "https://www.musica.com/letras.asp?q=" + q.replace(" ", "+")
     html_text = fetch_url(search_url)
     if not html_text:
         return None
-    # find first /letras.asp?letra=xxxxx
     m = re.search(r'href="(letras\.asp\?letra=[0-9]+)"', html_text)
     if not m:
         return None
@@ -223,7 +215,6 @@ def fetch_from_musica_com(artist: str, title: str) -> Optional[str]:
     song_html = fetch_url(song_url)
     if not song_html:
         return None
-    # lyrics are in <div id="letra">
     m = re.search(r'<div id="letra">(.*?)</div>', song_html, flags=re.DOTALL)
     if not m:
         return None
@@ -233,18 +224,16 @@ def fetch_from_musica_com(artist: str, title: str) -> Optional[str]:
     block = html.unescape(block)
     return block.strip()
 
-# ------------------------------------------------------------
-# Source 4: fallback: lyricstranslate-ish generic scrape
-# ------------------------------------------------------------
-def fetch_from_generic_googleable(artist: str, title: str) -> Optional[str]:
-    # This is intentionally dumb: we try lyrics.com with slug
+# ---------------------------------------------------------------------
+# source: lyrics.com (weak fallback)
+# ---------------------------------------------------------------------
+def fetch_from_lyrics_com(artist: str, title: str) -> Optional[str]:
     artist_slug = slug_hyphen(artist)
     title_slug = slug_hyphen(title)
     url = f"https://www.lyrics.com/lyric/{artist_slug}/{title_slug}"
     html_text = fetch_url(url)
     if not html_text:
         return None
-    # lyrics.com has <pre id="lyric-body-text">
     m = re.search(r'<pre[^>]*id="lyric-body-text"[^>]*>(.*?)</pre>', html_text, flags=re.DOTALL)
     if not m:
         return None
@@ -253,96 +242,137 @@ def fetch_from_generic_googleable(artist: str, title: str) -> Optional[str]:
     block = html.unescape(block)
     return block.strip()
 
-# ------------------------------------------------------------
-# final pick logic
-# ------------------------------------------------------------
-def pick_best_variant(variants: List[Tuple[str, str]]) -> Tuple[str, Dict]:
-    """
-    variants: [(source_name, raw_text), ...]
-    Returns: (best_text, debug_info)
-    """
-    cleaned_variants = []
-    for src, txt in variants:
-        if not txt:
+# ---------------------------------------------------------------------
+# fallback to existing lyrics_fetcher.py
+# ---------------------------------------------------------------------
+def try_legacy_fetcher(artist: str, title: str, final_out: str, scripts_dir: str) -> Optional[str]:
+    legacy_path = os.path.join(scripts_dir, "lyrics_fetcher.py")
+    if not os.path.isfile(legacy_path):
+        return None
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="legacy_lyrics_", suffix=".txt")
+    os.close(tmp_fd)
+    try:
+        cmd = [sys.executable, legacy_path, artist, title, "-o", tmp_path]
+        print(f"[lyrics_fetcher_smart] trying legacy fetcher: {' '.join(cmd)}")
+        subprocess.run(cmd, check=False)
+        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 30:
+            with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+                txt = f.read().strip()
+            os.unlink(tmp_path)
+            return txt
+    except Exception as e:
+        print(f"[lyrics_fetcher_smart] legacy fetcher failed: {e}")
+    return None
+
+# ---------------------------------------------------------------------
+# pick best
+# ---------------------------------------------------------------------
+def pick_best(variants: List[Tuple[str, str]]) -> Optional[Dict]:
+    cleaned = []
+    for src, raw in variants:
+        if not raw:
             continue
-        txt = normalize_lines(txt)
+        txt = normalize_lines(raw)
         txt = strip_junk_header(txt)
         txt = fix_spanish_sms_shortcuts(txt)
-        lines_score, char_score = score_lyrics(txt)
-        cleaned_variants.append({
+        line_count, char_count = score_lyrics(txt)
+        cleaned.append({
             "source": src,
             "text": txt,
-            "lines": lines_score,
-            "chars": char_score,
+            "lines": line_count,
+            "chars": char_count,
         })
-    if not cleaned_variants:
-        return ("[LYRICS NOT FOUND]\n", {"picked": None, "candidates": []})
-    # sort: more lines first, if tie -> more chars
-    cleaned_variants.sort(key=lambda d: (d["lines"], d["chars"]), reverse=True)
-    best = cleaned_variants[0]
-    debug = {
-        "picked": best["source"],
-        "candidates": cleaned_variants,
-    }
-    return best["text"], debug
+    if not cleaned:
+        return None
+    cleaned.sort(key=lambda d: (d["lines"], d["chars"]), reverse=True)
+    return cleaned[0], cleaned
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
 # main
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("artist")
     ap.add_argument("title")
-    ap.add_argument("-o", "--output", help="output txt path", required=False)
+    ap.add_argument("-o", "--output", help="output txt path")
     args = ap.parse_args()
 
     artist = args.artist.strip()
     title = args.title.strip()
 
-    print(f"[smart-lyrics] fetching lyrics for: {artist!r} – {title!r}")
+    # figure out scripts dir to call legacy
+    scripts_dir = os.path.dirname(os.path.realpath(__file__))
+
+    print(f"[smart-lyrics] fetching for: {artist!r} – {title!r}")
 
     variants: List[Tuple[str, str]] = []
 
-    # 1) Genius API (if token)
+    # remote sources
     g = fetch_from_genius_api(artist, title)
     if g:
         variants.append(("genius_api", g))
 
-    # 2) letras.com
     l = fetch_from_letras(artist, title)
     if l:
         variants.append(("letras", l))
 
-    # 3) musica.com
     m = fetch_from_musica_com(artist, title)
     if m:
         variants.append(("musica_com", m))
 
-    # 4) generic
-    gg = fetch_from_generic_googleable(artist, title)
-    if gg:
-        variants.append(("lyrics_com_generic", gg))
+    lc = fetch_from_lyrics_com(artist, title)
+    if lc:
+        variants.append(("lyrics_com", lc))
 
-    # 5) if STILL empty, put placeholder
-    if not variants:
-      final_txt = f"{title}\n{artist}\n\n[lyrics not found — add manually]\n"
-      out = args.output or f"{slug_hyphen(artist)}-{slug_hyphen(title)}.txt"
-      with open(out, "w", encoding="utf-8") as f:
-          f.write(final_txt)
-      print(f"[smart-lyrics] wrote placeholder to {out}")
-      sys.exit(0)
+    best = None
+    ranked = []
+    if variants:
+        best, ranked = pick_best(variants) or (None, [])
 
-    best_text, debug = pick_best_variant(variants)
+    # if we don't have a good-enough one, call legacy
+    good_enough = False
+    if best:
+        if best["chars"] >= MIN_OK_CHARS and best["lines"] >= MIN_OK_LINES:
+            good_enough = True
+
+    if not good_enough:
+        legacy_txt = try_legacy_fetcher(artist, title, args.output or "", scripts_dir)
+        if legacy_txt:
+            # clean legacy too
+            legacy_txt = normalize_lines(legacy_txt)
+            legacy_txt = strip_junk_header(legacy_txt)
+            legacy_txt = fix_spanish_sms_shortcuts(legacy_txt)
+            lc_lines, lc_chars = score_lyrics(legacy_txt)
+            if not best or (lc_lines, lc_chars) > (best["lines"], best["chars"]):
+                best = {
+                    "source": "legacy_lyrics_fetcher.py",
+                    "text": legacy_txt,
+                    "lines": lc_lines,
+                    "chars": lc_chars,
+                }
+                good_enough = lc_chars >= MIN_OK_CHARS and lc_lines >= MIN_OK_LINES
 
     out_path = args.output or f"{slug_hyphen(artist)}-{slug_hyphen(title)}.txt"
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(best_text + "\n")
 
-    print(f"[smart-lyrics] picked source: {debug['picked']}")
-    for cand in debug["candidates"]:
-        print(f"  - {cand['source']}: {cand['lines']} lines, {cand['chars']} chars")
-    print(f"[smart-lyrics] wrote to {out_path}")
+    # final write logic (NON-DESTRUCTIVE)
+    if best and best["text"].strip():
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(best["text"].strip() + "\n")
+        print(f"[smart-lyrics] picked: {best['source']} ({best['lines']} lines, {best['chars']} chars)")
+        print(f"[smart-lyrics] wrote to {out_path}")
+    else:
+        # nothing good
+        if os.path.exists(out_path):
+            # we DO NOT overwrite
+            print(f"[smart-lyrics] no good lyrics found; keeping existing file: {out_path}")
+        else:
+            # ok, no file existed, write placeholder
+            placeholder = f"{title}\n{artist}\n\n[lyrics not found — add manually]\n"
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(placeholder)
+            print(f"[smart-lyrics] no lyrics found; wrote placeholder to {out_path}")
 
 if __name__ == "__main__":
     main()
