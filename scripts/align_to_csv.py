@@ -1,120 +1,120 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 import argparse, csv, re
-import stable_whisper
+import stable_whisper  # from stable-ts library
 
 def norm_tokens(s: str):
-    # keep letters/digits/apostrophes, lowercased
+    """Normalize a string to tokens: lowercase alphanumeric/apostrophe tokens."""
     return re.findall(r"[a-z0-9']+", s.lower())
 
 def extract_words_from_result(res):
+    """Extract a flat list of words with their start and end times from a Whisper result."""
     words = []
     for seg in res.to_dict().get("segments", []):
         for w in seg.get("words", []):
             if w.get("word") and isinstance(w.get("start"), (int, float)) and isinstance(w.get("end"), (int, float)):
-                words.append({"word": w["word"], "start": float(w["start"]), "end": float(w["end"])})
+                words.append({
+                    "word": w["word"],
+                    "start": float(w["start"]),
+                    "end": float(w["end"])
+                })
     return words
 
 def assign_lines_robust(words, lines, start_wi=0, search_ahead=400, skip_max=6, min_cover=0.6):
     """
-    Map each lyric line to a best-effort span in the ASR words.
-    - search_ahead: how far ahead (in words) we scan to find the first token
-    - skip_max: max non-matching words allowed between matched tokens
-    - min_cover: fraction of line tokens that must be matched to accept
+    Assign each lyric line a start and end timestamp by matching its words to the ASR word list.
+    Allows skipping up to skip_max words between matches and requires a minimum coverage of line tokens.
+    If a line can't be matched, it is assigned a zero-duration at the last known time (fallback).
     """
-    W = [ (norm_tokens(w["word"]) or [""]) [0] for w in words ]
-    out, wi = [], max(0, start_wi)
+    # Prepare a list of normalized word tokens from ASR output
+    W = [(norm_tokens(w["word"]) or [""])[0] for w in words]
+    out = []
+    wi = max(0, start_wi)
     fallback_count = 0
-
     for line in lines:
-        toks = norm_tokens(line)
-        if not toks:
-            # blank/symbol-only line; pin to previous end
+        tokens = norm_tokens(line)
+        if not tokens:
+            # Empty line (or only punctuation): assign it the previous line's end time
             prev_end = out[-1][2] if out else 0.0
-            out.append([line, round(prev_end,3), round(prev_end,3)])
+            out.append([line, round(prev_end, 3), round(prev_end, 3)])
             continue
-
-        best = None  # (score, start_idx, end_idx)
-        # bounded search for first-token candidates so we don't consume everything on a miss
+        best_match = None  # tuple (score, start_index, end_index in W)
+        # Limit how far ahead to search for the first token to avoid excessive mismatches
         end_window = min(len(W), wi + search_ahead)
         for k in range(wi, end_window):
-            if W[k] != toks[0]:
+            if W[k] != tokens[0]:
                 continue
-            # try to walk the rest of the tokens allowing small skips
+            # Potential start match found at index k
             m = 1
             j = k + 1
             last_match_idx = k
-            while m < len(toks) and j < len(W):
-                # advance up to skip_max to find next token
+            # Try to match subsequent tokens in line
+            while m < len(tokens) and j < len(W):
+                # Allow up to skip_max unmatched words between token matches
                 hopped = 0
-                while j < len(W) and W[j] != toks[m] and hopped < skip_max:
-                    j += 1
-                    hopped += 1
-                if j < len(W) and W[j] == toks[m]:
+                while j < len(W) and W[j] != tokens[m] and hopped < skip_max:
+                    j += 1; hopped += 1
+                if j < len(W) and W[j] == tokens[m]:
                     last_match_idx = j
                     m += 1
                     j += 1
                 else:
                     break
-            score = m / len(toks)
-            if best is None or score > best[0]:
-                best = (score, k, last_match_idx)
-                # early exit if perfect (or near-perfect)
-                if score >= 0.98:
+            score = m / len(tokens)  # proportion of tokens matched in sequence
+            if best_match is None or score > best_match[0]:
+                best_match = (score, k, last_match_idx)
+                if score >= 0.98:  # near-perfect match, no need to search further
                     break
-
-        if best and best[0] >= min_cover:
-            _, k, last = best
-            start = words[k]["start"]
-            end = words[last]["end"]
-            out.append([line, round(start,3), round(end,3)])
-            # advance global pointer to just past what we used (but not too far)
-            wi = min(last + 1, k + search_ahead)
+        if best_match and best_match[0] >= min_cover:
+            _, start_idx, end_idx = best_match
+            start_time = words[start_idx]["start"]
+            end_time   = words[end_idx]["end"]
+            out.append([line, round(start_time, 3), round(end_time, 3)])
+            # Move the search pointer forward, but not too far (ensures we don't skip matching far ahead)
+            wi = min(end_idx + 1, start_idx + search_ahead)
         else:
-            # no decent match found: do NOT advance wi, just pin to previous end
+            # No good match found: use fallback (line gets zero-duration at last known end time)
             prev_end = out[-1][2] if out else 0.0
-            out.append([line, round(prev_end,3), round(prev_end,3)])
+            out.append([line, round(prev_end, 3), round(prev_end, 3)])
             fallback_count += 1
-
     return out, fallback_count
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--audio", required=True)
-    ap.add_argument("--lyrics", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--model", default="large-v3")
-    ap.add_argument("--min-cover", type=float, default=0.6)
-    ap.add_argument("--search-ahead", type=int, default=400)
-    ap.add_argument("--skip-max", type=int, default=6)
+    ap.add_argument("--audio", required=True, help="Path to song audio file")
+    ap.add_argument("--lyrics", required=True, help="Path to lyrics text file")
+    ap.add_argument("--out", required=True, help="Output CSV file path")
+    ap.add_argument("--model", default="large-v3", help="Whisper model name (e.g. large-v3, medium, small, tiny)")
+    ap.add_argument("--min-cover", type=float, default=0.6, help="Minimum fraction of line tokens that must align")
+    ap.add_argument("--search-ahead", type=int, default=400, help="Word search window size for alignment")
+    ap.add_argument("--skip-max", type=int, default=6, help="Max words to skip in alignment matching")
     args = ap.parse_args()
 
-    with open(args.lyrics, "r") as f:
+    # Load lyrics lines
+    with open(args.lyrics, "r", encoding="utf-8") as f:
         lines = [l.rstrip() for l in f if l.strip()]
 
-    model = stable_whisper.load_model(args.model)  # uses MPS on Apple Silicon if available
-    # Align to the WHOLE lyrics text; Whisper aligns words across the full timeline
-    res = model.align(args.audio, "\n".join(lines), language="en")
-    words = extract_words_from_result(res)
+    # Load Whisper model (will use GPU/MPS if available, otherwise CPU)
+    model = stable_whisper.load_model(args.model)
+    # Perform alignment across the entire lyrics text
+    result = model.align(args.audio, "\n".join(lines), language="en")
+    words = extract_words_from_result(result)
 
-    rows, fb = assign_lines_robust(
-        words,
-        lines,
-        start_wi=0,
+    # Assign timestamps to each lyric line
+    rows, fb_count = assign_lines_robust(
+        words, lines, start_wi=0,
         search_ahead=args.search_ahead,
         skip_max=args.skip_max,
         min_cover=args.min_cover,
     )
 
-    with open(args.out, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["line", "start", "end"])
-        w.writerows(rows)
-
+    # Write output CSV
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["line", "start", "end"])
+        writer.writerows(rows)
     total = len(lines)
-    print(f"Aligned {total} lines. Fallback (pinned) lines: {fb} ({fb/total:.1%}).")
+    print(f"Aligned {total} lines. Fallback lines (no timing match): {fb_count} ({fb_count/total:.1%}).")
 
 if __name__ == "__main__":
     main()
-# end of scripts/align_to_csv.py
