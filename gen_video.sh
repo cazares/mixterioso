@@ -8,6 +8,8 @@
 #  - ✅ REUSE EXISTING STEMS
 #  - ✅ PRE-NUKE output/<name>.mp4 if it's a dir/file
 #  - ✅ optional --car-font-size passthrough
+#  - ✅ accent-friendly slugify
+#  - ✅ YouTube: PASS POSITIONAL QUERY (no --artist/--title)
 
 set -euo pipefail
 
@@ -40,7 +42,18 @@ mkdir -p "$LYRICS_DIR" "$SONGS_DIR" "$OUTPUT_DIR" "$STEMS_ROOT"
 
 # --- helpers --------------------------------------------------------------
 slugify() {
-  echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+  local s="$1"
+  s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+  s=$(printf '%s' "$s" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')
+  s=$(printf '%s' "$s" | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+  printf '%s\n' "$s"
+}
+
+# 👇 deaccent but KEEP SPACES (for YouTube queries)
+deaccent_keep_spaces() {
+  local s="$1"
+  s=$(printf '%s' "$s" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')
+  printf '%s\n' "$s"
 }
 
 is_pct() {
@@ -71,8 +84,9 @@ find_existing_stems_dir() {
   if [ -d "$stems_export_dir/htdemucs/$audio_base" ]; then
     echo "$stems_export_dir/htdemucs/$audio_base"; return
   fi
-  if [ -f "$stems_export_dir/htdemucs/$audio_base/vocals.wav" ]; then
-    echo "$stems_export_dir/htdemucs/$audio_base"; return
+  # last-resort: 2-stem often ends here too
+  if [ -d "$stems_export_dir/htdemucs_2s/$audio_base" ]; then
+    echo "$stems_export_dir/htdemucs_2s/$audio_base"; return
   fi
   echo ""
 }
@@ -87,7 +101,7 @@ ARTIST="$1"; shift
 TITLE="$1"; shift
 
 FONT_SIZE=140
-CAR_FONT_SIZE=""          # optional, pass-through
+CAR_FONT_SIZE=""
 MAX_CHARS=18
 OFFSET_VIDEO=-1.0
 EXTRA_DELAY=0.0
@@ -107,15 +121,15 @@ SEL_GUITAR=0;  GUITAR_LEVEL=100
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --font-size)    FONT_SIZE="$2"; shift 2;;
+    --font-size)     FONT_SIZE="$2"; shift 2;;
     --car-font-size) CAR_FONT_SIZE="$2"; shift 2;;
-    --max-chars)    MAX_CHARS="$2"; shift 2;;
-    --offset-video) OFFSET_VIDEO="$2"; shift 2;;
-    --extra-delay)  EXTRA_DELAY="$2"; shift 2;;
-    --hpad-pct)     HPAD_PCT="$2"; shift 2;;
-    --valign)       VALIGN="$2"; shift 2;;
+    --max-chars)     MAX_CHARS="$2"; shift 2;;
+    --offset-video)  OFFSET_VIDEO="$2"; shift 2;;
+    --extra-delay)   EXTRA_DELAY="$2"; shift 2;;
+    --hpad-pct)      HPAD_PCT="$2"; shift 2;;
+    --valign)        VALIGN="$2"; shift 2;;
     --gap-threshold) GAP_THRESHOLD="$2"; shift 2;;
-    --gap-delay)    GAP_DELAY="$2"; shift 2;;
+    --gap-delay)     GAP_DELAY="$2"; shift 2;;
     --vocal-pcts)
       HAS_VOCAL_PCTS=1
       VOCAL_PCTS_STR="$2"
@@ -176,11 +190,41 @@ if [ -f "$AUDIO_PATH" ]; then
 else
   if [ -f "$SCRIPTS_DIR/youtube_audio_picker.py" ]; then
     info ">>> Downloading audio from YouTube (yt-dlp)..."
-    python3 "$SCRIPTS_DIR/youtube_audio_picker.py" \
-      --artist "$ARTIST" \
-      --title "$TITLE" \
-      --out "$AUDIO_PATH"
-    ok "[OK] Audio saved to $AUDIO_PATH"
+
+    # 1) try with original accents
+    if python3 "$SCRIPTS_DIR/youtube_audio_picker.py" \
+        --artist "$ARTIST" \
+        --title "$TITLE" \
+        --out "$AUDIO_PATH"; then
+      ok "[OK] Audio saved to $AUDIO_PATH"
+    else
+      warn "[WARN] YouTube search with accents failed, retrying without accents…"
+
+      # deaccent artist/title for Spanish-ish names
+      PLAIN_ARTIST=$(printf '%s' "$ARTIST" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')
+      PLAIN_TITLE=$(printf '%s' "$TITLE"   | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')
+
+      # 2) try again with deaccented flags
+      if python3 "$SCRIPTS_DIR/youtube_audio_picker.py" \
+          --artist "$PLAIN_ARTIST" \
+          --title "$PLAIN_TITLE" \
+          --out "$AUDIO_PATH"; then
+        ok "[OK] Audio saved to $AUDIO_PATH"
+      else
+        warn "[WARN] Deaccented artist/title still failed — trying plain query…"
+
+        # 3) final fallback: plain query, --out is a SEPARATE arg (the bug you hit)
+        if python3 "$SCRIPTS_DIR/youtube_audio_picker.py" \
+            --query "$PLAIN_ARTIST $PLAIN_TITLE" \
+            --out "$AUDIO_PATH"; then
+          ok "[OK] Audio saved to $AUDIO_PATH"
+        else
+          err "[ERROR] Could not download audio from YouTube for: $PLAIN_ARTIST $PLAIN_TITLE"
+          err "      Try: python3 scripts/youtube_audio_picker.py --query \"$PLAIN_ARTIST $PLAIN_TITLE\" --out \"$AUDIO_PATH\""
+          exit 1
+        fi
+      fi
+    fi
   else
     err "[ERROR] scripts/youtube_audio_picker.py not found."
     exit 1
@@ -311,7 +355,7 @@ EOF
       fc+="${outs}amix=inputs=${idx}:normalize=0[outa]"
 
       MIXED_PATH="$MIXED_AUDIO_DIR/${TITLE_SLUG}_v${pct}.wav"
-      info "[MIX] building mix for ${pct}%% → $MIXED_PATH"
+      info "[MIX] building mix for ${pct}% → $MIXED_PATH"
 
       if ffmpeg -y "${inputs[@]}" -filter_complex "$fc" -map "[outa]" -ar 48000 -ac 1 -b:a 192k "$MIXED_PATH" >/dev/null 2>&1; then
         AUDIO_FOR_THIS="$MIXED_PATH"
@@ -327,7 +371,6 @@ EOF
     warn "[WARN] No demucs stems — ${pct}% will sound same as others."
   fi
 
-  # ✅ PRE-NUKE bad existing output (file OR directory) so ffmpeg never fails
   FINAL_MP4="$OUTPUT_DIR/${OUT_NAME}.mp4"
   if [ -d "$FINAL_MP4" ]; then
     warn "[CLEANUP] $FINAL_MP4 was a directory — removing it so we can write the mp4."
@@ -337,7 +380,6 @@ EOF
     rm -f "$FINAL_MP4"
   fi
 
-  # 7) render video for this pct -------------------------------------------
   PY_ARGS=(
     "$SCRIPTS_DIR/render_from_csv.py"
     --csv "$CSV_PATH"
@@ -356,7 +398,6 @@ EOF
     --gap-delay "$GAP_DELAY"
     --no-open
   )
-
   if [ -n "$CAR_FONT_SIZE" ]; then
     PY_ARGS+=( --car-font-size "$CAR_FONT_SIZE" )
   fi

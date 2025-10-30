@@ -7,6 +7,10 @@ Interactive usage (manual pick):
     python3 youtube_audio_picker.py
 Automated usage (no prompts):
     python3 youtube_audio_picker.py "Artist Name" "Song Title"
+
+NEW (for bash pipeline):
+    python3 youtube_audio_picker.py --query "jesus adrian romero sumergeme" --out songs/auto_jesus-adrian-romero-sumergeme.mp3
+    python3 youtube_audio_picker.py --artist "Jesús Adrián Romero" --title "Sumérgeme" --out songs/auto_jesus-adrian-romero-sumergeme.mp3
 """
 import os, sys, shutil, subprocess, json
 from typing import List, Dict, Optional
@@ -203,6 +207,67 @@ def download_audio_for_entry(entry: Dict, download_dir: str, want_mp3: bool) -> 
         print("\nDownloaded, but couldn't locate the audio file.")
     return path
 
+# ---------- NEW helper: deaccent ----------
+def deaccent_string(s: str) -> str:
+    import unicodedata
+    nfkd = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+# ---------- NEW helper: non-interactive download for bash ----------
+def noninteractive_download(query: str, out_path: str) -> bool:
+    """
+    This is the bit your bash wants:
+      python3 youtube_audio_picker.py --query "foo bar" --out /path/to.mp3
+
+    1. search
+    2. pick 1st non-cover
+    3. download
+    4. move/rename to out_path
+    """
+    print(f'Auto search query: "{query}"')
+    results = yt_search_sorted_by_views(query, max_results=15)
+    if not results:
+        # try deaccented
+        plain = deaccent_string(query)
+        if plain != query:
+            print("[WARN] No results, retrying without accents…")
+            results = yt_search_sorted_by_views(plain, max_results=15)
+    if not results:
+        print("[ERROR] No results found on YouTube for the query.")
+        return False
+
+    download_dir = os.path.dirname(out_path) or "."
+    os.makedirs(download_dir, exist_ok=True)
+
+    # prefer non-cover/instrumental
+    def is_bad_title(t: str) -> bool:
+        t = t.lower()
+        bad = ["cover", "karaoke", "instrumental", "live", "en vivo"]
+        return any(b in t for b in bad)
+
+    candidates = [e for e in results if not is_bad_title(e.get("title") or "")]
+    if not candidates:
+        candidates = results
+
+    for entry in candidates:
+        title = entry.get("title", "Unknown")
+        print(f'Auto-selected: "{title}"')
+        fp = download_audio_for_entry(entry, download_dir=download_dir, want_mp3=True)
+        if fp and os.path.isfile(fp):
+            # rename/move to out_path
+            if os.path.abspath(fp) != os.path.abspath(out_path):
+                try:
+                    shutil.move(fp, out_path)
+                except Exception as e:
+                    print(f"[WARN] could not rename to {out_path}: {e}")
+            print(f"[OK] Audio saved to {out_path}")
+            return True
+        else:
+            print("[WARN] download failed for this candidate, trying next…")
+
+    print("[ERROR] Audio download failed for all candidate results.")
+    return False
+
 # ---------- Main interactive flow ----------
 def prompt_search_query() -> Optional[str]:
     print_hr()
@@ -320,8 +385,33 @@ def main():
             print("\nNo more results. Goodbye.")
             return
 
-# --- Automated mode: auto-search and download without prompts ---
+# --- Automated / script entrypoint ----------------------------------------
 if __name__ == "__main__":
+    # NEW: real CLI path for bash
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--query", help="Full YouTube search query (preferred for automation).")
+    ap.add_argument("--artist", help="Artist (will be combined with --title).")
+    ap.add_argument("--title", help="Title (will be combined with --artist).")
+    ap.add_argument("--out", help="Output path (mp3).")
+    # we don't want to break the old positional auto-mode, so we parse only known
+    args, unknown = ap.parse_known_args()
+
+    # 1) if called with flags, do flag mode
+    if args.query or args.artist or args.title:
+        # build query
+        if args.query:
+            q = args.query.strip()
+        else:
+            art = args.artist or ""
+            tit = args.title or ""
+            q = f"{art} {tit}".strip()
+        out_path = args.out or os.path.join(os.getcwd(), "songs", "auto_download.mp3")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        ok = noninteractive_download(q, out_path)
+        sys.exit(0 if ok else 1)
+
+    # 2) if they passed positionals (old style): keep your old behavior
     if len(sys.argv) > 1:
         # Auto mode: use provided args as search query
         query = " ".join(sys.argv[1:]).strip()
@@ -366,9 +456,14 @@ if __name__ == "__main__":
             print("Audio download failed for all candidate results.")
             sys.exit(1)
         # Rename the downloaded file to our standardized filename
-        from lyrics_fetcher import slug_hyphen  # use same slug logic for consistency
+        try:
+            from lyrics_fetcher import slug_hyphen  # use same slug logic for consistency
+        except Exception:
+            # fallback: simple
+            def slug_hyphen(s: str) -> str:
+                return "".join(c if c.isalnum() else "-" for c in s.lower()).strip("-")
         artist_arg = sys.argv[1]; title_arg = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else ""
-        slug_base = f"{slug_hyphen(artist_arg)}-{slug_hyphen(title_arg)}"
+        slug_base = f"{slug_hyphen(artist_arg)}-{slug_hyphen(title_arg)}".strip("-")
         orig_ext = os.path.splitext(filepath)[1] or ""
         target_path = os.path.join(download_dir, f"auto_{slug_base}{orig_ext}")
         try:
@@ -380,8 +475,9 @@ if __name__ == "__main__":
         print(f"Saved audio to {filepath}")
         sys.exit(0)
     else:
-        # No arguments: run in interactive mode
+        # 3) no args → interactive
         try:
             main()
         except KeyboardInterrupt:
             print("\nInterrupted. Goodbye.")
+# end of youtube_audio_picker.py
