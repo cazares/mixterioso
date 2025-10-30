@@ -11,7 +11,7 @@ shift
 
 python3 scripts/car_karaoke_time.py \
   --lyrics "lyrics/${TITLE}.txt" \
-  --vocal-pcts 0 35 100 \
+  --vocal-pcts 50 75 \
   --high-quality \
   --font-size 140 \
   --offset-video -1.0 \
