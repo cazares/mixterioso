@@ -1,124 +1,155 @@
-#!/bin/bash
-# new_song_with_automated_timings.sh — Master pipeline script (auto: lyrics → yt → align → render)
-# Run like:
-#   ./new_song_with_automated_timings.sh "Shakira" "Soltera"
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -e
+# new_song_with_automated_timings.sh
+# Usage:
+#   ./new_song_with_automated_timings.sh "Red Hot Chili Peppers" "Californication"
+#   ./new_song_with_automated_timings.sh "Red Hot Chili Peppers" "Californication" --extra-delay 1.0
 
-artist="$1"
-title="$2"
-
-if [[ -z "$artist" || -z "$title" ]]; then
-  echo "Usage: $0 \"Artist Name\" \"Song Title\""
+if [ $# -lt 2 ]; then
+  echo "usage: $0 \"Artist\" \"Title\" [render extra args...]"
   exit 1
 fi
 
-# ✅ IMPORTANT: repo root = folder where THIS script lives
-# (not the parent — your project is already in karaoke-time-by-miguel)
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+ARTIST="$1"
+TITLE="$2"
+shift 2 || true   # extra args → render_from_csv.py
 
-SONGS_DIR="$REPO_ROOT/songs"
-AUTO_LYRICS_DIR="$REPO_ROOT/auto_lyrics"
-OUTPUT_DIR="$REPO_ROOT/output"
+REPO_ROOT="$(pwd)"
 SCRIPTS_DIR="$REPO_ROOT/scripts"
 
-mkdir -p "$SONGS_DIR" "$AUTO_LYRICS_DIR" "$OUTPUT_DIR"
+# normalize for filenames
+SAFE_ARTIST=$(echo "$ARTIST" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd '[:alnum:]-')
+SAFE_TITLE=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd '[:alnum:]-')
+BASE="${SAFE_ARTIST}-${SAFE_TITLE}"
 
-# slug: "Shakira Soltera" -> "shakira-soltera"
-slug="$(echo "${artist} ${title}" | sed -E 's/[^A-Za-z0-9]+/-/g; s/^-+|-+$//g' | tr 'A-Z' 'a-z')"
+LYRICS_DIR="$REPO_ROOT/auto_lyrics"
+SONGS_DIR="$REPO_ROOT/songs"
+OUT_DIR="$REPO_ROOT/output"
 
-echo ">>> Fetching lyrics for \"${title}\" by ${artist}..."
-lyrics_file="$AUTO_LYRICS_DIR/${slug}.txt"
+mkdir -p "$LYRICS_DIR" "$SONGS_DIR" "$OUT_DIR"
 
-python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$artist" "$title" -o "$lyrics_file" >/dev/null 2>&1 || true
+LYRICS_OUT="$LYRICS_DIR/${BASE}.txt"
+CSV_OUT="$LYRICS_DIR/${BASE}.csv"
+AUDIO_OUT="$SONGS_DIR/auto_${BASE}.mp3"
 
-if grep -Fxq "Lyrics not found." "$lyrics_file" 2>/dev/null; then
-  echo "[ERROR] Lyrics not found for \"$title\" by $artist. Aborting."
+# ---------------------------------------------------------------------
+# locate python helpers
+# ---------------------------------------------------------------------
+if [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
+  LYRICS_FETCHER="$SCRIPTS_DIR/lyrics_fetcher.py"
+elif [ -f "$REPO_ROOT/lyrics_fetcher.py" ]; then
+  LYRICS_FETCHER="$REPO_ROOT/lyrics_fetcher.py"
+else
+  echo "[ERROR] lyrics_fetcher.py not found in scripts/ or repo root."
   exit 1
 fi
-echo "[OK] Lyrics saved to $lyrics_file"
 
+if [ -f "$SCRIPTS_DIR/youtube_audio_picker.py" ]; then
+  YT_PICKER="$SCRIPTS_DIR/youtube_audio_picker.py"
+elif [ -f "$REPO_ROOT/youtube_audio_picker.py" ]; then
+  YT_PICKER="$REPO_ROOT/youtube_audio_picker.py"
+else
+  echo "[ERROR] youtube_audio_picker.py not found in scripts/ or repo root."
+  exit 1
+fi
+
+if [ -f "$SCRIPTS_DIR/align_to_csv.py" ]; then
+  ALIGNER="$SCRIPTS_DIR/align_to_csv.py"
+else
+  echo "[ERROR] scripts/align_to_csv.py not found."
+  exit 1
+fi
+
+if [ -f "$SCRIPTS_DIR/render_from_csv.py" ]; then
+  RENDERER="$SCRIPTS_DIR/render_from_csv.py"
+else
+  echo "[ERROR] scripts/render_from_csv.py not found."
+  exit 1
+fi
+
+# ---------------------------------------------------------------------
+# 1) fetch lyrics (try flag, then positional)
+# ---------------------------------------------------------------------
+echo ">>> Fetching lyrics for \"$TITLE\" by $ARTIST..."
+FETCH_OK=0
+set +e
+python3 "$LYRICS_FETCHER" --artist "$ARTIST" --title "$TITLE" --out "$LYRICS_OUT"
+if [ $? -ne 0 ]; then
+  python3 "$LYRICS_FETCHER" "$ARTIST" "$TITLE" -o "$LYRICS_OUT"
+  FETCH_OK=$?
+else
+  FETCH_OK=0
+fi
+set -e
+
+if [ $FETCH_OK -ne 0 ] || [ ! -s "$LYRICS_OUT" ]; then
+  echo "[ERROR] Could not fetch lyrics for \"$TITLE\" by $ARTIST."
+  exit 1
+fi
+echo "[OK] Lyrics saved to $LYRICS_OUT"
+
+# ---------------------------------------------------------------------
+# 2) download audio (try flag mode, then positional search)
+# ---------------------------------------------------------------------
 echo ">>> Downloading audio from YouTube..."
 
-# prefer scripts/ version
-YTPICKER="$SCRIPTS_DIR/youtube_audio_picker.py"
-if [[ ! -f "$YTPICKER" ]]; then
-  # fallback to root if user drops it there
-  YTPICKER="$REPO_ROOT/youtube_audio_picker.py"
-fi
-if [[ ! -f "$YTPICKER" ]]; then
-  echo "[ERROR] youtube_audio_picker.py not found in scripts/ or repo root."
-  echo "        Expected: $SCRIPTS_DIR/youtube_audio_picker.py"
-  exit 1
-fi
+# try 1: flag-style (maybe your picker supports it)
+YT_ERR_LOG=$(mktemp)
+set +e
+python3 "$YT_PICKER" \
+  --artist "$ARTIST" \
+  --title "$TITLE" \
+  --out "$AUDIO_OUT" 2> "$YT_ERR_LOG"
+YT_RC=$?
+set -e
 
-# 🚗 call picker in AUTO mode, passing artist + song title
-if ! python3 "$YTPICKER" "$artist" "$title"; then
-  echo "[ERROR] Failed to download audio for \"$title\". Aborting."
-  exit 1
-fi
-
-# try to resolve audio file name
-audio_file="$SONGS_DIR/auto_${slug}.mp3"
-if [[ ! -f "$audio_file" ]]; then
-  # maybe picker wrote auto-shakira-soltera.mp3
-  alt1="$SONGS_DIR/auto-${slug}.mp3"
-  if [[ -f "$alt1" ]]; then
-    audio_file="$alt1"
-  else
-    # last resort: newest audio-like file in songs/
-    newest="$(ls -t "$SONGS_DIR"/*.{mp3,m4a,opus,webm,mp4} 2>/dev/null | head -n1 || true)"
-    if [[ -n "$newest" && -f "$newest" ]]; then
-      audio_file="$newest"
-    else
-      echo "[ERROR] Audio download step completed but no audio file was found in $SONGS_DIR"
-      exit 1
-    fi
+NEED_FALLBACK=0
+if [ $YT_RC -ne 0 ]; then
+  NEED_FALLBACK=1
+elif ! [ -f "$AUDIO_OUT" ]; then
+  NEED_FALLBACK=1
+else
+  # some versions print "No results found" but still exit 0
+  if grep -qi "No results found" "$YT_ERR_LOG"; then
+    NEED_FALLBACK=1
   fi
 fi
-echo "[OK] Audio saved to $audio_file"
 
-echo ">>> Aligning lyrics with audio (Whisper model)..."
-timings_file="$AUTO_LYRICS_DIR/${slug}.csv"
-align_script="$SCRIPTS_DIR/align_to_csv.py"
-if [[ ! -f "$align_script" ]]; then
-  echo "[ERROR] $align_script not found."
-  exit 1
+if [ $NEED_FALLBACK -eq 1 ]; then
+  echo "[WARN] flag-style YouTube download failed or no results. Retrying with single search query..."
+  SEARCH_QUERY="${ARTIST} ${TITLE}"
+  python3 "$YT_PICKER" "$SEARCH_QUERY" "$AUDIO_OUT"
 fi
 
-align_models=( "large-v3" "medium" "small" "tiny" )
-align_success=false
-for model in "${align_models[@]}"; do
-  echo " - Trying model: $model"
-  if python3 "$align_script" --audio "$audio_file" --lyrics "$lyrics_file" --out "$timings_file" --model "$model"; then
-    align_success=true
-    break
-  else
-    echo "   [WARN] $model failed, trying next..."
-  fi
-done
-
-if ! $align_success; then
-  echo "[ERROR] All alignment models failed."
+if [ ! -f "$AUDIO_OUT" ]; then
+  echo "[ERROR] Failed to download audio for \"$TITLE\". Aborting."
   exit 1
 fi
-echo "[OK] Alignment CSV: $timings_file"
+echo "[OK] Audio saved to $AUDIO_OUT"
 
+# ---------------------------------------------------------------------
+# 3) align lyrics -> CSV
+# ---------------------------------------------------------------------
+echo ">>> Aligning lyrics to audio..."
+python3 "$ALIGNER" \
+  --audio "$AUDIO_OUT" \
+  --lyrics "$LYRICS_OUT" \
+  --out "$CSV_OUT" \
+  --model large-v3
+echo "[OK] CSV with timings saved to $CSV_OUT"
+
+# ---------------------------------------------------------------------
+# 4) render (baked-in good settings)
+# ---------------------------------------------------------------------
 echo ">>> Rendering karaoke video..."
-render_script="$SCRIPTS_DIR/render_from_csv.py"
-if [[ ! -f "$render_script" ]]; then
-  echo "[ERROR] $render_script not found."
-  exit 1
-fi
-
-python3 "$render_script" \
-  --csv "$timings_file" \
-  --audio "$audio_file" \
-  --font-size 140 \
-  --offset-video -1.0 \
-  --append-end-duration 0.0 \
+python3 "$RENDERER" \
+  --csv "$CSV_OUT" \
+  --audio "$AUDIO_OUT" \
+  --font-size 50 \
   --repo-root "$REPO_ROOT" \
-  --no-open
+  --offset-video -1.0 \
+  "$@"
 
-echo "[DONE] Video should now be in: $OUTPUT_DIR"
+echo "[DONE] Karaoke video for $ARTIST – \"$TITLE\" is in ./output/"
 # end of new_song_with_automated_timings.sh
