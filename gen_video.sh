@@ -185,12 +185,16 @@ info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
   info "[INFO] Lyrics already exist at $LYRICS_PATH — skipping fetch."
 else
-  if [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
+  if [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
+    info ">>> Fetching lyrics (smart) for \"${TITLE}\" by ${ARTIST}..."
+    python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
+    ok "[OK] Lyrics saved to $LYRICS_PATH"
+  elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
     info ">>> Fetching lyrics for \"${TITLE}\" by ${ARTIST}..."
     python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
     ok "[OK] Lyrics saved to $LYRICS_PATH"
   else
-    err "[ERROR] scripts/lyrics_fetcher.py not found."
+    err "[ERROR] no lyrics fetcher found."
     exit 1
   fi
 fi
