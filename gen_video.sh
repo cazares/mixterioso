@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # gen_video.sh — pipeline: lyrics → audio → align → demucs → render (multi-variant)
 # now with:
-#  - intro screen (render_from_csv.py)
-#  - gap filler symbols (render_from_csv.py)
+#  - intro screen
+#  - gap filler symbols
 #  - gap-threshold + gap-delay pass-through
 #  - REAL per-vocal-pct audio from demucs stems (when available)
-#  - ✅ REUSE EXISTING STEMS (but only if matching mono exists)
+#  - ✅ REUSE EXISTING STEMS
 #  - ✅ PRE-NUKE output/<name>.mp4 if it's a dir/file
 #  - ✅ optional --car-font-size passthrough
-#  - ✅ accent-friendly slugify (for filenames)
-#  - ✅ YouTube: call picker with POSITIONAL QUERY
-#  - ✅ --force-audio to re-download
-#  - ✅ NEW: --preview-seconds N + --preview-interactive even when audio already exists
+#  - ✅ accent-friendly slugify
+#  - ✅ YouTube: PASS POSITIONAL QUERY (no --artist/--title)
+#  - ✅ --force-audio, --force-align
+#  - ✅ --preview-seconds, --preview-interactive (forwarded to youtube_audio_picker.py)
 
 set -euo pipefail
 
@@ -51,7 +51,8 @@ slugify() {
   printf '%s\n' "$s"
 }
 
-deaccent_only() {
+# deaccent but KEEP SPACES (for YouTube queries)
+deaccent_keep_spaces() {
   local s="$1"
   s=$(printf '%s' "$s" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')
   printf '%s\n' "$s"
@@ -85,49 +86,12 @@ find_existing_stems_dir() {
   if [ -d "$stems_export_dir/htdemucs/$audio_base" ]; then
     echo "$stems_export_dir/htdemucs/$audio_base"; return
   fi
-  if [ -d "$stems_export_dir/htdemucs/$audio_base" ]; then
-    echo "$stems_export_dir/htdemucs/$audio_base"; return
-  fi
   echo ""
-}
-
-preview_audio() {
-  local src="$1"
-  local secs="$2"
-  if [ ! -f "$src" ]; then
-    warn "[PREVIEW] audio does not exist yet, skipping preview."
-    return 0
-  fi
-  if [ "$secs" = "0" ]; then
-    return 0
-  fi
-  local tmp="/tmp/karaoke-preview-$$.wav"
-  ffmpeg -y -i "$src" -t "$secs" -ac 2 -ar 44100 -vn "$tmp" >/dev/null 2>&1 || {
-    warn "[PREVIEW] ffmpeg failed to make preview."
-    return 0
-  }
-  if command -v afplay >/dev/null 2>&1; then
-    info "[PREVIEW] playing first ${secs}s (Ctrl+C to stop)…"
-    afplay "$tmp" || true
-  else
-    info "[PREVIEW] opening first ${secs}s in default player…"
-    open "$tmp" >/dev/null 2>&1 || true
-  fi
-}
-
-ask_confirm_audio() {
-  local ans
-  read -r -p "Is this the correct audio? [y/N]: " ans
-  ans=${ans:-n}
-  case "$ans" in
-    y|Y|yes|YES) return 0;;
-    *) return 1;;
-  esac
 }
 
 # --- args -----------------------------------------------------------------
 if [ $# -lt 2 ]; then
-  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--car-font-size N] [--max-chars N] [--offset-video SEC] [--extra-delay SEC] [--hpad-pct N] [--valign ...] [--vocal-pcts \"0 20 100\"] [--gap-threshold 5.0] [--gap-delay 2.0] [--force-audio] [--preview-seconds N] [--preview-interactive]"
+  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--car-font-size N] [--max-chars N] [--offset-video SEC] [--extra-delay SEC] [--hpad-pct N] [--valign ...] [--vocal-pcts \"0 20 100\"] [--gap-threshold 5.0] [--gap-delay 2.0] [--force-audio] [--force-align] [--preview-seconds N] [--preview-interactive]"
   exit 1
 fi
 
@@ -143,9 +107,6 @@ HPAD_PCT=6
 VALIGN=middle
 GAP_THRESHOLD=5.0
 GAP_DELAY=2.0
-FORCE_AUDIO=0
-PREVIEW_SECONDS=0
-PREVIEW_INTERACTIVE=0
 
 HAS_VOCAL_PCTS=0
 VOCAL_PCTS_STR=""
@@ -156,17 +117,22 @@ SEL_DRUMS=0;   DRUMS_LEVEL=100
 SEL_BASS=0;    BASS_LEVEL=100
 SEL_GUITAR=0;  GUITAR_LEVEL=100
 
+FORCE_AUDIO=0
+FORCE_ALIGN=0
+PREVIEW_SECONDS=0
+PREVIEW_INTERACTIVE=0
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --font-size)        FONT_SIZE="$2"; shift 2;;
-    --car-font-size)    CAR_FONT_SIZE="$2"; shift 2;;
-    --max-chars)        MAX_CHARS="$2"; shift 2;;
-    --offset-video)     OFFSET_VIDEO="$2"; shift 2;;
-    --extra-delay)      EXTRA_DELAY="$2"; shift 2;;
-    --hpad-pct)         HPAD_PCT="$2"; shift 2;;
-    --valign)           VALIGN="$2"; shift 2;;
-    --gap-threshold)    GAP_THRESHOLD="$2"; shift 2;;
-    --gap-delay)        GAP_DELAY="$2"; shift 2;;
+    --font-size)     FONT_SIZE="$2"; shift 2;;
+    --car-font-size) CAR_FONT_SIZE="$2"; shift 2;;
+    --max-chars)     MAX_CHARS="$2"; shift 2;;
+    --offset-video)  OFFSET_VIDEO="$2"; shift 2;;
+    --extra-delay)   EXTRA_DELAY="$2"; shift 2;;
+    --hpad-pct)      HPAD_PCT="$2"; shift 2;;
+    --valign)        VALIGN="$2"; shift 2;;
+    --gap-threshold) GAP_THRESHOLD="$2"; shift 2;;
+    --gap-delay)     GAP_DELAY="$2"; shift 2;;
     --vocal-pcts)
       HAS_VOCAL_PCTS=1
       VOCAL_PCTS_STR="$2"
@@ -185,6 +151,8 @@ while [ $# -gt 0 ]; do
       if [ $# -gt 1 ] && is_pct "$2"; then GUITAR_LEVEL="$2"; shift 2; else shift 1; fi;;
     --force-audio)
       FORCE_AUDIO=1; shift 1;;
+    --force-align)
+      FORCE_ALIGN=1; shift 1;;
     --preview-seconds)
       PREVIEW_SECONDS="$2"; shift 2;;
     --preview-interactive)
@@ -214,7 +182,7 @@ mkdir -p "$STEMS_EXPORT_DIR"
 info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 
 # 1) lyrics ---------------------------------------------------------------
-if [ -f "$LYRICS_PATH" ]; then
+if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
   info "[INFO] Lyrics already exist at $LYRICS_PATH — skipping fetch."
 else
   if [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
@@ -228,77 +196,52 @@ else
 fi
 
 # 2) audio from YouTube ----------------------------------------------------
-NEED_AUDIO=0
-if [ $FORCE_AUDIO -eq 1 ]; then
-  NEED_AUDIO=1
-elif [ ! -s "$AUDIO_PATH" ]; then
-  NEED_AUDIO=1
+NEED_AUDIO=1
+if [ -f "$AUDIO_PATH" ] && [ $FORCE_AUDIO -eq 0 ]; then
+  info "[INFO] Audio already exists at $AUDIO_PATH — skipping YouTube download."
+  NEED_AUDIO=0
 fi
 
 if [ $NEED_AUDIO -eq 1 ]; then
   if [ -f "$SCRIPTS_DIR/youtube_audio_picker.py" ]; then
     info ">>> Downloading audio from YouTube (yt-dlp)..."
-    if (cd "$ROOT" && python3 "$SCRIPTS_DIR/youtube_audio_picker.py" "$ARTIST" "$TITLE"); then
-      :
-    else
-      PLAIN_ARTIST="$(deaccent_only "$ARTIST")"
-      PLAIN_TITLE="$(deaccent_only "$TITLE")"
-      warn "[WARN] YouTube search with accents failed, retrying without accents…"
-      if (cd "$ROOT" && python3 "$SCRIPTS_DIR/youtube_audio_picker.py" "$PLAIN_ARTIST" "$PLAIN_TITLE"); then
-        :
-      else
-        err "[ERROR] Could not download audio from YouTube for: $PLAIN_ARTIST $PLAIN_TITLE"
-        err "      Try: python3 scripts/youtube_audio_picker.py \"$PLAIN_ARTIST\" \"$PLAIN_TITLE\""
-        exit 1
-      fi
-    fi
-
-    FOUND_FILE=""
-    for ext in mp3 m4a webm opus mp4 wav; do
-      cand="$SONGS_DIR/auto_${ARTIST_SLUG}-${TITLE_SLUG}.$ext"
-      if [ -f "$cand" ]; then
-        FOUND_FILE="$cand"
-        break
-      fi
-    done
-    if [ -n "$FOUND_FILE" ]; then
-      if [ "${FOUND_FILE##*.}" != "mp3" ]; then
-        info "[INFO] Converting downloaded audio to mp3 → $AUDIO_PATH"
-        ffmpeg -y -i "$FOUND_FILE" -ac 2 -ar 48000 -b:a 192k "$AUDIO_PATH" >/dev/null 2>&1
-      else
-        if [ "$FOUND_FILE" != "$AUDIO_PATH" ]; then
-          mv -f "$FOUND_FILE" "$AUDIO_PATH"
-        fi
-      fi
+    # try accents first
+    if python3 "$SCRIPTS_DIR/youtube_audio_picker.py" \
+        --query "$ARTIST $TITLE" \
+        --out "$AUDIO_PATH" \
+        ${PREVIEW_SECONDS:+--preview-seconds "$PREVIEW_SECONDS"} \
+        $([ $PREVIEW_INTERACTIVE -eq 1 ] && echo --preview-interactive); then
       ok "[OK] Audio saved to $AUDIO_PATH"
     else
-      err "[ERROR] Downloader ran but we couldn't find auto_${ARTIST_SLUG}-${TITLE_SLUG}.<ext> in songs/"
-      exit 1
+      warn "[WARN] YouTube search with accents failed, retrying without accents…"
+      PLAIN_Q="$(deaccent_keep_spaces "$ARTIST $TITLE")"
+      if python3 "$SCRIPTS_DIR/youtube_audio_picker.py" \
+          --query "$PLAIN_Q" \
+          --out "$AUDIO_PATH" \
+          ${PREVIEW_SECONDS:+--preview-seconds "$PREVIEW_SECONDS"} \
+          $([ $PREVIEW_INTERACTIVE -eq 1 ] && echo --preview-interactive); then
+        ok "[OK] Audio saved to $AUDIO_PATH"
+      else
+        err "[ERROR] Could not download audio from YouTube for: $PLAIN_Q"
+        err "      Try: python3 scripts/youtube_audio_picker.py --query \"$PLAIN_Q\" --out \"$AUDIO_PATH\""
+        exit 1
+      fi
     fi
   else
     err "[ERROR] scripts/youtube_audio_picker.py not found."
     exit 1
   fi
-else
-  info "[INFO] Audio already exists at $AUDIO_PATH — skipping YouTube download."
-fi
-
-# ✅ preview even if audio already existed
-if [ $PREVIEW_SECONDS -gt 0 ] || [ $PREVIEW_INTERACTIVE -eq 1 ]; then
-  preview_audio "$AUDIO_PATH" "$PREVIEW_SECONDS"
-  if [ $PREVIEW_INTERACTIVE -eq 1 ]; then
-    if ! ask_confirm_audio; then
-      err "[ERROR] User said this is NOT the right audio. Re-run with --force-audio and pick another video."
-      exit 1
-    else
-      ok "[OK] Audio confirmed by user."
-    fi
-  fi
 fi
 
 # 2b) TRUE MONO ------------------------------------------------------------
-if [ -f "$AUDIO_MONO_PATH" ] && [ -s "$AUDIO_MONO_PATH" ]; then
-  info "[INFO] Mono audio already exists at $AUDIO_MONO_PATH — reusing."
+if [ -f "$AUDIO_MONO_PATH" ]; then
+  if [ $FORCE_AUDIO -eq 1 ] || [ "$AUDIO_PATH" -nt "$AUDIO_MONO_PATH" ]; then
+    info ">>> Source MP3 is newer (or --force-audio) — re-converting to TRUE MONO..."
+    ffmpeg -y -i "$AUDIO_PATH" -ac 1 -ar 48000 -b:a 192k "$AUDIO_MONO_PATH" >/dev/null 2>&1
+    ok "[OK] Mono audio at $AUDIO_MONO_PATH"
+  else
+    info "[INFO] Mono audio already exists at $AUDIO_MONO_PATH — reusing."
+  fi
 else
   info ">>> Converting to TRUE MONO (L+R avg) @ 48kHz..."
   ffmpeg -y -i "$AUDIO_PATH" -ac 1 -ar 48000 -b:a 192k "$AUDIO_MONO_PATH" >/dev/null 2>&1
@@ -306,7 +249,7 @@ else
 fi
 
 # 3) align -----------------------------------------------------------------
-if [ -f "$CSV_PATH" ]; then
+if [ -f "$CSV_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
   info "[INFO] CSV already exists at $CSV_PATH — skipping alignment."
 else
   if [ -f "$SCRIPTS_DIR/align_to_csv.py" ]; then
@@ -331,13 +274,8 @@ AUDIO_BASENAME="$(basename "$AUDIO_MONO_PATH")"
 AUDIO_BASE_NOEXT="${AUDIO_BASENAME%.*}"
 
 if [ -n "$DEMUCS_BIN" ]; then
-  if [ -s "$AUDIO_MONO_PATH" ]; then
-    EXISTING_DIR="$(find_existing_stems_dir "$STEMS_EXPORT_DIR" "$AUDIO_BASE_NOEXT")"
-  else
-    EXISTING_DIR=""
-  fi
-
-  if [ -n "$EXISTING_DIR" ]; then
+  EXISTING_DIR="$(find_existing_stems_dir "$STEMS_EXPORT_DIR" "$AUDIO_BASE_NOEXT")"
+  if [ -n "$EXISTING_DIR" ] && [ $FORCE_AUDIO -eq 0 ]; then
     ok "[REUSE] Found existing Demucs stems at $EXISTING_DIR — skipping separation."
     BEST_STEMS_DIR="$EXISTING_DIR"
   else
@@ -397,6 +335,7 @@ p = float("$pct")
 print(p/100.0)
 EOF
 )"
+
     for stem in vocals.wav vocal.wav; do
       if [ -f "$BEST_STEMS_DIR/$stem" ]; then
         inputs+=("-i" "$BEST_STEMS_DIR/$stem")
@@ -440,6 +379,7 @@ EOF
     warn "[WARN] No demucs stems — ${pct}% will sound same as others."
   fi
 
+  # PRE-NUKE bad existing output (file OR directory)
   FINAL_MP4="$OUTPUT_DIR/${OUT_NAME}.mp4"
   if [ -d "$FINAL_MP4" ]; then
     warn "[CLEANUP] $FINAL_MP4 was a directory — removing it so we can write the mp4."
@@ -478,5 +418,4 @@ ok "[DONE] Karaoke video(s) for ${ARTIST} – \"${TITLE}\" are in $OUTPUT_DIR/"
 if command -v open >/dev/null 2>&1; then
   open "$OUTPUT_DIR" >/dev/null 2>&1 || true
 fi
-
 # end of gen_video.sh
