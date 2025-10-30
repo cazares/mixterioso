@@ -8,6 +8,10 @@ Wrapper that reuses the existing Karaoke Time pipeline to render MP4s from a tim
 - Supports multiple vocal percentages in one run (e.g., --vocal-pcts 0 35 100).
 - If --lyrics is omitted, derives a temporary lyrics .txt from the CSV's "line" column.
 - Assumes macOS by default but works cross-platform if deps exist.
+
+THIS VERSION:
+- Adds --extra-delay so you can fix “lyrics appear 1s early” without editing the CSV.
+- We forward --extra-delay directly to scripts/car_karaoke_time.py.
 """
 
 import argparse
@@ -20,19 +24,23 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional
 
+
 def run(cmd: List[str], cwd: Optional[Path] = None) -> int:
     print("\n▶", " ".join(shlex.quote(c) for c in cmd))
     return subprocess.call(cmd, cwd=str(cwd) if cwd else None)
 
+
 def die(msg: str, code: int = 2) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(code)
+
 
 def ok(p: Path) -> bool:
     try:
         return p.exists()
     except Exception:
         return False
+
 
 def validate_csv_has_line_start(csv_path: Path) -> None:
     with csv_path.open("r", encoding="utf-8") as f:
@@ -50,6 +58,7 @@ def validate_csv_has_line_start(csv_path: Path) -> None:
             return
     die("CSV had no usable rows with numeric 'start'.")
 
+
 def derive_temp_lyrics_from_csv(csv_path: Path, tmpdir: Path) -> Path:
     out = tmpdir / f"{csv_path.stem}_auto_lyrics.txt"
     lines: List[str] = []
@@ -59,9 +68,10 @@ def derive_temp_lyrics_from_csv(csv_path: Path, tmpdir: Path) -> Path:
             line = (row.get("line") or "").rstrip()
             if line:
                 lines.append(line)
-    # One screen per CSV row: newline between screens
+    # One screen per CSV row
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
+
 
 def find_car_karaoke(repo_root: Path) -> Path:
     # Prefer scripts/car_karaoke_time.py
@@ -74,6 +84,7 @@ def find_car_karaoke(repo_root: Path) -> Path:
         return local
     die("scripts/car_karaoke_time.py not found. Set --repo-root to your repo top or place it next to this file.")
 
+
 def build_cmd(
     py: str,
     car_script: Path,
@@ -84,6 +95,7 @@ def build_cmd(
     font_size: int,
     offset_video: float,
     append_end: float,
+    extra_delay: float,
     high_quality: bool,
     remove_cache: bool,
     extra: List[str],
@@ -93,14 +105,23 @@ def build_cmd(
         cmd += ["--audio", str(audio)]
     if vocal_pcts:
         cmd += ["--vocal-pcts"] + [str(x) for x in vocal_pcts]
-    cmd += ["--font-size", str(font_size), "--offset-video", str(offset_video), "--append-end-duration", str(append_end)]
+    # 👇 this is the core set we always forwarded
+    cmd += [
+        "--font-size", str(font_size),
+        "--offset-video", str(offset_video),
+        "--append-end-duration", str(append_end),
+    ]
+    # 👇 NEW: forward extra-delay too
+    cmd += ["--extra-delay", str(extra_delay)]
     if high_quality:
         cmd.append("--high-quality")
     if remove_cache:
         cmd.append("--remove-cache")
     if extra:
+        # still allow pass-through for weird flags
         cmd += extra
     return cmd
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Render MP4(s) from timing CSV using Karaoke Time pipeline.")
@@ -111,12 +132,14 @@ def main() -> None:
     ap.add_argument("--font-size", type=int, default=140)
     ap.add_argument("--offset-video", type=float, default=-1.0)
     ap.add_argument("--append-end-duration", type=float, default=0.0)
+    ap.add_argument("--extra-delay", type=float, default=0.0, help="Additional delay (sec) for subtitles on top of --offset-video")
     ap.add_argument("--repo-root", default=".", help="Repo root that contains scripts/car_karaoke_time.py")
     ap.add_argument("--high-quality", action="store_true", help="Use 6-stem Demucs model for higher quality mixes")
     ap.add_argument("--remove-cache", action="store_true", help="Clear cached frames and outputs before rendering")
     ap.add_argument("--open", dest="open_dir", action="store_true", help="Open output directory when done")
     ap.add_argument("--no-open", dest="open_dir", action="store_false")
     ap.set_defaults(open_dir=True)
+    # leftover args → pass-through
     ap.add_argument("extra", nargs=argparse.REMAINDER, help="Additional flags passed through to car_karaoke_time.py")
     args = ap.parse_args()
 
@@ -127,7 +150,6 @@ def main() -> None:
 
     # Prepare lyrics
     tmpdir_path = Path(tempfile.mkdtemp(prefix="csv2mp4_"))
-    lyrics_txt: Path
     if args.lyrics:
         lyrics_txt = Path(args.lyrics).resolve()
         if not ok(lyrics_txt):
@@ -144,7 +166,6 @@ def main() -> None:
     # Locate car_karaoke_time.py
     car_script = find_car_karaoke(Path(args.repo_root).resolve())
 
-    # Build and run
     py_exec = sys.executable
     cmd = build_cmd(
         py=py_exec,
@@ -156,27 +177,29 @@ def main() -> None:
         font_size=args.font_size,
         offset_video=args.offset_video,
         append_end=args.append_end_duration,
+        extra_delay=args.extra_delay,          # 👈 forward it
         high_quality=args.high_quality,
         remove_cache=args.remove_cache,
         extra=args.extra,
     )
+
     rc = run(cmd)
     if rc != 0:
         die(f"car_karaoke_time.py exited with code {rc}", rc)
 
-    # Try to open the output directory if the downstream script prints it. Fallback: open repo root.
     if args.open_dir:
         try:
+            output_dir = (Path(args.repo_root) / "output").resolve()
             if sys.platform == "darwin":
-                subprocess.call(["open", str((Path(args.repo_root) / "output").resolve())])
+                subprocess.call(["open", str(output_dir)])
             elif sys.platform.startswith("win"):
-                subprocess.call(["explorer", str((Path(args.repo_root) / "output").resolve())])
+                subprocess.call(["explorer", str(output_dir)])
             else:
-                subprocess.call(["xdg-open", str((Path(args.repo_root) / "output").resolve())])
+                subprocess.call(["xdg-open", str(output_dir)])
         except Exception:
             pass
 
+
 if __name__ == "__main__":
     main()
-
 # end of scripts/render_from_csv.py
