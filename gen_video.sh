@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # gen_video.sh — pipeline: lyrics → audio → align → demucs → render (multi-variant)
-# now with:
+# generic version
 #  - prefer scripts/auto_lyrics_fetcher.py
-#  - VALIDATE existing lyrics; refetch if polluted or mismatched title/artist
+#  - VALIDATE existing lyrics generically (no artist/song-specific strings)
 #  - if we refetch lyrics, nuke CSV so align re-runs
 
 set -euo pipefail
@@ -67,6 +67,7 @@ find_demucs_bin() {
   echo ""
 }
 
+# detect existing stems for this song and reuse
 find_existing_stems_dir() {
   local stems_export_dir="$1"
   local audio_base="$2"
@@ -168,31 +169,47 @@ mkdir -p "$STEMS_EXPORT_DIR"
 info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 
 # ---------------------------------------------------------------------------
-# 1) LYRICS (with validation)
+# 1) LYRICS (generic validation, no song-specific strings)
 # ---------------------------------------------------------------------------
 need_fetch=1
+
+looks_like_lyrics() {
+  local path="$1"
+  # must have at least a few lines
+  local line_count
+  line_count=$(wc -l < "$path" | tr -d ' ')
+  if [ "$line_count" -lt 3 ]; then
+    return 1
+  fi
+  # must not be huge
+  local size_bytes
+  size_bytes=$(stat -f%z "$path" 2>/dev/null || stat -c%s "$path")
+  if [ "$size_bytes" -gt 65535 ]; then
+    return 1
+  fi
+  # too many very long lines → looks like prose
+  local long_lines
+  long_lines=$(awk 'length>170{c++} END{print c+0}' "$path")
+  if [ "$line_count" -gt 0 ]; then
+    local pct=$(( long_lines * 100 / line_count ))
+    if [ "$pct" -gt 40 ]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
 if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
-  # validate existing lyrics file
   first_line="$(head -n1 "$LYRICS_PATH" | tr -d '\r')"
   expected="${TITLE}//by//${ARTIST}"
-  plain_first="$(echo "$first_line" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
-  plain_expected="$(echo "$expected"   | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
+  plain_first="$(echo "$first_line"   | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
+  plain_expected="$(echo "$expected" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
 
-  if [ "$plain_first" = "$plain_expected" ]; then
-    # also check for bad/prose contamination
-    if grep -qi "valverde de lucerna" "$LYRICS_PATH" || \
-       grep -qi "ángela carballino" "$LYRICS_PATH" || \
-       grep -qi "don manuel bueno" "$LYRICS_PATH"; then
-      warn "[WARN] Existing lyrics look contaminated (novel/prose) — will refetch."
-      need_fetch=1
-    else
-      info "[INFO] Lyrics look good — reusing $LYRICS_PATH"
-      need_fetch=0
-    fi
+  if [ "$plain_first" = "$plain_expected" ] && looks_like_lyrics "$LYRICS_PATH"; then
+    info "[INFO] Lyrics look good — reusing $LYRICS_PATH"
+    need_fetch=0
   else
-    warn "[WARN] Existing lyrics header mismatch:"
-    warn "       got:      '$first_line'"
-    warn "       expected: '$expected'"
+    warn "[WARN] Existing lyrics failed generic checks — will refetch."
     need_fetch=1
   fi
 fi
@@ -202,7 +219,7 @@ if [ $need_fetch -eq 1 ]; then
     info ">>> Fetching lyrics (auto_lyrics_fetcher, accent-aware) for \"${TITLE}\" by ${ARTIST}..."
     if python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" --artist "$ARTIST" --title "$TITLE" --merge-strategy merge --no-prompt > "$LYRICS_PATH"; then
       ok "[OK] Lyrics saved to $LYRICS_PATH (auto_lyrics_fetcher.py)"
-      # because we fixed lyrics, drop old CSV so align re-runs:
+      # lyrics changed → force re-align
       rm -f "$CSV_PATH"
     else
       warn "[WARN] auto_lyrics_fetcher.py failed — falling back to legacy lyrics fetcher."
@@ -219,24 +236,24 @@ if [ $need_fetch -eq 1 ]; then
         exit 1
       fi
     fi
-  elif [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
-    info ">>> Fetching lyrics (smart) for \"${TITLE}\" by ${ARTIST}..."
-    python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
-    ok "[OK] Lyrics saved to $LYRICS_PATH"
-    rm -f "$CSV_PATH"
-  elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
-    info ">>> Fetching lyrics for \"${TITLE}\" by ${ARTIST}..."
-    python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
-    ok "[OK] Lyrics saved to $LYRICS_PATH"
-    rm -f "$CSV_PATH"
   else
-    err "[ERROR] no lyrics fetcher found."
-    exit 1
+    if [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
+      python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
+      ok "[OK] Lyrics saved to $LYRICS_PATH"
+      rm -f "$CSV_PATH"
+    elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
+      python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
+      ok "[OK] Lyrics saved to $LYRICS_PATH"
+      rm -f "$CSV_PATH"
+    else
+      err "[ERROR] no lyrics fetcher found."
+      exit 1
+    fi
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# 2) AUDIO (YouTube) — unchanged
+# 2) AUDIO (YouTube) — generic, accent-aware
 # ---------------------------------------------------------------------------
 NEED_AUDIO=1
 if [ -f "$AUDIO_PATH" ] && [ $FORCE_AUDIO -eq 0 ]; then
@@ -247,7 +264,6 @@ fi
 if [ $NEED_AUDIO -eq 1 ]; then
   if [ -f "$SCRIPTS_DIR/youtube_audio_picker.py" ]; then
     info ">>> Downloading audio from YouTube (yt-dlp)..."
-    # try accents first
     if python3 "$SCRIPTS_DIR/youtube_audio_picker.py" \
         --query "$ARTIST $TITLE" \
         --out "$AUDIO_PATH" \
@@ -265,7 +281,6 @@ if [ $NEED_AUDIO -eq 1 ]; then
         ok "[OK] Audio saved to $AUDIO_PATH"
       else
         err "[ERROR] Could not download audio from YouTube for: $PLAIN_Q"
-        err "      Try: python3 scripts/youtube_audio_picker.py --query \"$PLAIN_Q\" --out \"$AUDIO_PATH\""
         exit 1
       fi
     fi
