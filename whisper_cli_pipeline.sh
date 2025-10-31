@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # whisper_cli_pipeline.sh
 set -euo pipefail
+set -x
 
 # --- Config ---
 TITLE="Me Dice Que Me Ama"
@@ -19,7 +20,7 @@ if [[ "$ENABLE_DEMUCS" == "1" ]]; then need demucs; fi
 mkdir -p lyrics whisper_out whisper_out_vocals
 
 # --- 1) Fetch lyrics (plain) via LRCLIB ---
-curl -s "https://lrclib.net/api/search?track_name=$(python3 - <<'PY'
+curl "https://lrclib.net/api/search?track_name=$(python3 - <<'PY'
 import urllib.parse; print(urllib.parse.quote("Me Dice Que Me Ama"))
 PY
 )&artist_name=$(python3 - <<'PY'
@@ -30,7 +31,7 @@ PY
 | sed 's/\r$//' > "lyrics/${BASE}.txt"
 
 # --- 2) Fetch lyrics (synced LRC) via LRCLIB ---
-curl -s "https://lrclib.net/api/search?track_name=$(python3 - <<'PY'
+curl "https://lrclib.net/api/search?track_name=$(python3 - <<'PY'
 import urllib.parse; print(urllib.parse.quote("Me Dice Que Me Ama"))
 PY
 )&artist_name=$(python3 - <<'PY'
