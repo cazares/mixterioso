@@ -3,11 +3,13 @@
 """
 auto_lyrics_fetcher.py
 
-Priority order (NEW):
-1. Musixmatch (paid) – lyrics
-2. Musixmatch – subtitles (LRC) if available
-3. Musixmatch – richsync (word-level) if available (may be premium; we just try)
-4. Everything else (Genius, Vagalume public, etc.)
+Ultra-fallback lyrics fetcher for English + Mexican/Latin Spanish.
+
+NEW priority (because you’re paying for it 💸):
+1. Musixmatch (lyrics)  ← highest priority
+2. Musixmatch (subtitles LRC)  ← for karaoke timings, if your plan returns them
+3. Musixmatch (richsync)  ← word/segment timings, if available
+4. Everything else (Genius, Vagalume public, AudD, KSoft, lyrics.ovh, ChartLyrics, letras.com, lyrics.com, musica.com, YouTube transcript)
 
 Output (strict):
 
@@ -16,11 +18,11 @@ Output (strict):
     <clean, merged, normalized lyrics...>
 
 Also:
-- shows ALL source outputs in a 2-column table
-- expands "coro x2" / "chorus x2" as a WHOLE last coro/chorus section
-- capitalizes every non-empty line
-- normalizes Spanish slang ("q" -> "que", "xq" -> "porque", etc.)
-- prints Musixmatch metadata (lyrics_language, lyrics_id, copyright, tracking URLs)
+- prints ALL source outputs, labeled, in a 2-column table
+- expands “coro x2” / “chorus x2” as a WHOLE last coro/chorus section
+- normalizes/expands Spanish chat slang (“q” → “que”, “xq” → “porque”, “tec” → “etc”)
+- capitalizes the start of each line
+- won’t crash on Musixmatch subtitle list format
 """
 
 import os
@@ -42,9 +44,9 @@ C_MAG = "\033[95m"
 DOTENV_OK = False
 ENV_FILES_TRIED: List[str] = []
 
-# ------------------------------------------------------------
-# .env loading
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# .env LOADING
+# ---------------------------------------------------------------------------
 def _manual_load_env_file(path: Path) -> None:
     if not path.exists():
         return
@@ -55,7 +57,8 @@ def _manual_load_env_file(path: Path) -> None:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, val = line.split("=", 1)
-                key, val = key.strip(), val.strip()
+                key = key.strip()
+                val = val.strip()
                 if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
                     val = val[1:-1]
                 if val:
@@ -69,7 +72,6 @@ def _normalize_env_aliases() -> None:
         alt = os.getenv("GENIUS_TOKEN") or os.getenv("GENIUS_API_TOKEN")
         if alt:
             os.environ["GENIUS_ACCESS_TOKEN"] = alt
-
     if not os.getenv("YOUTUBE_API_KEY"):
         alt = os.getenv("GOOGLE_API_KEY") or os.getenv("YT_API_KEY")
         if alt:
@@ -82,6 +84,7 @@ def _load_envs() -> None:
     script_path = Path(__file__).resolve()
     script_dir = script_path.parent
     repo_root = script_dir.parent
+
     candidates = [
         cwd / ".env",
         cwd / ".env.local",
@@ -91,6 +94,7 @@ def _load_envs() -> None:
         repo_root / ".env.local",
         Path.home() / ".env",
     ]
+
     try:
         from dotenv import load_dotenv  # type: ignore
     except Exception:
@@ -110,16 +114,16 @@ def _load_envs() -> None:
 
 _load_envs()
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # deps
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
     import requests
 except ImportError:
     print("This script needs 'requests'. Install with: pip3 install requests", file=sys.stderr)
     sys.exit(1)
 
-USER_AGENT = "auto-lyrics-fetcher/2.0 (karaoke-time + musixmatch-first)"
+USER_AGENT = "auto-lyrics-fetcher/2.1 (karaoke-time + musixmatch-first)"
 DEFAULT_TIMEOUT = 12
 ENABLE_DEBUG = False
 ALLOW_PROMPTS = True
@@ -144,9 +148,9 @@ def http_get(url: str, params=None, headers=None, timeout=DEFAULT_TIMEOUT) -> Op
     return None
 
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # helpers
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def strip_html_tags(html: str) -> str:
     try:
         from bs4 import BeautifulSoup  # type: ignore
@@ -223,6 +227,7 @@ def clean_lyrics_junk(text: str) -> str:
         "You might also like", "About", "Genius Annotation", "More on Genius",
     ]
     skip_exact = {"", " ", "\u200b"}
+
     dropping = True
     for line in lines:
         stripped = line.strip()
@@ -236,6 +241,7 @@ def clean_lyrics_junk(text: str) -> str:
                 continue
             dropping = False
         cleaned.append(line)
+
     tail_drop_patterns = [
         r"^\d{1,4}Embed$",
         r"^See.*$",
@@ -244,12 +250,13 @@ def clean_lyrics_junk(text: str) -> str:
     ]
     while cleaned and any(re.match(p, cleaned[-1].strip()) for p in tail_drop_patterns):
         cleaned.pop()
+
     return "\n".join(cleaned).strip()
 
 
-# ------------------------------------------------------------
-# section-aware normalizer (includes CORO X2 whole-section repeat)
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# section-aware normalizer (with CORO X2)
+# ---------------------------------------------------------------------------
 def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
     if not text:
         return text
@@ -261,6 +268,7 @@ def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
     coro_x2_regex = re.compile(r"^(coro|chorus)\s*x\s*2\b[:.]?$", re.IGNORECASE)
 
     lines = text.splitlines()
+
     out_lines: List[str] = []
     current_section_name: Optional[str] = None
     current_section_lines: List[str] = []
@@ -347,9 +355,9 @@ def _capitalize_each_line(text: str) -> str:
     return "\n".join(out)
 
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # env status
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _mask_val(v: str) -> str:
     if not v:
         return ""
@@ -401,13 +409,9 @@ def get_api_key(name: str, env_var: str) -> str:
         return ""
 
 
-# ------------------------------------------------------------
-# MUSIXMATCH (highest priority now)
-# Docs: track.lyrics.get, track.subtitle.get, track.richsync.get, track.lyrics.translation.get
-#   lyrics_body, lyrics_language, lyrics_copyright, pixel_tracking_url, script_tracking_url
-#   subtitles -> LRC/DFXP -> good for karaoke
-#   richsync -> word-level timestamps (premium) :contentReference[oaicite:0]{index=0}
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# MUSIXMATCH (highest priority)
+# ---------------------------------------------------------------------------
 def _musixmatch_search_track(artist: str, title: str, key: str) -> Optional[int]:
     search_url = "https://api.musixmatch.com/ws/1.1/track.search"
     params = {
@@ -466,8 +470,12 @@ def fetch_from_musixmatch_lyrics(artist: str, title: str) -> Tuple[Optional[str]
 
 def fetch_from_musixmatch_subtitles(track_id: int, api_key: str) -> Optional[str]:
     """
-    LRC-like timestamps — PERFECT for karaoke. Musixmatch: track.subtitle.get
-    If you have the $30/mo plan you *should* get something here.
+    LRC-like timestamps — PERFECT for karaoke.
+    Musixmatch sometimes returns:
+      { "message": { "body": { "subtitle": {...} } } }
+    ...and sometimes:
+      { "message": { "body": [ { "subtitle": {...}}, ... ] } }
+    Handle both.
     """
     sub_url = "https://api.musixmatch.com/ws/1.1/track.subtitle.get"
     params = {
@@ -480,21 +488,36 @@ def fetch_from_musixmatch_subtitles(track_id: int, api_key: str) -> Optional[str
     resp = http_get(sub_url, params=params)
     if not resp:
         return None
-    data = resp.json()
-    sub = data.get("message", {}).get("body", {}).get("subtitle")
-    if not sub:
+
+    try:
+        data = resp.json()
+    except Exception:
         return None
-    # sometimes it's in subtitle_body
-    lrc = sub.get("subtitle_body")
-    if lrc:
-        return lrc.strip()
+
+    body = data.get("message", {}).get("body")
+    if not body:
+        return None
+
+    if isinstance(body, dict):
+        sub = body.get("subtitle")
+        if sub and isinstance(sub, dict):
+            lrc = sub.get("subtitle_body")
+            return lrc.strip() if lrc else None
+
+    if isinstance(body, list):
+        for item in body:
+            if not isinstance(item, dict):
+                continue
+            sub = item.get("subtitle")
+            if sub and isinstance(sub, dict):
+                lrc = sub.get("subtitle_body")
+                if lrc:
+                    return lrc.strip()
+
     return None
 
 
 def fetch_from_musixmatch_richsync(track_id: int, api_key: str) -> Optional[str]:
-    """
-    word-level timestamps, if allowed. Good to know even if 401.
-    """
     rich_url = "https://api.musixmatch.com/ws/1.1/track.richsync.get"
     params = {
         "track_id": track_id,
@@ -505,17 +528,19 @@ def fetch_from_musixmatch_richsync(track_id: int, api_key: str) -> Optional[str]
     resp = http_get(rich_url, params=params)
     if not resp:
         return None
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception:
+        return None
     sync = data.get("message", {}).get("body", {}).get("richsync")
     if not sync:
         return None
-    # it's JSON-ish; we just dump as string
     return str(sync)
 
 
-# ------------------------------------------------------------
-# other providers (unchanged order, but they run after Musixmatch)
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# other providers
+# ---------------------------------------------------------------------------
 def fetch_from_genius(artist: str, title: str) -> Optional[str]:
     token = os.getenv("GENIUS_ACCESS_TOKEN") or get_api_key("Genius API token", "GENIUS_ACCESS_TOKEN")
     if not token:
@@ -563,7 +588,6 @@ def fetch_from_genius(artist: str, title: str) -> Optional[str]:
 
 
 def fetch_from_vagalume(artist: str, title: str) -> Optional[str]:
-    # public-first (no key)
     base_url = "https://api.vagalume.com.br/v1/lyrics"
     artist_slug = requests.utils.requote_uri(artist.strip())
     title_slug = requests.utils.requote_uri(title.strip())
@@ -577,7 +601,6 @@ def fetch_from_vagalume(artist: str, title: str) -> Optional[str]:
                 return str(data["text"]).strip()
         except Exception:
             pass
-    # key-style
     key = os.getenv("VAGALUME_API_KEY")
     if key:
         url = "https://api.vagalume.com.br/search.php"
@@ -825,17 +848,28 @@ def fetch_from_youtube(artist: str, title: str) -> Optional[str]:
     return "\n".join(text_lines).strip() if text_lines else None
 
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # orchestrator + table
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def fetch_all_sources(artist: str, title: str) -> Dict[str, Optional[str]]:
-    # Musixmatch FIRST
     mm_lyrics, mm_meta = fetch_from_musixmatch_lyrics(artist, title)
     mm_subs = None
     mm_rich = None
-    if mm_meta.get("track_id") and os.getenv("MUSIXMATCH_API_KEY"):
-        mm_subs = fetch_from_musixmatch_subtitles(mm_meta["track_id"], os.getenv("MUSIXMATCH_API_KEY"))
-        mm_rich = fetch_from_musixmatch_richsync(mm_meta["track_id"], os.getenv("MUSIXMATCH_API_KEY"))
+    mm_key = os.getenv("MUSIXMATCH_API_KEY")
+
+    if mm_meta.get("track_id") and mm_key:
+        try:
+            mm_subs = fetch_from_musixmatch_subtitles(mm_meta["track_id"], mm_key)
+            if mm_subs:
+                print(f"{C_GREEN}[musixmatch] subtitles (LRC) found — good for karaoke timing{C_RESET}", file=sys.stderr)
+            else:
+                print(f"{C_YELLOW}[musixmatch] no subtitles/LRC returned for this track_id{C_RESET}", file=sys.stderr)
+        except Exception as e:
+            print(f"{C_RED}[musixmatch] subtitle fetch failed: {e}{C_RESET}", file=sys.stderr)
+        try:
+            mm_rich = fetch_from_musixmatch_richsync(mm_meta["track_id"], mm_key)
+        except Exception as e:
+            print(f"{C_RED}[musixmatch] richsync fetch failed: {e}{C_RESET}", file=sys.stderr)
 
     return {
         "Musixmatch (lyrics)": mm_lyrics,
@@ -854,7 +888,7 @@ def fetch_all_sources(artist: str, title: str) -> Dict[str, Optional[str]]:
     }
 
 
-def _preview(text: Optional[str], width: int = 58) -> str:
+def _preview(text: Optional[str], width: int = 56) -> str:
     if not text:
         return "(no data)"
     first_line = text.splitlines()[0].strip()
@@ -878,13 +912,11 @@ def print_sources_table(sources: Dict[str, Optional[str]]) -> None:
 
 
 def pick_best_in_order(sources: Dict[str, Optional[str]]) -> Optional[str]:
-    # Musixmatch already first in dict
     best = None
     best_score = 0
     for name, val in sources.items():
         if not val:
             continue
-        # Musixmatch wins immediately
         if name.startswith("Musixmatch (lyrics)"):
             return val
         score = len(re.sub(r"\s+", "", val))
@@ -920,9 +952,9 @@ def postprocess_lyrics(lyrics: str, title: str, artist: str, force_spanish: bool
     return lyrics.strip()
 
 
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # CLI
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
         description="Fetch lyrics with Musixmatch first (paid), plus all fallbacks, show sources, expand CORO X2, normalize Spanish slang."
@@ -950,9 +982,7 @@ def main():
     all_results = fetch_all_sources(artist, title)
     print_sources_table(all_results)
 
-    # build final candidate set (in dict order)
-    got_any = any(v for v in all_results.values())
-    if not got_any:
+    if not any(v for v in all_results.values()):
         print(f"{title}//by//{artist}\n")
         print(f"{C_RED}[!] No lyrics found from any source.{C_RESET}", file=sys.stderr)
         sys.exit(1)
