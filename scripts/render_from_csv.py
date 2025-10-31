@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 # render_from_csv.py
 # CSV (line,start[,end]) -> ASS -> ffmpeg -> MP4
-# simplified: intro = 0 -> first_lyric_start, no special hold logic
+# features:
+# - intro screen (title/artist) from t=0 until first lyric
+# - gap filler (♬♫♪♩) when gap >= --gap-threshold, but only after --gap-delay
+# - vertical alignment (top|middle|bottom)
+# - horizontal padding via --hpad-pct
+# - --offset-video AND --extra-delay both applied:
+#       final_start = start + extra_delay - offset_video
+# - hard wrap via --max-chars
+# - font override via --font-name (default ArialMT on macOS)
+#
+# NOTE (2025-10-31, per Miguel):
+# - during RENDER we should treat CSV as *start-times-only*
+# - we IGNORE the CSV-provided "end" (except earlier sanity scripts)
+# - the end time for a line = (next line's start after shifts), or +2.0s if last
 
 import argparse
 import csv
@@ -9,11 +22,7 @@ import os
 import random
 import subprocess
 import tempfile
-import unicodedata
-from typing import List, Dict, Any, Optional
-
-
-EPS = 0.05  # small safety so intro and first lyric never share a frame
+from typing import List, Dict, Any
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,15 +34,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--repo-root", required=True, help="Root of karaoke repo (for output/)")
     p.add_argument("--font-size", type=int, default=60, help="Main font size")
     p.add_argument("--car-font-size", type=int, default=None, help="Optional smaller font for gap line")
-    p.add_argument("--font-name", default="ArialMT", help="ASS font name to use")
-    p.add_argument("--offset-video", type=float, default=0.0, help="Shift subs vs audio (negative = delay)")
+    p.add_argument("--font-name", default="ArialMT", help="ASS font name to use (macOS: ArialMT is safer)")
+    p.add_argument("--offset-video", type=float, default=0.0, help="Shift subtitles vs audio (negative = delay)")
     p.add_argument("--extra-delay", type=float, default=0.0, help="Extra delay added to every line start")
     p.add_argument("--hpad-pct", type=float, default=6.0, help="Horizontal padding (percent per side)")
     p.add_argument("--valign", default="middle", choices=["top", "middle", "bottom"], help="Vertical alignment")
     p.add_argument("--output-name", default="output", help="Base name (no extension) for output mp4")
     p.add_argument("--max-chars", type=int, default=0, help="Hard wrap at this many chars (0 = no wrap)")
-    p.add_argument("--artist", default="", help="For intro screen / header filtering")
-    p.add_argument("--title", default="", help="For intro screen / header filtering")
+    p.add_argument("--artist", default="", help="For intro screen")
+    p.add_argument("--title", default="", help="For intro screen")
     p.add_argument("--gap-threshold", type=float, default=5.0, help="Seconds of silence to trigger filler")
     p.add_argument("--gap-delay", type=float, default=2.0, help="Seconds AFTER line end before filler shows")
     p.add_argument("--no-open", action="store_true", help="Do not open output dir on macOS")
@@ -52,33 +61,11 @@ def read_csv_rows(path: str) -> List[Dict[str, Any]]:
                 start = float(row["start"])
             except ValueError:
                 continue
+            # we still read "end" in case upstream wants it, but we IGNORE it for render
             end_raw = row.get("end", "").strip()
             end_val = float(end_raw) if end_raw else None
             rows.append({"line": text, "start": start, "end": end_val})
     rows.sort(key=lambda x: x["start"])
-    return rows
-
-
-def normalize_for_compare(s: str) -> str:
-    s = s.lower()
-    s = "".join(
-        c for c in unicodedata.normalize("NFD", s)
-        if unicodedata.category(c) != "Mn"
-    )
-    s = s.replace(" ", "")
-    return s
-
-
-def maybe_drop_header_row(rows: List[Dict[str, Any]], title: str, artist: str) -> List[Dict[str, Any]]:
-    if not rows:
-        return rows
-    if not title or not artist:
-        return rows
-    expected = f"{title}//by//{artist}"
-    norm_expected = normalize_for_compare(expected)
-    first_line = normalize_for_compare(rows[0]["line"])
-    if first_line == norm_expected:
-        return rows[1:]
     return rows
 
 
@@ -164,11 +151,10 @@ def sec_to_ass_time(sec: float) -> str:
     return f"{h:d}:{m:02d}:{s:05.2f}"
 
 
-def build_intro_event(artist: str, title: str, intro_end: float) -> List[str]:
-    if intro_end <= 0.0:
-        return []
+def build_intro_events(artist: str, title: str, first_start: float) -> List[str]:
     if not artist and not title:
         return []
+    end_time = first_start if first_start > 0 else 3.0
     if artist and title:
         text = f"{title}\\Nby\\N{artist}"
     elif title:
@@ -176,7 +162,7 @@ def build_intro_event(artist: str, title: str, intro_end: float) -> List[str]:
     else:
         text = artist
     return [
-        f"Dialogue: 0,{sec_to_ass_time(0.0)},{sec_to_ass_time(intro_end)},Default,,0,0,0,,{text}"
+        f"Dialogue: 0,{sec_to_ass_time(0.0)},{sec_to_ass_time(end_time)},Default,,0,0,0,,{text}"
     ]
 
 
@@ -198,44 +184,36 @@ def build_ass_events(rows: List[Dict[str, Any]],
     if not rows:
         return events
 
-    # final start of FIRST lyric after shifts
+    # first lyric start after shifts
     first_start = rows[0]["start"] + extra_delay - offset_video
-    if first_start < 0:
-        first_start = 0.0
+    events.extend(build_intro_events(artist, title, first_start))
 
-    # 1) intro = 0 -> first_start (minus a tiny epsilon so they don't overlap)
-    intro_end = max(0.0, first_start - EPS)
-    events.extend(build_intro_event(artist, title, intro_end))
-
-    # 2) all lyric lines
     for i, row in enumerate(rows):
+        # START is ALWAYS from CSV.start + shifts
         start = row["start"] + extra_delay - offset_video
-        end = row["end"]
-        if end is None:
-            if i + 1 < len(rows):
-                end = rows[i + 1]["start"] + extra_delay - offset_video
-            else:
-                end = start + 2.0
-        else:
-            end = end + extra_delay - offset_video
 
-        # ensure each line is at least visible a bit
-        if end <= start:
-            end = start + 0.25
+        # END is ALWAYS derived from NEXT START (ignoring CSV end)
+        if i + 1 < len(rows):
+            next_start_shifted = rows[i + 1]["start"] + extra_delay - offset_video
+            end = next_start_shifted
+        else:
+            end = start + 2.0  # last line fallback
+
+        text = row["line"]
 
         events.append(
-            f"Dialogue: 0,{sec_to_ass_time(start)},{sec_to_ass_time(end)},Default,,0,0,0,,{row['line']}"
+            f"Dialogue: 0,{sec_to_ass_time(start)},{sec_to_ass_time(end)},Default,,0,0,0,,{text}"
         )
 
-        # gap
+        # gap filler: only if real gap between this END and next START
         if i + 1 < len(rows):
-            next_start = rows[i + 1]["start"] + extra_delay - offset_video
-            gap = next_start - end
+            next_start_shifted = rows[i + 1]["start"] + extra_delay - offset_video
+            gap = next_start_shifted - end  # should be 0 normally
             if gap >= gap_threshold:
                 gap_start = end + gap_delay
-                if gap_start < next_start:
-                    # this gap is AFTER intro by construction, since intro ended before first_start
-                    events.append(build_gap_event(gap_start, next_start))
+                if gap_start < next_start_shifted:
+                    gap_end = next_start_shifted
+                    events.append(build_gap_event(gap_start, gap_end))
 
     return events
 
@@ -267,11 +245,10 @@ def write_ass(tmp_ass: str,
 
 def get_audio_duration(path: str) -> float:
     try:
-        out = subprocess.check_output(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            encoding="utf-8",
-        )
+        out = subprocess.check_output([
+            "ffprobe", "-v", "error", "-show_entries",
+            "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path
+        ], encoding="utf-8")
         return float(out.strip())
     except Exception:
         return 0.0
@@ -301,12 +278,7 @@ def main():
     if not rows:
         raise SystemExit("CSV has no usable rows")
 
-    # drop "title//by//artist" header if present
-    rows = maybe_drop_header_row(rows, args.title, args.artist)
-    if not rows:
-        raise SystemExit("CSV has no usable rows after header drop")
-
-    # hard-wrap before writing ASS
+    # apply hard wrap before we write to ASS
     if args.max_chars and args.max_chars > 0:
         for r in rows:
             r["line"] = wrap_line(r["line"], args.max_chars)
@@ -320,9 +292,10 @@ def main():
         write_ass(ass_path, rows, args)
 
         audio_dur = get_audio_duration(args.audio)
-        csv_last_end = max((r["end"] if r["end"] is not None else r["start"] + 2.0) for r in rows)
-        csv_last_end = csv_last_end + args.extra_delay - args.offset_video
-        duration = max(audio_dur, csv_last_end + 0.25)
+        # since we ignore CSV ends, the "script" duration is the last start + 2s (after shifts)
+        last_start = rows[-1]["start"] + args.extra_delay - args.offset_video
+        script_dur = last_start + 2.25
+        duration = max(audio_dur, script_dur)
 
         try:
             run_ffmpeg(ass_path, args.audio, duration, out_mp4)
