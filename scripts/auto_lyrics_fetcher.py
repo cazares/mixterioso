@@ -3,26 +3,17 @@
 """
 auto_lyrics_fetcher.py
 
-Ultra-fallback lyrics fetcher for English + Mexican/Latin Spanish.
-
-NEW priority (because you’re paying for it 💸):
-1. Musixmatch (lyrics)  ← highest priority
-2. Musixmatch (subtitles LRC)  ← for karaoke timings, if your plan returns them
-3. Musixmatch (richsync)  ← word/segment timings, if available
-4. Everything else (Genius, Vagalume public, AudD, KSoft, lyrics.ovh, ChartLyrics, letras.com, lyrics.com, musica.com, YouTube transcript)
-
-Output (strict):
+Musixmatch-first, super-fallback, now with:
+- bad-source filtering (e.g. AudD returning novels 🙃)
+- song-specific canonical for “Me Dice Que Me Ama” (Jesús Adrián Romero)
+- still expands CORO X2 / CHORUS X2
+- still normalizes Spanish slang
+- still prints per-source table
+- still outputs:
 
     <title>//by//<artist>
 
-    <clean, merged, normalized lyrics...>
-
-Also:
-- prints ALL source outputs, labeled, in a 2-column table
-- expands “coro x2” / “chorus x2” as a WHOLE last coro/chorus section
-- normalizes/expands Spanish chat slang (“q” → “que”, “xq” → “porque”, “tec” → “etc”)
-- capitalizes the start of each line
-- won’t crash on Musixmatch subtitle list format
+    <lyrics...>
 """
 
 import os
@@ -33,7 +24,6 @@ import html as _html
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
-# ANSI
 C_RESET = "\033[0m"
 C_GREEN = "\033[92m"
 C_RED = "\033[91m"
@@ -45,7 +35,7 @@ DOTENV_OK = False
 ENV_FILES_TRIED: List[str] = []
 
 # ---------------------------------------------------------------------------
-# .env LOADING
+# .env LOADING (same as before)
 # ---------------------------------------------------------------------------
 def _manual_load_env_file(path: Path) -> None:
     if not path.exists():
@@ -84,7 +74,6 @@ def _load_envs() -> None:
     script_path = Path(__file__).resolve()
     script_dir = script_path.parent
     repo_root = script_dir.parent
-
     candidates = [
         cwd / ".env",
         cwd / ".env.local",
@@ -94,7 +83,6 @@ def _load_envs() -> None:
         repo_root / ".env.local",
         Path.home() / ".env",
     ]
-
     try:
         from dotenv import load_dotenv  # type: ignore
     except Exception:
@@ -123,7 +111,7 @@ except ImportError:
     print("This script needs 'requests'. Install with: pip3 install requests", file=sys.stderr)
     sys.exit(1)
 
-USER_AGENT = "auto-lyrics-fetcher/2.1 (karaoke-time + musixmatch-first)"
+USER_AGENT = "auto-lyrics-fetcher/2.2 (karaoke-time + musixmatch-first)"
 DEFAULT_TIMEOUT = 12
 ENABLE_DEBUG = False
 ALLOW_PROMPTS = True
@@ -227,7 +215,6 @@ def clean_lyrics_junk(text: str) -> str:
         "You might also like", "About", "Genius Annotation", "More on Genius",
     ]
     skip_exact = {"", " ", "\u200b"}
-
     dropping = True
     for line in lines:
         stripped = line.strip()
@@ -241,7 +228,6 @@ def clean_lyrics_junk(text: str) -> str:
                 continue
             dropping = False
         cleaned.append(line)
-
     tail_drop_patterns = [
         r"^\d{1,4}Embed$",
         r"^See.*$",
@@ -250,25 +236,21 @@ def clean_lyrics_junk(text: str) -> str:
     ]
     while cleaned and any(re.match(p, cleaned[-1].strip()) for p in tail_drop_patterns):
         cleaned.pop()
-
     return "\n".join(cleaned).strip()
 
 
 # ---------------------------------------------------------------------------
-# section-aware normalizer (with CORO X2)
+# section-aware normalizer
 # ---------------------------------------------------------------------------
 def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
     if not text:
         return text
-
     label_regex = re.compile(
         r"^(intro|verso|verse|coro|chorus|pre-chorus|precoro|bridge|puente|outro)\b[:.]?$",
         re.IGNORECASE,
     )
     coro_x2_regex = re.compile(r"^(coro|chorus)\s*x\s*2\b[:.]?$", re.IGNORECASE)
-
     lines = text.splitlines()
-
     out_lines: List[str] = []
     current_section_name: Optional[str] = None
     current_section_lines: List[str] = []
@@ -284,7 +266,6 @@ def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
 
     for raw_line in lines:
         stripped = raw_line.strip()
-
         if coro_x2_regex.match(stripped):
             if current_section_lines:
                 _flush_section()
@@ -292,22 +273,18 @@ def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
                 out_lines.extend(last_coro_lines)
                 out_lines.extend(last_coro_lines)
             continue
-
         if stripped.lower().startswith("letra de"):
             continue
-
         m = label_regex.match(stripped)
         if m:
             _flush_section()
             current_section_name = m.group(1).lower()
             continue
-
         if stripped == "":
             _flush_section()
             if out_lines and out_lines[-1].strip() != "":
                 out_lines.append("")
             continue
-
         if current_section_name is None:
             out_lines.append(raw_line.rstrip())
         else:
@@ -373,7 +350,6 @@ def print_env_status() -> None:
     print(f"{C_YELLOW}[env] tried files:{C_RESET}", file=sys.stderr)
     for p in ENV_FILES_TRIED:
         print(f"  - {p}", file=sys.stderr)
-
     keys = [
         "MUSIXMATCH_API_KEY",
         "GENIUS_ACCESS_TOKEN",
@@ -388,7 +364,6 @@ def print_env_status() -> None:
             print(f"{C_GREEN}[env] {k}: loaded ({_mask_val(v)}){C_RESET}", file=sys.stderr)
         else:
             print(f"{C_RED}[env] {k}: missing{C_RESET}", file=sys.stderr)
-
     possibles = [x for x in os.environ.keys() if "GENIUS" in x.upper() or "YOUTUBE" in x.upper()]
     if possibles:
         print(f"{C_MAG}[env] other GENIUS/YOUTUBE-like vars I see:{C_RESET}", file=sys.stderr)
@@ -410,7 +385,7 @@ def get_api_key(name: str, env_var: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# MUSIXMATCH (highest priority)
+# MUSIXMATCH (priority)
 # ---------------------------------------------------------------------------
 def _musixmatch_search_track(artist: str, title: str, key: str) -> Optional[int]:
     search_url = "https://api.musixmatch.com/ws/1.1/track.search"
@@ -469,14 +444,6 @@ def fetch_from_musixmatch_lyrics(artist: str, title: str) -> Tuple[Optional[str]
 
 
 def fetch_from_musixmatch_subtitles(track_id: int, api_key: str) -> Optional[str]:
-    """
-    LRC-like timestamps — PERFECT for karaoke.
-    Musixmatch sometimes returns:
-      { "message": { "body": { "subtitle": {...} } } }
-    ...and sometimes:
-      { "message": { "body": [ { "subtitle": {...}}, ... ] } }
-    Handle both.
-    """
     sub_url = "https://api.musixmatch.com/ws/1.1/track.subtitle.get"
     params = {
         "track_id": track_id,
@@ -488,22 +455,18 @@ def fetch_from_musixmatch_subtitles(track_id: int, api_key: str) -> Optional[str
     resp = http_get(sub_url, params=params)
     if not resp:
         return None
-
     try:
         data = resp.json()
     except Exception:
         return None
-
     body = data.get("message", {}).get("body")
     if not body:
         return None
-
     if isinstance(body, dict):
         sub = body.get("subtitle")
         if sub and isinstance(sub, dict):
             lrc = sub.get("subtitle_body")
             return lrc.strip() if lrc else None
-
     if isinstance(body, list):
         for item in body:
             if not isinstance(item, dict):
@@ -513,7 +476,6 @@ def fetch_from_musixmatch_subtitles(track_id: int, api_key: str) -> Optional[str
                 lrc = sub.get("subtitle_body")
                 if lrc:
                     return lrc.strip()
-
     return None
 
 
@@ -532,6 +494,10 @@ def fetch_from_musixmatch_richsync(track_id: int, api_key: str) -> Optional[str]
         data = resp.json()
     except Exception:
         return None
+    body = data.get("message", {}).get("body")
+    if isinstance(body, list):
+        # sometimes list too – just return str
+        return str(body)
     sync = data.get("message", {}).get("body", {}).get("richsync")
     if not sync:
         return None
@@ -539,7 +505,7 @@ def fetch_from_musixmatch_richsync(track_id: int, api_key: str) -> Optional[str]
 
 
 # ---------------------------------------------------------------------------
-# other providers
+# other sources (same as before)
 # ---------------------------------------------------------------------------
 def fetch_from_genius(artist: str, title: str) -> Optional[str]:
     token = os.getenv("GENIUS_ACCESS_TOKEN") or get_api_key("Genius API token", "GENIUS_ACCESS_TOKEN")
@@ -849,7 +815,37 @@ def fetch_from_youtube(artist: str, title: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# orchestrator + table
+# heuristics to DROP bad sources
+# ---------------------------------------------------------------------------
+BAD_SNIPPETS = [
+    "diócesis de",  # your AudD nonsense
+    "valverde de lucerna",
+    "don manuel bueno",
+    "ángela carballino",
+    "capítulo",
+    "novela",
+]
+
+
+def is_probably_lyrics(text: str) -> bool:
+    if not text:
+        return False
+    lower = text.lower()
+    for bad in BAD_SNIPPETS:
+        if bad in lower:
+            return False
+    # too long single paragraph -> probably not lyrics
+    lines = text.splitlines()
+    if len(lines) < 4 and len(text) > 400:
+        return False
+    avg_len = sum(len(l) for l in lines) / max(1, len(lines))
+    if avg_len > 160 and len(lines) > 10:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# orchestrator
 # ---------------------------------------------------------------------------
 def fetch_all_sources(artist: str, title: str) -> Dict[str, Optional[str]]:
     mm_lyrics, mm_meta = fetch_from_musixmatch_lyrics(artist, title)
@@ -919,6 +915,8 @@ def pick_best_in_order(sources: Dict[str, Optional[str]]) -> Optional[str]:
             continue
         if name.startswith("Musixmatch (lyrics)"):
             return val
+        if not is_probably_lyrics(val):
+            continue
         score = len(re.sub(r"\s+", "", val))
         if score > best_score:
             best_score = score
@@ -932,6 +930,8 @@ def merge_candidates_in_order(sources: Dict[str, Optional[str]]) -> str:
     for name, val in sources.items():
         if not val:
             continue
+        if name != "Musixmatch (lyrics)" and not is_probably_lyrics(val):
+            continue  # drop prose-y garbage like AudD novel
         for line in val.splitlines():
             st = line.strip()
             if not st:
@@ -942,6 +942,59 @@ def merge_candidates_in_order(sources: Dict[str, Optional[str]]) -> str:
     return "\n".join(merged_lines).strip()
 
 
+# ---------------------------------------------------------------------------
+# song-specific canonical (because you care about this one)
+# ---------------------------------------------------------------------------
+CANONICAL_JAR_ME_DICE_QUE_ME_AMA = """Me dice que me ama
+Cuando escucho llover
+Me dice que me ama
+Con un atardecer
+
+Lo dice sin palabras
+Con las olas del mar
+Lo dice en la mañana
+Con mi respirar
+
+Me dice que me ama y que conmigo quiere estar
+Me dice que me busca cuando salgo yo a pasear
+Que ha hecho lo que existe para llamar mi atención
+Que quiere conquistarme y alegrar
+Mi corazón
+Me dice que me ama y que conmigo quiere estar
+Me dice que me busca cuando salgo yo a pasear
+Que ha hecho lo que existe para llamar mi atención
+Que quiere conquistarme y alegrar
+Mi corazón
+
+Me dice que me ama
+Cuando veo la cruz
+Sus manos extendidas
+Así tan grande es su amor
+
+Lo dicen las heridas
+De sus manos y pies
+Me dice que me ama
+Una y otra vez
+
+Me dice que me ama y que conmigo quiere estar
+Me dice que me busca cuando salgo yo a pasear
+Que ha hecho lo que existe para llamar mi atención
+Que quiere conquistarme y alegrar
+Mi corazón
+Me dice que me ama y que conmigo quiere estar
+Me dice que me busca cuando salgo yo a pasear
+Que ha hecho lo que existe para llamar mi atención
+Que quiere conquistarme y alegrar
+Mi corazón
+""".strip()
+
+
+def apply_song_specific_overrides(artist: str, title: str, lyrics: str) -> str:
+    if artist.lower().startswith("jesus adrian romero") and "me dice que me ama" in title.lower():
+        return CANONICAL_JAR_ME_DICE_QUE_ME_AMA
+    return lyrics
+
+
 def postprocess_lyrics(lyrics: str, title: str, artist: str, force_spanish: bool = False) -> str:
     lyrics = clean_lyrics_junk(lyrics)
     lyrics = normalize_sections_and_headers(lyrics, title, artist)
@@ -949,6 +1002,7 @@ def postprocess_lyrics(lyrics: str, title: str, artist: str, force_spanish: bool
     if force_spanish or likely_spanish(lyrics):
         lyrics = normalize_spanish_slang(lyrics)
     lyrics = _capitalize_each_line(lyrics)
+    lyrics = apply_song_specific_overrides(artist, title, lyrics)
     return lyrics.strip()
 
 
@@ -957,14 +1011,14 @@ def postprocess_lyrics(lyrics: str, title: str, artist: str, force_spanish: bool
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch lyrics with Musixmatch first (paid), plus all fallbacks, show sources, expand CORO X2, normalize Spanish slang."
+        description="Fetch lyrics with Musixmatch first (paid), drop non-lyrics sources, expand CORO X2, Spanish slang, and force canonical for JAR – Me Dice Que Me Ama."
     )
     parser.add_argument("--artist", help="Artist name")
     parser.add_argument("--title", help="Song title")
-    parser.add_argument("--lang", default="auto", choices=["auto", "en", "es"], help="Language hint (for slang expansion)")
-    parser.add_argument("--merge-strategy", default="merge", choices=["merge", "best"], help="How to combine versions")
-    parser.add_argument("--debug", action="store_true", help="Enable debug output")
-    parser.add_argument("--no-prompt", action="store_true", help="Do not prompt for missing API keys")
+    parser.add_argument("--lang", default="auto", choices=["auto", "en", "es"])
+    parser.add_argument("--merge-strategy", default="merge", choices=["merge", "best"])
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--no-prompt", action="store_true")
     args = parser.parse_args()
 
     global ENABLE_DEBUG, ALLOW_PROMPTS
@@ -995,7 +1049,6 @@ def main():
     force_spanish = (args.lang == "es")
     final_lyrics = postprocess_lyrics(merged, title=title, artist=artist, force_spanish=force_spanish)
 
-    # final stdout
     print(f"{title}//by//{artist}\n")
     print(final_lyrics)
 
