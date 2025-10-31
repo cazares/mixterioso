@@ -1,29 +1,9 @@
 #!/usr/bin/env python3
 """
 whisper_timing_pipeline.py
-
-Pipeline:
-- optional: demucs vocal isolation
-- ffmpeg → mono 16kHz + loudnorm
-- whisper (py or cli) with word timestamps
-- optional: whisperx align
-- emit:
-  - raw whisper json
-  - word-level csv
-  - karaoke line,start csv (no blank lines)
-  - karaoke txt (no blank lines)
-
-Additive:
-- --lyrics-txt = source-of-truth
-- unmatched lines snap forward to next ASR word (prevents 23.96 collisions)
 """
 
-import argparse
-import json
-import subprocess
-import sys
-import tempfile
-import re
+import argparse, json, subprocess, sys, tempfile, re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,21 +13,17 @@ KNOWN_DEMUCS_LATENCIES = {
     "htdemucs_ft": 0.18,
 }
 
-
-def run_cmd(cmd: List[str], cwd: Optional[str] = None, capture: bool = False) -> Tuple[int, str]:
+def run_cmd(cmd, cwd=None, capture=False):
     p = subprocess.run(cmd, cwd=cwd, capture_output=capture, text=True)
     if capture:
         return p.returncode, p.stdout + p.stderr
     return p.returncode, ""
 
-
 def have_program(name: str) -> bool:
     return subprocess.run(["which", name], capture_output=True).returncode == 0
 
-
 def ensure_dir(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-
 
 def run_demucs(audio: str, model: str, out_dir: str) -> Optional[str]:
     if not have_program("demucs"):
@@ -59,16 +35,13 @@ def run_demucs(audio: str, model: str, out_dir: str) -> Optional[str]:
         print("[demucs] failed:", out, file=sys.stderr)
         return None
     out_path = Path(out_dir)
-    cands = list(out_path.rglob("vocals.*"))
+    cands = list(out_path.rglob("vocals.*")) or list(out_path.rglob("vocals.wav"))
     if not cands:
-        cands = list(out_path.rglob("vocals.wav"))
-    if not cands:
-        print("[demucs] vocals.* not found.", file=sys.stderr)
+        print("[demucs] no vocals.*", file=sys.stderr)
         return None
     v = str(cands[0])
     print(f"[demucs] got vocals at {v}")
     return v
-
 
 def ffmpeg_trim(in_path: str, out_path: str, offset_s: float) -> str:
     print(f"[ffmpeg] trimming {offset_s:.3f}s …")
@@ -80,7 +53,6 @@ def ffmpeg_trim(in_path: str, out_path: str, offset_s: float) -> str:
         print("[ffmpeg] trim failed:", out, file=sys.stderr)
         return in_path
     return out_path
-
 
 def ffmpeg_to_mono16k_loudnorm(in_path: str, out_path: str) -> str:
     print("[ffmpeg] creating mono, 16kHz, loudnorm version …")
@@ -94,8 +66,7 @@ def ffmpeg_to_mono16k_loudnorm(in_path: str, out_path: str) -> str:
         return in_path
     return out_path
 
-
-def run_whisper_python(audio_path: str, model_name: str, language: Optional[str], prompt: Optional[str]) -> Optional[Dict[str, Any]]:
+def run_whisper_python(audio_path, model_name, language, prompt):
     try:
         import whisper  # type: ignore
     except ImportError:
@@ -110,8 +81,7 @@ def run_whisper_python(audio_path: str, model_name: str, language: Optional[str]
         kw["initial_prompt"] = prompt
     return model.transcribe(audio_path, **kw)
 
-
-def run_whisper_cli(audio_path: str, model_name: str, language: Optional[str], prompt: Optional[str]) -> Optional[Dict[str, Any]]:
+def run_whisper_cli(audio_path, model_name, language, prompt):
     if not have_program("whisper"):
         print("[whisper(cli)] not installed.", file=sys.stderr)
         return None
@@ -119,22 +89,14 @@ def run_whisper_cli(audio_path: str, model_name: str, language: Optional[str], p
     cmd = [
         "whisper",
         audio_path,
-        "--model",
-        model_name,
-        "--task",
-        "transcribe",
-        "--output_dir",
-        tmpdir,
-        "--output_format",
-        "json",
-        "--condition_on_previous_text",
-        "False",
-        "--temperature",
-        "0.0",
-        "--beam_size",
-        "5",
-        "--best_of",
-        "5",
+        "--model", model_name,
+        "--task", "transcribe",
+        "--output_dir", tmpdir,
+        "--output_format", "json",
+        "--condition_on_previous_text", "False",
+        "--temperature", "0.0",
+        "--beam_size", "5",
+        "--best_of", "5",
     ]
     if language:
         cmd += ["--language", language]
@@ -147,12 +109,11 @@ def run_whisper_cli(audio_path: str, model_name: str, language: Optional[str], p
         return None
     js = list(Path(tmpdir).glob("*.json"))
     if not js:
-        print("[whisper(cli)] no json output.", file=sys.stderr)
+        print("[whisper(cli)] no json.", file=sys.stderr)
         return None
     return json.loads(js[0].read_text(encoding="utf-8"))
 
-
-def try_whisper(audio_path: str, model_name: str, language: Optional[str], prompt: Optional[str]) -> Dict[str, Any]:
+def try_whisper(audio_path, model_name, language, prompt):
     res = run_whisper_python(audio_path, model_name, language, prompt)
     if res is not None:
         return res
@@ -161,8 +122,7 @@ def try_whisper(audio_path: str, model_name: str, language: Optional[str], promp
         return res
     raise RuntimeError("no whisper backend")
 
-
-def try_whisperx_align(audio_path: str, whisper_result: Dict[str, Any], language: Optional[str]) -> Optional[Dict[str, Any]]:
+def try_whisperx_align(audio_path, whisper_result, language):
     try:
         import torch  # type: ignore
         import whisperx  # type: ignore
@@ -179,126 +139,80 @@ def try_whisperx_align(audio_path: str, whisper_result: Dict[str, Any], language
     align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
     return whisperx.align(result["segments"], align_model, metadata, audio, device)
 
-
-def extract_words_from_whisper(result: Dict[str, Any]) -> List[Dict[str, Any]]:
-    words: List[Dict[str, Any]] = []
+def extract_words_from_whisper(result):
+    words = []
     for seg in result.get("segments", []):
         seg_start = seg.get("start", 0.0)
         seg_end = seg.get("end", 0.0)
         if seg.get("words"):
             for w in seg["words"]:
-                words.append(
-                    {
-                        "word": w.get("word", "").strip(),
-                        "start": float(w.get("start", seg_start)),
-                        "end": float(w.get("end", seg_end)),
-                        "conf": float(w.get("probability", seg.get("avg_logprob", 0.0))),
-                    }
-                )
+                words.append({
+                    "word": w.get("word", "").strip(),
+                    "start": float(w.get("start", seg_start)),
+                    "end": float(w.get("end", seg_end)),
+                    "conf": float(w.get("probability", seg.get("avg_logprob", 0.0))),
+                })
         else:
-            text = seg.get("text", "").strip()
-            if text:
-                words.append(
-                    {
-                        "word": text,
-                        "start": float(seg_start),
-                        "end": float(seg_end),
-                        "conf": float(seg.get("avg_logprob", 0.0)),
-                    }
-                )
+            txt = seg.get("text", "").strip()
+            if txt:
+                words.append({
+                    "word": txt,
+                    "start": float(seg_start),
+                    "end": float(seg_end),
+                    "conf": float(seg.get("avg_logprob", 0.0)),
+                })
     return words
 
-
-def apply_offset(words: List[Dict[str, Any]], offset: float) -> None:
+def apply_offset(words, offset):
     for w in words:
         w["start"] = max(0.0, w["start"] + offset)
         w["end"] = max(0.0, w["end"] + offset)
 
-
-def write_csv(words: List[Dict[str, Any]], csv_path: str) -> None:
-    ensure_dir(csv_path)
-    with open(csv_path, "w", encoding="utf-8") as f:
+def write_csv(words, path):
+    ensure_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
         f.write("word,start,end,conf\n")
         for w in words:
             f.write(f"{w['word']},{w['start']:.3f},{w['end']:.3f},{w['conf']:.4f}\n")
-    print(f"[out] wrote CSV to {csv_path}")
+    print(f"[out] {path}")
 
-
-def group_words_to_lines(words: List[Dict[str, Any]], gap_threshold: float, max_chars: int) -> List[Dict[str, Any]]:
-    lines: List[Dict[str, Any]] = []
-    cur_words: List[str] = []
-    cur_start: Optional[float] = None
-    cur_len = 0
-    prev_end: Optional[float] = None
-    for w in words:
-        text = w["word"]
-        st = w["start"]
-        en = w["end"]
-        gap_ok = prev_end is None or (st - prev_end) < gap_threshold
-        room_ok = (cur_len + (1 if cur_len else 0) + len(text)) <= max_chars
-        if cur_words and (not gap_ok or not room_ok):
-            joined = " ".join(cur_words).strip()
-            if joined:
-                lines.append({"line": joined, "start": cur_start if cur_start is not None else 0.0})
-            cur_words = []
-            cur_start = None
-            cur_len = 0
-        if not cur_words:
-            cur_start = st
-        cur_words.append(text)
-        cur_len += (0 if cur_len == 0 else 1) + len(text)
-        prev_end = en
-    if cur_words:
-        joined = " ".join(cur_words).strip()
-        if joined:
-            lines.append({"line": joined, "start": cur_start if cur_start is not None else 0.0})
-    return lines
-
-
-def write_lines_csv(lines: List[Dict[str, Any]], out_path: str) -> None:
-    ensure_dir(out_path)
-    with open(out_path, "w", encoding="utf-8") as f:
+def write_lines_csv(lines, path):
+    ensure_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
         f.write("line,start\n")
         for L in lines:
             t = L["line"].strip()
             if not t:
                 continue
             f.write(f"{t},{L['start']:.3f}\n")
-    print(f"[out] wrote karaoke CSV to {out_path}")
+    print(f"[out] {path}")
 
-
-def write_lines_txt(lines: List[Dict[str, Any]], out_path: str) -> None:
-    ensure_dir(out_path)
-    with open(out_path, "w", encoding="utf-8") as f:
+def write_lines_txt(lines, path):
+    ensure_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
         for L in lines:
             t = L["line"].strip()
             if not t:
                 continue
             f.write(t + "\n")
-    print(f"[out] wrote karaoke TXT to {out_path}")
+    print(f"[out] {path}")
 
+def write_json(result, path):
+    ensure_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    print(f"[out] {path}")
 
 _WORD_RE = re.compile(r"[a-z0-9áéíóúüñ']+", re.IGNORECASE)
-
 
 def _norm_token(s: str) -> str:
     m = _WORD_RE.findall(s.lower())
     return m[0] if m else ""
 
-
 def _is_header_line(line: str) -> bool:
-    l = line.lower()
-    return "//by//" in l or "///by///" in l
+    return "//by//" in line.lower()
 
-
-def _search_range(
-    W: List[str],
-    words: List[Dict[str, Any]],
-    tokens: List[str],
-    start_i: int,
-    end_i: int,
-    skip_max: int,
-) -> Optional[Tuple[float, int, int]]:
+def _search_range(W, words, tokens, start_i, end_i, skip_max):
     best = None
     upper = min(end_i, len(W))
     for k in range(start_i, upper):
@@ -325,7 +239,6 @@ def _search_range(
                 break
     return best
 
-
 def align_txt_lines_to_words(
     words: List[Dict[str, Any]],
     lyrics_lines: List[str],
@@ -333,6 +246,7 @@ def align_txt_lines_to_words(
     skip_max: int = 6,
     min_cover: float = 0.5,
     local_dt: float = 6.0,
+    max_jump: float = 8.0,
 ) -> List[Dict[str, Any]]:
     W = [_norm_token(w["word"]) for w in words]
     out: List[Dict[str, Any]] = []
@@ -359,12 +273,23 @@ def align_txt_lines_to_words(
         if best and best[0] >= min_cover:
             _, si, ei = best
             ts = words[si]["start"]
-            out.append({"line": line, "start": ts})
-            last_ts = ts
-            if _is_header_line(line):
-                wi = 0
+            # clamp big forward jumps
+            if ts - last_ts > max_jump:
+                # ignore that far match, snap to next real word
+                snap_ts = last_ts
+                for ww in words:
+                    if ww["start"] > last_ts:
+                        snap_ts = ww["start"]
+                        break
+                out.append({"line": line, "start": snap_ts})
+                last_ts = snap_ts
             else:
-                wi = min(ei + 1, si + search_ahead)
+                out.append({"line": line, "start": ts})
+                last_ts = ts
+                if _is_header_line(line):
+                    wi = 0
+                else:
+                    wi = min(ei + 1, si + search_ahead)
         else:
             # snap forward to next actual word
             snap_ts = last_ts
@@ -376,96 +301,77 @@ def align_txt_lines_to_words(
             last_ts = snap_ts
     return out
 
-
-def write_json(result: Dict[str, Any], json_path: str) -> None:
-    ensure_dir(json_path)
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-    print(f"[out] wrote JSON to {json_path}")
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Preprocess song and run Whisper for accurate timings.")
+def main():
+    ap = argparse.ArgumentParser()
     ap.add_argument("--audio", required=True)
-    ap.add_argument("--artist", default=None)
-    ap.add_argument("--title", default=None)
+    ap.add_argument("--artist")
+    ap.add_argument("--title")
     ap.add_argument("--use-demucs", action="store_true")
     ap.add_argument("--demucs-model", default="htdemucs_6s")
     ap.add_argument("--demucs-latency", type=float, default=None)
     ap.add_argument("--model", default="large-v3")
-    ap.add_argument("--language", default=None)
-    ap.add_argument("--out-json", default=None)
-    ap.add_argument("--out-csv", default=None)
-    ap.add_argument("--out-lines-csv", default=None)
-    ap.add_argument("--out-lines-txt", default=None)
+    ap.add_argument("--language")
+    ap.add_argument("--out-json")
+    ap.add_argument("--out-csv")
+    ap.add_argument("--out-lines-csv")
+    ap.add_argument("--out-lines-txt")
     ap.add_argument("--gap-threshold", type=float, default=0.60)
     ap.add_argument("--max-chars", type=int, default=32)
     ap.add_argument("--no-whisperx", action="store_true")
-    ap.add_argument("--lyrics-txt", default=None)
+    ap.add_argument("--lyrics-txt")
     args = ap.parse_args()
 
     if not Path(args.audio).exists():
-        print(f"[err] audio file not found: {args.audio}", file=sys.stderr)
+        print(f"[err] audio not found: {args.audio}", file=sys.stderr)
         sys.exit(1)
 
     workdir = tempfile.mkdtemp(prefix="whisper_timing_")
-    print(f"[tmp] working dir: {workdir}")
+    print(f"[tmp] {workdir}")
 
-    demucs_offset_applied = 0.0
+    demucs_offset = 0.0
     audio_for_whisper = args.audio
-
     if args.use_demucs:
         d_out = str(Path(workdir) / "demucs_out")
         vocals = run_demucs(args.audio, args.demucs_model, d_out)
         if vocals:
-            if args.demucs_latency is not None:
-                latency = args.demucs_latency
-            else:
-                latency = KNOWN_DEMUCS_LATENCIES.get(args.demucs_model, 0.0)
+            latency = args.demucs_latency if args.demucs_latency is not None else KNOWN_DEMUCS_LATENCIES.get(args.demucs_model, 0.0)
             if latency > 0:
                 trimmed = str(Path(workdir) / "vocals_trimmed.wav")
                 vocals = ffmpeg_trim(vocals, trimmed, latency)
-                demucs_offset_applied = latency
+                demucs_offset = latency
             audio_for_whisper = vocals
         else:
-            print("[demucs] falling back to original audio.", file=sys.stderr)
+            print("[demucs] using original audio.", file=sys.stderr)
 
     proc_audio = str(Path(workdir) / "mono16k.wav")
     audio_for_whisper = ffmpeg_to_mono16k_loudnorm(audio_for_whisper, proc_audio)
 
-    prompt_parts: List[str] = []
+    prompt = []
     if args.artist:
-        prompt_parts.append(f"Artist: {args.artist}.")
+        prompt.append(f"Artist: {args.artist}.")
     if args.title:
-        prompt_parts.append(f"Song: {args.title}.")
-    prompt_parts.append("Do not describe music. Do not output [instrumental]. Output lyrics only.")
-    initial_prompt = " ".join(prompt_parts)
+        prompt.append(f"Song: {args.title}.")
+    prompt.append("Do not describe music. Do not output [instrumental]. Output lyrics only.")
+    initial_prompt = " ".join(prompt)
 
     whisper_res = try_whisper(audio_for_whisper, args.model, args.language, initial_prompt)
-
     aligned_res = None
     if not args.no_whisperx:
         aligned_res = try_whisperx_align(audio_for_whisper, whisper_res, args.language)
 
-    result_to_use = aligned_res if aligned_res is not None else whisper_res
-    words = extract_words_from_whisper(result_to_use)
+    result = aligned_res if aligned_res is not None else whisper_res
+    words = extract_words_from_whisper(result)
 
-    if demucs_offset_applied != 0.0:
-        print(f"[offset] applying demucs offset {demucs_offset_applied:.3f}s …")
-        apply_offset(words, demucs_offset_applied)
+    if demucs_offset != 0.0:
+        print(f"[offset] applying {demucs_offset:.3f}s")
+        apply_offset(words, demucs_offset)
 
     if args.out_csv:
         write_csv(words, args.out_csv)
 
-    if args.lyrics_txt:
-        src = Path(args.lyrics_txt)
-        if src.exists():
-            print(f"[lines] using source TXT: {args.lyrics_txt}")
-            raw_lines = src.read_text(encoding="utf-8").splitlines()
-            lines = align_txt_lines_to_words(words, raw_lines)
-        else:
-            print(f"[lines] {args.lyrics_txt} not found, auto-grouping.", file=sys.stderr)
-            lines = group_words_to_lines(words, args.gap_threshold, args.max_chars)
+    if args.lyrics_txt and Path(args.lyrics_txt).exists():
+        raw_lines = Path(args.lyrics_txt).read_text(encoding="utf-8").splitlines()
+        lines = align_txt_lines_to_words(words, raw_lines)
     else:
         lines = group_words_to_lines(words, args.gap_threshold, args.max_chars)
 
@@ -479,13 +385,12 @@ def main() -> None:
         write_lines_txt(lines, out_txt)
 
     if args.out_json:
-        write_json(result_to_use, args.out_json)
+        write_json(result, args.out_json)
 
-    print("[preview] first 15 tokens:")
+    print("[preview]")
     for w in words[:15]:
         print(f"{w['start']:.3f}-{w['end']:.3f}: {w['word']} ({w['conf']:.3f})")
     print("[done]")
-
 
 if __name__ == "__main__":
     main()
