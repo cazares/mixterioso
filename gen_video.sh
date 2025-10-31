@@ -220,14 +220,14 @@ if [ $NEED_AUDIO -eq 1 ]; then
     info ">>> Downloading audio from YouTube (yt-dlp)..."
     if python3 "$SCRIPTS_DIR/youtube_audio_picker.py" \
         --query "$ARTIST $TITLE" \
-        --out "$AUDIO_PATH"
+        --out "$AUDIO_PATH"; then
       ok "[OK] Audio saved to $AUDIO_PATH"
     else
       warn "[WARN] YouTube search with accents failed, retrying without accents…"
       PLAIN_Q="$(deaccent_keep_spaces "$ARTIST $TITLE")"
       if python3 "$SCRIPTS_DIR/youtube_audio_picker.py" \
           --query "$PLAIN_Q" \
-          --out "$AUDIO_PATH"
+          --out "$AUDIO_PATH"; then
         ok "[OK] Audio saved to $AUDIO_PATH"
       else
         err "[ERROR] Could not download audio from YouTube for: $PLAIN_Q"
