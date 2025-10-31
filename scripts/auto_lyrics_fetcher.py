@@ -5,31 +5,22 @@ auto_lyrics_fetcher.py
 
 Ultra-fallback lyrics fetcher for English + Mexican/Latin Spanish.
 
-Output format (IMPORTANT, per spec):
+Output format (IMPORTANT):
 
     <title>//by//<artist>
 
     <clean, merged, normalized lyrics...>
 
-No other header text, no extra “de …” line.
+No extra headers.
 
-What it does:
-- takes ARTIST + TITLE (CLI or import)
-- tries APIs first (Genius, Musixmatch, Vagalume, AudD, KSoft, Lyrics.ovh, ChartLyrics)
-- then tries scrapers (letras.com, lyrics.com, musica.com)
-- can optionally try YouTube (search + captions) if youtube_transcript_api + YT key
-- merges all versions, dedupes, strips “Letra de … de …”, strips section labels
-  (intro, verse, chorus, pre-chorus, bridge, coro, verso, etc.)
-- expands common Mexican/LatAm SMS slang: q→que, xq→porque, pa→para, tmb→también, tec→etc
-- auto-detects Spanish and applies that expansion
-
-Env vars it will look for (will prompt unless --no-prompt):
-    GENIUS_ACCESS_TOKEN
-    MUSIXMATCH_API_KEY
-    AUDD_API_KEY or AUDD_API_TOKEN
-    VAGALUME_API_KEY
-    KSOFT_API_KEY
-    YOUTUBE_API_KEY
+Features:
+- tries multiple APIs (Genius, Musixmatch, Vagalume, AudD, KSoft, Lyrics.ovh, ChartLyrics)
+- then scrapes (letras.com, lyrics.com, musica.com)
+- optional YouTube captions
+- merges/dedupes
+- strips “Letra de … de …”, “intro”, “verse”, “coro”, etc.
+- expands Spanish/Mx SMS (q→que, xq→porque, pa→para, tmb→también, tec→etc)
+- NEW: lines like “CORO X2” / “coro x2” / “chorus x2” → repeat the previous stanza twice
 """
 
 import os
@@ -44,7 +35,7 @@ except ImportError:
     print("This script needs 'requests'. Install with: pip3 install requests")
     sys.exit(1)
 
-USER_AGENT = "auto-lyrics-fetcher/1.1 (karaoke-time)"
+USER_AGENT = "auto-lyrics-fetcher/1.2 (karaoke-time)"
 DEFAULT_TIMEOUT = 12
 ENABLE_DEBUG = False
 ALLOW_PROMPTS = True
@@ -161,6 +152,12 @@ def clean_lyrics_junk(text: str) -> str:
 
 
 def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
+    """
+    - drop 'Letra de ... de ...'
+    - drop generic labels (intro, verse, coro, pre-chorus, bridge...)
+    - BUT: if line is 'coro x2' / 'chorus x2' (any case, with optional space), we
+      repeat the *previous stanza* twice (for sing-along)
+    """
     if not text:
         return text
 
@@ -171,22 +168,40 @@ def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
         "outro", "outro:"
     }
 
+    lines = text.splitlines()
     out_lines: List[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
+    current_stanza: List[str] = []  # lines since last blank
 
-        if not line:
-            out_lines.append("")
+    coro_x2_pattern = re.compile(r"^(coro|chorus)\s*x\s*2\b[:.]?$", re.IGNORECASE)
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+
+        # 1) special case: CORO X2 / chorus x2
+        if coro_x2_pattern.match(stripped):
+            if current_stanza:
+                # repeat the stanza twice
+                out_lines.extend(current_stanza)
+                out_lines.extend(current_stanza)
+            # do not output the label itself
             continue
 
-        if line.lower().startswith("letra de"):
-            # e.g. "Letra de Me Dice Que Me Ama de Jesús Adrián Romero"
+        # 2) drop "Letra de ..."
+        if stripped.lower().startswith("letra de"):
             continue
 
-        if line.lower() in section_labels or line.lower().replace("-", " ") in section_labels:
+        # 3) drop simple labels
+        if stripped.lower() in section_labels or stripped.lower().replace("-", " ") in section_labels:
             continue
 
+        # 4) otherwise, keep line
         out_lines.append(raw_line)
+
+        # maintain stanza buffer
+        if stripped == "":
+            current_stanza = []
+        else:
+            current_stanza.append(raw_line)
 
     # collapse extra blanks
     final_lines: List[str] = []
@@ -623,7 +638,7 @@ def postprocess_lyrics(lyrics: str, title: str, artist: str, force_spanish: bool
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch lyrics from many sources, merge, clean, and normalize Spanish slang."
+        description="Fetch lyrics from many sources, merge, clean, repeat CORO X2, normalize Spanish slang."
     )
     parser.add_argument("--artist", help="Artist name")
     parser.add_argument("--title", help="Song title")
@@ -647,7 +662,6 @@ def main():
     candidates = [txt for txt in all_results.values() if txt]
 
     if not candidates:
-        # even on failure, follow output format
         print(f"{title}//by//{artist}\n")
         print("[!] No lyrics found from any source.")
         print("Tip: set GENIUS_ACCESS_TOKEN, MUSIXMATCH_API_KEY, AUDD_API_KEY, VAGALUME_API_KEY, KSOFT_API_KEY, YOUTUBE_API_KEY")
@@ -661,10 +675,7 @@ def main():
     force_spanish = (args.lang == "es")
     final_lyrics = postprocess_lyrics(merged, title=title, artist=artist, force_spanish=force_spanish)
 
-    # EXACT OUTPUT SHAPE:
-    # <title>//by//<artist>
-    #
-    # <lyrics...>
+    # EXACT OUTPUT
     print(f"{title}//by//{artist}\n")
     print(final_lyrics)
 
