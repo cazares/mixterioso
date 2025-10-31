@@ -7,6 +7,7 @@
 #  - ALIGN prefers: existing vocal stem → original stereo → mono
 #  - post-align fix: fix_early_lines_from_audio.py (0–40s)
 #  - post-align sanity: csv_sanity_fill_improbables.py (snap improbable line to just before next)
+#  - NEW: --timings-csv to bypass internal alignment and use user-provided CSV directly
 
 set -euo pipefail
 
@@ -84,7 +85,7 @@ find_existing_stems_dir() {
 
 # --- args -----------------------------------------------------------------
 if [ $# -lt 2 ]; then
-  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--car-font-size N] [--max-chars N] [--offset-video SEC] [--extra-delay SEC] [--hpad-pct N] [--valign ...] [--vocal-pcts \"0 20 100\"] [--gap-threshold 5.0] [--gap-delay 2.0] [--force-audio] [--force-align]"
+  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--car-font-size N] [--max-chars N] [--offset-video SEC] [--extra-delay SEC] [--hpad-pct N] [--valign ...] [--vocal-pcts \"0 20 100\"] [--gap-threshold 5.0] [--gap-delay 2.0] [--force-audio] [--force-align] [--timings-csv file.csv]"
   exit 1
 fi
 
@@ -111,6 +112,7 @@ FORCE_AUDIO=0
 FORCE_ALIGN=0
 PREVIEW_SECONDS=0
 PREVIEW_INTERACTIVE=0
+USER_TIMINGS_CSV=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -143,6 +145,8 @@ while [ $# -gt 0 ]; do
       FORCE_AUDIO=1; shift 1;;
     --force-align)
       FORCE_ALIGN=1; shift 1;;
+    --timings-csv)
+      USER_TIMINGS_CSV="$2"; shift 2;;
     *)
       warn "Unknown arg: $1 (ignored)"
       shift 1;;
@@ -159,13 +163,19 @@ AUDIO_MONO_PATH="$SONGS_DIR/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono.mp3"
 STEMS_EXPORT_DIR="$STEMS_ROOT/${ARTIST_SLUG}-${TITLE_SLUG}"
 mkdir -p "$STEMS_EXPORT_DIR"
 
+# if user provided a timings csv, prefer that and skip align later
+if [ -n "$USER_TIMINGS_CSV" ]; then
+  info "[INFO] Using user-provided timings CSV: $USER_TIMINGS_CSV"
+  CSV_PATH="$USER_TIMINGS_CSV"
+fi
+
 info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 
 # ---------------------------------------------------------------------------
 # 1) LYRICS (with validation)
 # ---------------------------------------------------------------------------
 need_fetch=1
-if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
+if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ] && [ -z "$USER_TIMINGS_CSV" ]; then
   first_line="$(head -n1 "$LYRICS_PATH" | tr -d '\r')"
   expected="${TITLE}//by//${ARTIST}"
   plain_first="$(echo "$first_line" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
@@ -179,22 +189,22 @@ if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
   fi
 fi
 
-if [ $need_fetch -eq 1 ]; then
+if [ $need_fetch -eq 1 ] && [ -z "$USER_TIMINGS_CSV" ]; then
   if [ -f "$SCRIPTS_DIR/auto_lyrics_fetcher.py" ]; then
     info ">>> Fetching lyrics (auto_lyrics_fetcher) for \"${TITLE}\" by ${ARTIST}..."
     if python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" --artist "$ARTIST" --title "$TITLE" --merge-strategy merge --no-prompt > "$LYRICS_PATH"; then
       ok "[OK] Lyrics saved to $LYRICS_PATH (auto_lyrics_fetcher.py)"
-      rm -f "$CSV_PATH"
+      rm -f "$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.csv"
     else
       warn "[WARN] auto_lyrics_fetcher.py failed — trying legacy fetchers."
       if [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
         python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
         ok "[OK] Lyrics saved to $LYRICS_PATH"
-        rm -f "$CSV_PATH"
+        rm -f "$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.csv"
       elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
         python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
         ok "[OK] Lyrics saved to $LYRICS_PATH"
-        rm -f "$CSV_PATH"
+        rm -f "$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.csv"
       else
         err "[ERROR] no lyrics fetcher found."
         exit 1
@@ -260,7 +270,6 @@ fi
 # ---------------------------------------------------------------------------
 ALIGN_AUDIO="$AUDIO_MONO_PATH"
 
-# existing vocal stem from previous run?
 POSSIBLE_VOCAL_DIR="$STEMS_ROOT/${ARTIST_SLUG}-${TITLE_SLUG}/htdemucs_6s/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono"
 if [ -f "$POSSIBLE_VOCAL_DIR/vocals.wav" ]; then
   info "[ALIGN] using existing Demucs vocal stem for alignment → $POSSIBLE_VOCAL_DIR/vocals.wav"
@@ -275,41 +284,43 @@ else
   fi
 fi
 
-if [ -f "$CSV_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
-  info "[INFO] CSV already exists at $CSV_PATH — skipping alignment."
+if [ -n "$USER_TIMINGS_CSV" ]; then
+  info "[INFO] --timings-csv supplied, skipping internal alignment and fixes."
 else
-  if [ -f "$SCRIPTS_DIR/align_to_csv.py" ]; then
-    info ">>> Aligning lyrics to audio (large-v3) from: $ALIGN_AUDIO ..."
-    python3 "$SCRIPTS_DIR/align_to_csv.py" \
-      --audio "$ALIGN_AUDIO" \
-      --lyrics "$LYRICS_PATH" \
-      --out "$CSV_PATH" \
-      --model large-v3 \
-      --no-vad
-    ok "[OK] CSV saved to $CSV_PATH"
+  if [ -f "$CSV_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
+    info "[INFO] CSV already exists at $CSV_PATH — skipping alignment."
   else
-    err "[ERROR] scripts/align_to_csv.py not found."
-    exit 1
+    if [ -f "$SCRIPTS_DIR/align_to_csv.py" ]; then
+      info ">>> Aligning lyrics to audio (large-v3) from: $ALIGN_AUDIO ..."
+      python3 "$SCRIPTS_DIR/align_to_csv.py" \
+        --audio "$ALIGN_AUDIO" \
+        --lyrics "$LYRICS_PATH" \
+        --out "$CSV_PATH" \
+        --model large-v3 \
+        --no-vad
+      ok "[OK] CSV saved to $CSV_PATH"
+    else
+      err "[ERROR] scripts/align_to_csv.py not found."
+      exit 1
+    fi
   fi
-fi
 
-# post-align: audio-window-based correction
-if [ -f "$SCRIPTS_DIR/fix_early_lines_from_audio.py" ] && [ -f "$SCRIPTS_DIR/transcribe_window.py" ]; then
-  info "[FIX] Auto-correcting early lyric lines from real audio (0–40s)…"
-  python3 "$SCRIPTS_DIR/fix_early_lines_from_audio.py" \
-    --audio "$AUDIO_MONO_PATH" \
-    --csv "$CSV_PATH" \
-    --lyrics "$LYRICS_PATH" \
-    --scripts-dir "$SCRIPTS_DIR" \
-    --window-end 40 \
-    --max-lines 6 \
-    --language es || true
-fi
+  if [ -f "$SCRIPTS_DIR/fix_early_lines_from_audio.py" ] && [ -f "$SCRIPTS_DIR/transcribe_window.py" ]; then
+    info "[FIX] Auto-correcting early lyric lines from real audio (0–40s)…"
+    python3 "$SCRIPTS_DIR/fix_early_lines_from_audio.py" \
+      --audio "$AUDIO_MONO_PATH" \
+      --csv "$CSV_PATH" \
+      --lyrics "$LYRICS_PATH" \
+      --scripts-dir "$SCRIPTS_DIR" \
+      --window-end 40 \
+      --max-lines 6 \
+      --language es || true
+  fi
 
-# post-align: improbables → snap to just before next
-if [ -f "$SCRIPTS_DIR/csv_sanity_fill_improbables.py" ]; then
-  info "[SANITY] Checking for improbable-fast lines (snap-to-next)…"
-  python3 "$SCRIPTS_DIR/csv_sanity_fill_improbables.py" --csv "$CSV_PATH" || true
+  if [ -f "$SCRIPTS_DIR/csv_sanity_fill_improbables.py" ]; then
+    info "[SANITY] Checking for improbable-fast lines (snap-to-next)…"
+    python3 "$SCRIPTS_DIR/csv_sanity_fill_improbables.py" --csv "$CSV_PATH" || true
+  fi
 fi
 
 # ---------------------------------------------------------------------------
