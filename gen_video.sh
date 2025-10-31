@@ -296,8 +296,7 @@ else
         --audio "$ALIGN_AUDIO" \
         --lyrics "$LYRICS_PATH" \
         --out "$CSV_PATH" \
-        --model large-v3 \
-        --no-vad
+  --model large-v3
       ok "[OK] CSV saved to $CSV_PATH"
     else
       err "[ERROR] scripts/align_to_csv.py not found."
