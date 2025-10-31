@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 # render_from_csv.py
 # CSV (line,start[,end]) -> ASS -> ffmpeg -> MP4
-# - intro screen (title/artist) at t=0
-# - --intro-hold is clamped to raw start of 2nd lyric (no offset)
-# - first CSV row that matches "<title>//by//<artist>" is DROPPED
-# - any lyric starting at/before intro_end is pushed to intro_end+0.05s
-# - gap screen never during intro
+# simplified: intro = 0 -> first_lyric_start, no special hold logic
 
 import argparse
 import csv
@@ -17,7 +13,7 @@ import unicodedata
 from typing import List, Dict, Any, Optional
 
 
-EPS = 0.05  # 50ms safety so intro & lyric never share a frame
+EPS = 0.05  # small safety so intro and first lyric never share a frame
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,12 +36,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--title", default="", help="For intro screen / header filtering")
     p.add_argument("--gap-threshold", type=float, default=5.0, help="Seconds of silence to trigger filler")
     p.add_argument("--gap-delay", type=float, default=2.0, help="Seconds AFTER line end before filler shows")
-    p.add_argument(
-        "--intro-hold",
-        type=float,
-        default=5.0,
-        help="Preferred intro duration (will be clamped to 2nd lyric raw time)",
-    )
     p.add_argument("--no-open", action="store_true", help="Do not open output dir on macOS")
     return p.parse_args()
 
@@ -70,7 +60,6 @@ def read_csv_rows(path: str) -> List[Dict[str, Any]]:
 
 
 def normalize_for_compare(s: str) -> str:
-    # lower, deaccent, strip spaces
     s = s.lower()
     s = "".join(
         c for c in unicodedata.normalize("NFD", s)
@@ -82,9 +71,9 @@ def normalize_for_compare(s: str) -> str:
 
 def maybe_drop_header_row(rows: List[Dict[str, Any]], title: str, artist: str) -> List[Dict[str, Any]]:
     if not rows:
-      return rows
+        return rows
     if not title or not artist:
-      return rows
+        return rows
     expected = f"{title}//by//{artist}"
     norm_expected = normalize_for_compare(expected)
     first_line = normalize_for_compare(rows[0]["line"])
@@ -175,7 +164,9 @@ def sec_to_ass_time(sec: float) -> str:
     return f"{h:d}:{m:02d}:{s:05.2f}"
 
 
-def build_intro_events(artist: str, title: str, intro_end: float) -> List[str]:
+def build_intro_event(artist: str, title: str, intro_end: float) -> List[str]:
+    if intro_end <= 0.0:
+        return []
     if not artist and not title:
         return []
     if artist and title:
@@ -202,12 +193,21 @@ def build_ass_events(rows: List[Dict[str, Any]],
                      gap_threshold: float,
                      gap_delay: float,
                      artist: str,
-                     title: str,
-                     intro_end: float) -> List[str]:
+                     title: str) -> List[str]:
     events: List[str] = []
-    # intro first
-    events.extend(build_intro_events(artist, title, intro_end))
+    if not rows:
+        return events
 
+    # final start of FIRST lyric after shifts
+    first_start = rows[0]["start"] + extra_delay - offset_video
+    if first_start < 0:
+        first_start = 0.0
+
+    # 1) intro = 0 -> first_start (minus a tiny epsilon so they don't overlap)
+    intro_end = max(0.0, first_start - EPS)
+    events.extend(build_intro_event(artist, title, intro_end))
+
+    # 2) all lyric lines
     for i, row in enumerate(rows):
         start = row["start"] + extra_delay - offset_video
         end = row["end"]
@@ -219,11 +219,9 @@ def build_ass_events(rows: List[Dict[str, Any]],
         else:
             end = end + extra_delay - offset_video
 
-        # make sure NO lyric appears on same frame as intro
-        if start < intro_end + EPS:
-            shift = (intro_end + EPS) - start
-            start = intro_end + EPS
-            end = max(end + shift, start + 0.25)
+        # ensure each line is at least visible a bit
+        if end <= start:
+            end = start + 0.25
 
         events.append(
             f"Dialogue: 0,{sec_to_ass_time(start)},{sec_to_ass_time(end)},Default,,0,0,0,,{row['line']}"
@@ -232,13 +230,11 @@ def build_ass_events(rows: List[Dict[str, Any]],
         # gap
         if i + 1 < len(rows):
             next_start = rows[i + 1]["start"] + extra_delay - offset_video
-            if next_start < intro_end + EPS:
-                next_start = intro_end + EPS
-
             gap = next_start - end
             if gap >= gap_threshold:
                 gap_start = end + gap_delay
-                if gap_start < next_start and gap_start >= intro_end + EPS:
+                if gap_start < next_start:
+                    # this gap is AFTER intro by construction, since intro ended before first_start
                     events.append(build_gap_event(gap_start, next_start))
 
     return events
@@ -246,8 +242,7 @@ def build_ass_events(rows: List[Dict[str, Any]],
 
 def write_ass(tmp_ass: str,
               rows: List[Dict[str, Any]],
-              args: argparse.Namespace,
-              intro_end: float) -> None:
+              args: argparse.Namespace) -> None:
     header = make_ass_header(
         args.font_name,
         args.font_size,
@@ -263,7 +258,6 @@ def write_ass(tmp_ass: str,
         args.gap_delay,
         args.artist,
         args.title,
-        intro_end,
     )
     with open(tmp_ass, "w", encoding="utf-8") as f:
         f.write(header)
@@ -307,22 +301,15 @@ def main():
     if not rows:
         raise SystemExit("CSV has no usable rows")
 
-    # drop auto header row like "Title//by//Artist"
+    # drop "title//by//artist" header if present
     rows = maybe_drop_header_row(rows, args.title, args.artist)
+    if not rows:
+        raise SystemExit("CSV has no usable rows after header drop")
 
+    # hard-wrap before writing ASS
     if args.max_chars and args.max_chars > 0:
         for r in rows:
             r["line"] = wrap_line(r["line"], args.max_chars)
-
-    # raw times (no offset) to clamp intro
-    first_raw = rows[0]["start"] + args.extra_delay
-    second_raw: Optional[float] = None
-    if len(rows) > 1:
-        second_raw = rows[1]["start"] + args.extra_delay
-
-    intro_end = max(3.0, args.intro_hold, first_raw)
-    if second_raw is not None and intro_end > second_raw:
-        intro_end = second_raw
 
     out_dir = os.path.join(args.repo_root, "output")
     os.makedirs(out_dir, exist_ok=True)
@@ -330,12 +317,12 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmpd:
         ass_path = os.path.join(tmpd, "lyrics.ass")
-        write_ass(ass_path, rows, args, intro_end)
+        write_ass(ass_path, rows, args)
 
         audio_dur = get_audio_duration(args.audio)
         csv_last_end = max((r["end"] if r["end"] is not None else r["start"] + 2.0) for r in rows)
         csv_last_end = csv_last_end + args.extra_delay - args.offset_video
-        duration = max(audio_dur, csv_last_end + 0.25, intro_end + 0.25)
+        duration = max(audio_dur, csv_last_end + 0.25)
 
         try:
             run_ffmpeg(ass_path, args.audio, duration, out_mp4)
