@@ -2,11 +2,9 @@
 # gen_video.sh — pipeline: lyrics → audio → align → demucs → render (multi-variant)
 # now with:
 #  - prefer scripts/auto_lyrics_fetcher.py
-#  - VALIDATE existing lyrics; refetch if title/artist header mismatch
-#  - CSV nuked when lyrics refetched
-#  - RENDER ALWAYS USES MONO (48k) AS SOURCE OF TRUTH
-#  - ALIGN PREFERS DEMUCS VOCAL STEM (if present), otherwise falls back to mono
-#  - ALIGN asks for --no-vad to avoid early triggers on noisy mixes
+#  - VALIDATE existing lyrics; refetch if polluted or mismatched title/artist
+#  - if we refetch lyrics, nuke CSV so align re-runs
+#  - auto-fix early lyric lines from REAL audio (0–40s) using Whisper window
 
 set -euo pipefail
 
@@ -46,6 +44,7 @@ slugify() {
   printf '%s\n' "$s"
 }
 
+# deaccent but KEEP SPACES (for YouTube queries and title match)
 deaccent_keep_spaces() {
   local s="$1"
   s=$(printf '%s' "$s" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')
@@ -72,6 +71,7 @@ find_demucs_bin() {
 find_existing_stems_dir() {
   local stems_export_dir="$1"
   local audio_base="$2"
+
   if [ -d "$stems_export_dir/htdemucs_6s/$audio_base" ]; then
     echo "$stems_export_dir/htdemucs_6s/$audio_base"; return
   fi
@@ -169,7 +169,7 @@ mkdir -p "$STEMS_EXPORT_DIR"
 info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 
 # ---------------------------------------------------------------------------
-# 1) LYRICS
+# 1) LYRICS (with validation)
 # ---------------------------------------------------------------------------
 need_fetch=1
 if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
@@ -177,23 +177,24 @@ if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
   expected="${TITLE}//by//${ARTIST}"
   plain_first="$(echo "$first_line" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
   plain_expected="$(echo "$expected"   | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
+
   if [ "$plain_first" = "$plain_expected" ]; then
-    info "[INFO] Lyrics look good — reusing $LYRICS_PATH"
+    info "[INFO] Lyrics header matches — reusing $LYRICS_PATH"
     need_fetch=0
   else
-    warn "[WARN] Existing lyrics header mismatch — will refetch."
+    warn "[WARN] Lyrics header mismatch — will refetch."
     need_fetch=1
   fi
 fi
 
 if [ $need_fetch -eq 1 ]; then
   if [ -f "$SCRIPTS_DIR/auto_lyrics_fetcher.py" ]; then
-    info ">>> Fetching lyrics (auto_lyrics_fetcher, accent-aware) for \"${TITLE}\" by ${ARTIST}..."
+    info ">>> Fetching lyrics (auto_lyrics_fetcher) for \"${TITLE}\" by ${ARTIST}..."
     if python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" --artist "$ARTIST" --title "$TITLE" --merge-strategy merge --no-prompt > "$LYRICS_PATH"; then
       ok "[OK] Lyrics saved to $LYRICS_PATH (auto_lyrics_fetcher.py)"
       rm -f "$CSV_PATH"
     else
-      warn "[WARN] auto_lyrics_fetcher.py failed — falling back."
+      warn "[WARN] auto_lyrics_fetcher.py failed — trying legacy fetchers."
       if [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
         python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
         ok "[OK] Lyrics saved to $LYRICS_PATH"
@@ -207,8 +208,18 @@ if [ $need_fetch -eq 1 ]; then
         exit 1
       fi
     fi
+  elif [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
+    info ">>> Fetching lyrics (smart) for \"${TITLE}\" by ${ARTIST}..."
+    python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
+    ok "[OK] Lyrics saved to $LYRICS_PATH"
+    rm -f "$CSV_PATH"
+  elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
+    info ">>> Fetching lyrics for \"${TITLE}\" by ${ARTIST}..."
+    python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
+    ok "[OK] Lyrics saved to $LYRICS_PATH"
+    rm -f "$CSV_PATH"
   else
-    err "[ERROR] scripts/auto_lyrics_fetcher.py not found and no fallbacks."
+    err "[ERROR] no lyrics fetcher found."
     exit 1
   fi
 fi
@@ -242,6 +253,7 @@ if [ $NEED_AUDIO -eq 1 ]; then
         ok "[OK] Audio saved to $AUDIO_PATH"
       else
         err "[ERROR] Could not download audio from YouTube for: $PLAIN_Q"
+        err "      Try: python3 scripts/youtube_audio_picker.py --query \"$PLAIN_Q\" --out \"$AUDIO_PATH\""
         exit 1
       fi
     fi
@@ -251,7 +263,7 @@ if [ $NEED_AUDIO -eq 1 ]; then
   fi
 fi
 
-# 2b) TRUE MONO (source of truth for align + render) -----------------------
+# 2b) TRUE MONO ------------------------------------------------------------
 if [ -f "$AUDIO_MONO_PATH" ]; then
   if [ $FORCE_AUDIO -eq 1 ] || [ "$AUDIO_PATH" -nt "$AUDIO_MONO_PATH" ]; then
     info ">>> Source MP3 is newer (or --force-audio) — re-converting to TRUE MONO..."
@@ -266,58 +278,38 @@ else
   ok "[OK] Mono audio at $AUDIO_MONO_PATH"
 fi
 
-# render must ALWAYS use mono
-RENDER_AUDIO="$AUDIO_MONO_PATH"
-
 # ---------------------------------------------------------------------------
-# 3) ALIGN — now try to use vocals stem if we already have it
-#    (first run: likely no stems yet → we fall back to mono)
+# 3) ALIGN (now: prefer vocal stem → stereo → mono)
 # ---------------------------------------------------------------------------
 ALIGN_AUDIO="$AUDIO_MONO_PATH"
-ALIGN_EXTRA_ARGS=()
 
-# try to reuse existing demucs stems for ALIGN (vocals-only is best SNR)
-POSSIBLE_STEMS_DIR="$STEMS_ROOT/${ARTIST_SLUG}-${TITLE_SLUG}/htdemucs_6s/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono"
-if [ -f "$POSSIBLE_STEMS_DIR/vocals.wav" ]; then
-  info "[ALIGN] Using existing Demucs vocal stem for alignment: $POSSIBLE_STEMS_DIR/vocals.wav"
-  ALIGN_AUDIO="$POSSIBLE_STEMS_DIR/vocals.wav"
+# 3a) try to find an existing *vocal* stem from a previous demucs run
+POSSIBLE_VOCAL_DIR="$STEMS_ROOT/${ARTIST_SLUG}-${TITLE_SLUG}/htdemucs_6s/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono"
+if [ -f "$POSSIBLE_VOCAL_DIR/vocals.wav" ]; then
+  info "[ALIGN] using existing Demucs vocal stem for alignment → $POSSIBLE_VOCAL_DIR/vocals.wav"
+  ALIGN_AUDIO="$POSSIBLE_VOCAL_DIR/vocals.wav"
 else
-  # optional: try a quick 2-stem just for align (additive, safe)
-  DEMUCS_BIN_FOR_ALIGN="$(find_demucs_bin)"
-  if [ -n "$DEMUCS_BIN_FOR_ALIGN" ] && [ $FORCE_ALIGN -eq 1 ]; then
-    info "[ALIGN] No existing vocal stem — running quick demucs 2-stem for ALIGN..."
-    ALIGN_STEMS_DIR="$STEMS_ROOT/${ARTIST_SLUG}-${TITLE_SLUG}/align_stems"
-    mkdir -p "$ALIGN_STEMS_DIR"
-    if $DEMUCS_BIN_FOR_ALIGN --two-stems=vocals -o "$ALIGN_STEMS_DIR" "$AUDIO_MONO_PATH" >/dev/null 2>&1; then
-      # demucs will drop under .../htdemucs/... usually
-      if [ -d "$ALIGN_STEMS_DIR/htdemucs/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono" ] && [ -f "$ALIGN_STEMS_DIR/htdemucs/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono/vocals.wav" ]; then
-        ALIGN_AUDIO="$ALIGN_STEMS_DIR/htdemucs/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono/vocals.wav"
-        info "[ALIGN] Using freshly separated vocal stem for alignment."
-      else
-        warn "[ALIGN] quick demucs 2-stem didn't produce expected layout; falling back to mono."
-      fi
-    else
-      warn "[ALIGN] demucs 2-stem for ALIGN failed; falling back to mono."
-    fi
+  # 3b) no vocal stem yet → try ORIGINAL STEREO before falling back to mono
+  if [ -f "$AUDIO_PATH" ]; then
+    info "[ALIGN] no vocal stem yet; using ORIGINAL STEREO for alignment → $AUDIO_PATH"
+    ALIGN_AUDIO="$AUDIO_PATH"
   else
-    info "[ALIGN] No existing vocal stem — aligning on mono."
+    info "[ALIGN] using mono for alignment → $AUDIO_MONO_PATH"
+    ALIGN_AUDIO="$AUDIO_MONO_PATH"
   fi
 fi
-
-# we want to tell aligner: DON'T VAD, trust timestamps
-ALIGN_EXTRA_ARGS+=(--no-vad)
 
 if [ -f "$CSV_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
   info "[INFO] CSV already exists at $CSV_PATH — skipping alignment."
 else
   if [ -f "$SCRIPTS_DIR/align_to_csv.py" ]; then
-    info ">>> Aligning lyrics to audio (large-v3) — src: $ALIGN_AUDIO ..."
+    info ">>> Aligning lyrics to audio (large-v3) from: $ALIGN_AUDIO ..."
     python3 "$SCRIPTS_DIR/align_to_csv.py" \
       --audio "$ALIGN_AUDIO" \
       --lyrics "$LYRICS_PATH" \
       --out "$CSV_PATH" \
       --model large-v3 \
-      "${ALIGN_EXTRA_ARGS[@]}"
+      --no-vad
     ok "[OK] CSV saved to $CSV_PATH"
   else
     err "[ERROR] scripts/align_to_csv.py not found."
@@ -325,7 +317,22 @@ else
   fi
 fi
 
-# 4) DEMUCS with REUSE -----------------------------------------------------
+# --- auto-fix early lyric lines using real audio (0–40s) ---
+if [ -f "$SCRIPTS_DIR/fix_early_lines_from_audio.py" ] && [ -f "$SCRIPTS_DIR/transcribe_window.py" ]; then
+  info "[FIX] Auto-correcting early lyric lines from real audio (0–40s)…"
+  python3 "$SCRIPTS_DIR/fix_early_lines_from_audio.py" \
+    --audio "$AUDIO_MONO_PATH" \
+    --csv "$CSV_PATH" \
+    --lyrics "$LYRICS_PATH" \
+    --scripts-dir "$SCRIPTS_DIR" \
+    --window-end 40 \
+    --max-lines 6 \
+    --language es || true
+fi
+
+# ---------------------------------------------------------------------------
+# 4) DEMUCS with REUSE
+# ---------------------------------------------------------------------------
 DEMUCS_BIN="$(find_demucs_bin)"
 BEST_STEMS_DIR=""
 
@@ -340,6 +347,7 @@ if [ -n "$DEMUCS_BIN" ]; then
   else
     info ">>> [DEMUCS] Running separation (6 → 4 → 2) …"
     DEMUCS_BASE_OUT="$STEMS_EXPORT_DIR"
+
     if $DEMUCS_BIN -n htdemucs_6s -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH" 2>&1 | tee "$DEMUCS_BASE_OUT/demucs_6s.log"; then
       BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs_6s/$AUDIO_BASE_NOEXT"
       ok "[OK] Demucs 6-stem succeeded → $BEST_STEMS_DIR"
@@ -354,7 +362,7 @@ if [ -n "$DEMUCS_BIN" ]; then
           BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs/$AUDIO_BASE_NOEXT"
           ok "[OK] Demucs 2-stem succeeded → $BEST_STEMS_DIR"
         else
-          warn "[WARN] All demucs attempts failed — will use mono for ALL variants."
+          err "[ERROR] All demucs attempts failed — will use mono for ALL variants."
           BEST_STEMS_DIR=""
         fi
       fi
@@ -364,10 +372,11 @@ else
   warn "[WARN] demucs not found — ALL variants will sound the same (mono)."
 fi
 
-# 5) decide what to render -------------------------------------------------
+# ---------------------------------------------------------------------------
+# 5) decide what to render
+# ---------------------------------------------------------------------------
 RENDER_PCTS=()
 if [ $HAS_VOCAL_PCTS -eq 1 ]; then
-  # shellcheck disable=SC2206
   RENDER_PCTS=($VOCAL_PCTS_STR)
 else
   RENDER_PCTS=("100")
@@ -375,12 +384,15 @@ fi
 
 info ">>> Rendering karaoke video(s): ${RENDER_PCTS[*]}"
 
-# 6) per-pct: build audio (still done, but video uses mono) ----------------
+# ---------------------------------------------------------------------------
+# 6) per-pct: build audio + render
+# ---------------------------------------------------------------------------
 MIXED_AUDIO_DIR="$SONGS_DIR/mixed"
 mkdir -p "$MIXED_AUDIO_DIR"
 
 for pct in "${RENDER_PCTS[@]}"; do
   OUT_NAME="${ARTIST_SLUG}-${TITLE_SLUG}_v${pct}"
+  AUDIO_FOR_THIS="$AUDIO_MONO_PATH"
 
   if [ -n "${BEST_STEMS_DIR:-}" ] && [ -d "$BEST_STEMS_DIR" ]; then
     inputs=()
@@ -422,12 +434,18 @@ EOF
       MIXED_PATH="$MIXED_AUDIO_DIR/${TITLE_SLUG}_v${pct}.wav"
       info "[MIX] building mix for ${pct}% → $MIXED_PATH"
 
-      if ! ffmpeg -y "${inputs[@]}" -filter_complex "$fc" -map "[outa]" -ar 48000 -ac 1 -b:a 192k "$MIXED_PATH" >/dev/null 2>&1; then
-        warn "[WARN] mix for ${pct}% failed, ignoring (we will render with mono)."
+      if ffmpeg -y "${inputs[@]}" -filter_complex "$fc" -map "[outa]" -ar 48000 -ac 1 -b:a 192k "$MIXED_PATH" >/dev/null 2>&1; then
+        AUDIO_FOR_THIS="$MIXED_PATH"
+      else
+        warn "[WARN] mix for ${pct}% failed, falling back to mono."
+        AUDIO_FOR_THIS="$AUDIO_MONO_PATH"
       fi
     else
-      warn "[WARN] demucs produced no usable stems — skipping mix build."
+      warn "[WARN] demucs produced no usable stems — falling back to mono."
+      AUDIO_FOR_THIS="$AUDIO_MONO_PATH"
     fi
+  else
+    warn "[WARN] No demucs stems — ${pct}% will sound same as others."
   fi
 
   FINAL_MP4="$OUTPUT_DIR/${OUT_NAME}.mp4"
@@ -439,24 +457,29 @@ EOF
     rm -f "$FINAL_MP4"
   fi
 
-  python3 "$SCRIPTS_DIR/render_from_csv.py" \
-    --csv "$CSV_PATH" \
-    --audio "$RENDER_AUDIO" \
-    --font-size "$FONT_SIZE" \
-    --repo-root "$ROOT" \
-    --offset-video "$OFFSET_VIDEO" \
-    --extra-delay "$EXTRA_DELAY" \
-    --hpad-pct "$HPAD_PCT" \
-    --valign "$VALIGN" \
-    --output-name "$OUT_NAME" \
-    --max-chars "$MAX_CHARS" \
-    --artist "$ARTIST" \
-    --title "$TITLE" \
-    --gap-threshold "$GAP_THRESHOLD" \
-    --gap-delay "$GAP_DELAY" \
-    ${CAR_FONT_SIZE:+--car-font-size "$CAR_FONT_SIZE"} \
+  PY_ARGS=(
+    "$SCRIPTS_DIR/render_from_csv.py"
+    --csv "$CSV_PATH"
+    --audio "$AUDIO_FOR_THIS"
+    --font-size "$FONT_SIZE"
+    --repo-root "$ROOT"
+    --offset-video "$OFFSET_VIDEO"
+    --extra-delay "$EXTRA_DELAY"
+    --hpad-pct "$HPAD_PCT"
+    --valign "$VALIGN"
+    --output-name "$OUT_NAME"
+    --max-chars "$MAX_CHARS"
+    --artist "$ARTIST"
+    --title "$TITLE"
+    --gap-threshold "$GAP_THRESHOLD"
+    --gap-delay "$GAP_DELAY"
     --no-open
+  )
+  if [ -n "$CAR_FONT_SIZE" ]; then
+    PY_ARGS+=( --car-font-size "$CAR_FONT_SIZE" )
+  fi
 
+  python3 "${PY_ARGS[@]}"
 done
 
 ok "[DONE] Karaoke video(s) for ${ARTIST} – \"${TITLE}\" are in $OUTPUT_DIR/"
@@ -464,4 +487,3 @@ if command -v open >/dev/null 2>&1; then
   open "$OUTPUT_DIR" >/dev/null 2>&1 || true
 fi
 # end of gen_video.sh
- 
