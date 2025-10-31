@@ -11,25 +11,67 @@ Output:
 
     <clean, merged, normalized lyrics...>
 
-Now loads .env automatically (current dir + .env.local).
+Now:
+- loads .env from multiple likely locations (cwd, script dir, repo root)
+- prints which env vars were found (colorized)
+- still falls back to prompting if missing (unless --no-prompt)
+- expands "CORO X2"/"chorus x2" into previous stanza twice
 """
 
 import os
 import re
 import sys
 import argparse
+from pathlib import Path
 from typing import List, Dict, Optional
 
-# NEW: load .env first
-try:
-    from dotenv import load_dotenv  # type: ignore
-    # load default .env in cwd
-    load_dotenv()
-    # optional second file
-    load_dotenv(".env.local")
-except Exception:
-    # if python-dotenv isn't installed, we just skip it
-    pass
+# ------------------------------------------------------------
+# ANSI colors
+# ------------------------------------------------------------
+C_RESET = "\033[0m"
+C_GREEN = "\033[92m"
+C_RED = "\033[91m"
+C_YELLOW = "\033[93m"
+C_CYAN = "\033[96m"
+
+# ------------------------------------------------------------
+# load .env from several spots
+# ------------------------------------------------------------
+def _load_envs() -> None:
+    """
+    Try to load .env from:
+      - current working dir
+      - current working dir /.env.local
+      - script dir
+      - repo root (parent of script dir)
+      - repo root /.env.local
+    """
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception:
+        # no python-dotenv installed, skip
+        return
+
+    cwd = Path.cwd()
+    script_path = Path(__file__).resolve()
+    script_dir = script_path.parent
+    repo_root = script_dir.parent  # e.g. /Users/.../karaoke-time-by-miguel
+
+    candidates = [
+        cwd / ".env",
+        cwd / ".env.local",
+        script_dir / ".env",
+        script_dir / ".env.local",
+        repo_root / ".env",
+        repo_root / ".env.local",
+    ]
+
+    for p in candidates:
+        if p.exists():
+            load_dotenv(p)
+
+
+_load_envs()
 
 try:
     import requests
@@ -37,7 +79,7 @@ except ImportError:
     print("This script needs 'requests'. Install with: pip3 install requests")
     sys.exit(1)
 
-USER_AGENT = "auto-lyrics-fetcher/1.2 (karaoke-time)"
+USER_AGENT = "auto-lyrics-fetcher/1.3 (karaoke-time)"
 DEFAULT_TIMEOUT = 12
 ENABLE_DEBUG = False
 ALLOW_PROMPTS = True
@@ -151,9 +193,7 @@ def clean_lyrics_junk(text: str) -> str:
 
 def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
     """
-    - drop 'Letra de ... de ...'
-    - drop generic labels (intro, verse, coro, pre-chorus, bridge...)
-    - expand 'coro x2' / 'chorus x2' (any case): repeat previous stanza twice
+    Drop junk + expand CORO X2 / CHORUS X2 into previous stanza twice.
     """
     if not text:
         return text
@@ -174,7 +214,6 @@ def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
     for raw_line in lines:
         stripped = raw_line.strip()
 
-        # expand "CORO X2"
         if coro_x2_pattern.match(stripped):
             if current_stanza:
                 out_lines.extend(current_stanza)
@@ -194,7 +233,6 @@ def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
         else:
             current_stanza.append(raw_line)
 
-    # collapse blanks
     final_lines: List[str] = []
     blank_counter = 0
     for l in out_lines:
@@ -218,6 +256,32 @@ def de_dupe_lines(text: str) -> str:
             out_lines.append(line)
             seen.add(key)
     return "\n".join(out_lines)
+
+
+def _mask_val(v: str) -> str:
+    if not v:
+        return ""
+    if len(v) <= 6:
+        return "*" * len(v)
+    return v[:4] + "..." + v[-3:]
+
+
+def print_env_status() -> None:
+    keys = [
+        "GENIUS_ACCESS_TOKEN",
+        "MUSIXMATCH_API_KEY",
+        "VAGALUME_API_KEY",
+        "AUDD_API_KEY",
+        "KSOFT_API_KEY",
+        "YOUTUBE_API_KEY",
+    ]
+    print(f"{C_CYAN}[env] checking .env / environment...{C_RESET}", file=sys.stderr)
+    for k in keys:
+        v = os.getenv(k)
+        if v:
+            print(f"{C_GREEN}[env] {k}: loaded ({_mask_val(v)}){C_RESET}", file=sys.stderr)
+        else:
+            print(f"{C_RED}[env] {k}: missing{C_RESET}", file=sys.stderr)
 
 
 def get_api_key(name: str, env_var: str) -> str:
@@ -496,7 +560,7 @@ def scrape_musica_com(artist: str, title: str) -> Optional[str]:
     return None
 
 
-# -------------------- youtube (optional) -------------------- #
+# -------------------- youtube -------------------- #
 
 def fetch_from_youtube(artist: str, title: str) -> Optional[str]:
     ykey = os.getenv("YOUTUBE_API_KEY") or get_api_key("YouTube Data API key", "YOUTUBE_API_KEY")
@@ -619,7 +683,7 @@ def postprocess_lyrics(lyrics: str, title: str, artist: str, force_spanish: bool
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch lyrics from many sources, merge, clean, repeat CORO X2, normalize Spanish slang, load .env."
+        description="Fetch lyrics from many sources, merge, clean, expand CORO X2, load .env, colorize env status."
     )
     parser.add_argument("--artist", help="Artist name")
     parser.add_argument("--title", help="Song title")
@@ -634,18 +698,21 @@ def main():
     if args.no_prompt:
         ALLOW_PROMPTS = False
 
+    # show what we loaded
+    print_env_status()
+
     artist = args.artist or input("Artist: ").strip()
     title = args.title or input("Song title: ").strip()
 
-    print(f"[i] Fetching lyrics for '{title}' by '{artist}' ...", file=sys.stderr)
+    print(f"{C_CYAN}[i] Fetching lyrics for '{title}' by '{artist}' ...{C_RESET}", file=sys.stderr)
 
     all_results = fetch_all_sources(artist, title)
     candidates = [txt for txt in all_results.values() if txt]
 
     if not candidates:
         print(f"{title}//by//{artist}\n")
-        print("[!] No lyrics found from any source.")
-        print("Tip: set GENIUS_ACCESS_TOKEN, MUSIXMATCH_API_KEY, AUDD_API_KEY, VAGALUME_API_KEY, KSOFT_API_KEY, YOUTUBE_API_KEY")
+        print(f"{C_RED}[!] No lyrics found from any source.{C_RESET}", file=sys.stderr)
+        print(f"{C_YELLOW}Tip: set GENIUS_ACCESS_TOKEN, MUSIXMATCH_API_KEY, AUDD_API_KEY, VAGALUME_API_KEY, KSOFT_API_KEY, YOUTUBE_API_KEY{C_RESET}", file=sys.stderr)
         sys.exit(1)
 
     if args.merge_strategy == "merge":
@@ -656,6 +723,7 @@ def main():
     force_spanish = (args.lang == "es")
     final_lyrics = postprocess_lyrics(merged, title=title, artist=artist, force_spanish=force_spanish)
 
+    # final output (non-colored)
     print(f"{title}//by//{artist}\n")
     print(final_lyrics)
 
