@@ -5,22 +5,13 @@ auto_lyrics_fetcher.py
 
 Ultra-fallback lyrics fetcher for English + Mexican/Latin Spanish.
 
-Output format (IMPORTANT):
+Output:
 
     <title>//by//<artist>
 
     <clean, merged, normalized lyrics...>
 
-No extra headers.
-
-Features:
-- tries multiple APIs (Genius, Musixmatch, Vagalume, AudD, KSoft, Lyrics.ovh, ChartLyrics)
-- then scrapes (letras.com, lyrics.com, musica.com)
-- optional YouTube captions
-- merges/dedupes
-- strips “Letra de … de …”, “intro”, “verse”, “coro”, etc.
-- expands Spanish/Mx SMS (q→que, xq→porque, pa→para, tmb→también, tec→etc)
-- NEW: lines like “CORO X2” / “coro x2” / “chorus x2” → repeat the previous stanza twice
+Now loads .env automatically (current dir + .env.local).
 """
 
 import os
@@ -28,6 +19,17 @@ import re
 import sys
 import argparse
 from typing import List, Dict, Optional
+
+# NEW: load .env first
+try:
+    from dotenv import load_dotenv  # type: ignore
+    # load default .env in cwd
+    load_dotenv()
+    # optional second file
+    load_dotenv(".env.local")
+except Exception:
+    # if python-dotenv isn't installed, we just skip it
+    pass
 
 try:
     import requests
@@ -40,10 +42,6 @@ DEFAULT_TIMEOUT = 12
 ENABLE_DEBUG = False
 ALLOW_PROMPTS = True
 
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 
 def debug(msg: str):
     if ENABLE_DEBUG:
@@ -155,8 +153,7 @@ def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
     """
     - drop 'Letra de ... de ...'
     - drop generic labels (intro, verse, coro, pre-chorus, bridge...)
-    - BUT: if line is 'coro x2' / 'chorus x2' (any case, with optional space), we
-      repeat the *previous stanza* twice (for sing-along)
+    - expand 'coro x2' / 'chorus x2' (any case): repeat previous stanza twice
     """
     if not text:
         return text
@@ -170,40 +167,34 @@ def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
 
     lines = text.splitlines()
     out_lines: List[str] = []
-    current_stanza: List[str] = []  # lines since last blank
+    current_stanza: List[str] = []
 
     coro_x2_pattern = re.compile(r"^(coro|chorus)\s*x\s*2\b[:.]?$", re.IGNORECASE)
 
     for raw_line in lines:
         stripped = raw_line.strip()
 
-        # 1) special case: CORO X2 / chorus x2
+        # expand "CORO X2"
         if coro_x2_pattern.match(stripped):
             if current_stanza:
-                # repeat the stanza twice
                 out_lines.extend(current_stanza)
                 out_lines.extend(current_stanza)
-            # do not output the label itself
             continue
 
-        # 2) drop "Letra de ..."
         if stripped.lower().startswith("letra de"):
             continue
 
-        # 3) drop simple labels
         if stripped.lower() in section_labels or stripped.lower().replace("-", " ") in section_labels:
             continue
 
-        # 4) otherwise, keep line
         out_lines.append(raw_line)
 
-        # maintain stanza buffer
         if stripped == "":
             current_stanza = []
         else:
             current_stanza.append(raw_line)
 
-    # collapse extra blanks
+    # collapse blanks
     final_lines: List[str] = []
     blank_counter = 0
     for l in out_lines:
@@ -242,9 +233,7 @@ def get_api_key(name: str, env_var: str) -> str:
         return ""
 
 
-# ---------------------------------------------------------------------------
-# providers (APIs)
-# ---------------------------------------------------------------------------
+# -------------------- providers -------------------- #
 
 def fetch_from_genius(artist: str, title: str) -> Optional[str]:
     token = os.getenv("GENIUS_ACCESS_TOKEN") or get_api_key("Genius API token", "GENIUS_ACCESS_TOKEN")
@@ -425,9 +414,7 @@ def fetch_from_chartlyrics(artist: str, title: str) -> Optional[str]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# scrapers
-# ---------------------------------------------------------------------------
+# -------------------- scrapers -------------------- #
 
 def scrape_letras_com(artist: str, title: str) -> Optional[str]:
     search_q = f"{artist} {title}".replace(" ", "+")
@@ -509,9 +496,7 @@ def scrape_musica_com(artist: str, title: str) -> Optional[str]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# youtube (optional)
-# ---------------------------------------------------------------------------
+# -------------------- youtube (optional) -------------------- #
 
 def fetch_from_youtube(artist: str, title: str) -> Optional[str]:
     ykey = os.getenv("YOUTUBE_API_KEY") or get_api_key("YouTube Data API key", "YOUTUBE_API_KEY")
@@ -570,9 +555,7 @@ def fetch_from_youtube(artist: str, title: str) -> Optional[str]:
     return "\n".join(text_lines).strip() if text_lines else None
 
 
-# ---------------------------------------------------------------------------
-# orchestrator
-# ---------------------------------------------------------------------------
+# -------------------- orchestrator -------------------- #
 
 def fetch_all_sources(artist: str, title: str) -> Dict[str, Optional[str]]:
     return {
@@ -632,13 +615,11 @@ def postprocess_lyrics(lyrics: str, title: str, artist: str, force_spanish: bool
     return lyrics.strip()
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# -------------------- CLI -------------------- #
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch lyrics from many sources, merge, clean, repeat CORO X2, normalize Spanish slang."
+        description="Fetch lyrics from many sources, merge, clean, repeat CORO X2, normalize Spanish slang, load .env."
     )
     parser.add_argument("--artist", help="Artist name")
     parser.add_argument("--title", help="Song title")
@@ -675,7 +656,6 @@ def main():
     force_spanish = (args.lang == "es")
     final_lyrics = postprocess_lyrics(merged, title=title, artist=artist, force_spanish=force_spanish)
 
-    # EXACT OUTPUT
     print(f"{title}//by//{artist}\n")
     print(final_lyrics)
 
