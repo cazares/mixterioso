@@ -6,23 +6,10 @@ Additive update:
 - can now emit karaoke-friendly CSV in the exact format of scar_tissue.csv:
   header: line,start
 - grouping is heuristic: time gap and max chars
-
-Example:
-python3 whisper_timing_pipeline.py \
-  --audio songs/scar_tissue.mp3 \
-  --artist "Red Hot Chili Peppers" \
-  --title "Scar Tissue" \
-  --use-demucs --demucs-model htdemucs_6s --demucs-latency 0.18 \
-  --out-json auto_lyrics/scar_tissue_whisper.json \
-  --out-csv  auto_lyrics/scar_tissue_words.csv \
-  --out-lines-csv auto_lyrics/scar_tissue.csv \
-  --gap-threshold 0.60 \
-  --max-chars 32
 """
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -53,20 +40,12 @@ def ensure_dir(path: str) -> None:
 
 
 def run_demucs(audio: str, model: str, out_dir: str) -> Optional[str]:
-        # unchanged
     if not have_program("demucs"):
         print("[demucs] not installed. skipping demucs step.", file=sys.stderr)
         return None
 
     print(f"[demucs] separating with model {model} ...")
-    cmd = [
-        "demucs",
-        "-n",
-        model,
-        "-o",
-        out_dir,
-        audio,
-    ]
+    cmd = ["demucs", "-n", model, "-o", out_dir, audio]
     code, out = run_cmd(cmd, capture=True)
     if code != 0:
         print("[demucs] failed:", out, file=sys.stderr)
@@ -76,7 +55,6 @@ def run_demucs(audio: str, model: str, out_dir: str) -> Optional[str]:
     candidates = list(out_path.rglob("vocals.*"))
     if not candidates:
         candidates = list(out_path.rglob("vocals.wav"))
-
     if not candidates:
         print("[demucs] vocals not found in output.", file=sys.stderr)
         return None
@@ -255,7 +233,7 @@ def extract_words_from_whisper(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "word": text,
                         "start": float(segment_start),
                         "end": float(segment_end),
-                        "conf": float(seg.get("avg_logprob", 0.0)),
+                        "conf": float(seg.get("avg_logprob", 0.0))),
                     }
                 )
     return words
@@ -277,10 +255,6 @@ def write_csv(words: List[Dict[str, Any]], csv_path: str) -> None:
 
 
 def group_words_to_lines(words: List[Dict[str, Any]], gap_threshold: float, max_chars: int) -> List[Dict[str, Any]]:
-    """
-    Turn word-level into line-level.
-    Output items: {"line": str, "start": float}
-    """
     lines: List[Dict[str, Any]] = []
     cur_words: List[str] = []
     cur_start: Optional[float] = None
@@ -336,41 +310,37 @@ def write_json(result: Dict[str, Any], json_path: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Preprocess song and run Whisper for accurate timings.")
-    ap.add_argument("--audio", required=True, help="Input audio file (song)")
-    ap.add_argument("--artist", default=None, help="Artist for initial prompt")
-    ap.add_argument("--title", default=None, help="Title for initial prompt")
-    ap.add_argument("--use-demucs", action="store_true", help="Run demucs to isolate vocals first")
-    ap.add_argument("--demucs-model", default="htdemucs_6s", help="Demucs model name")
-    ap.add_argument("--demucs-latency", type=float, default=None, help="Seconds to trim/offset from demucs vocal stem")
-    ap.add_argument("--model", default="large-v3", help="Whisper model name")
-    ap.add_argument("--language", default=None, help="Language code, e.g. en, es, pt")
-    ap.add_argument("--out-json", default=None, help="Where to write raw whisper json")
-    ap.add_argument("--out-csv", default=None, help="Where to write word-level csv")
-    ap.add_argument("--out-lines-csv", default=None, help="Where to write karaoke-style line,start csv")
-    ap.add_argument("--gap-threshold", type=float, default=0.60, help="seconds between words to force new line")
-    ap.add_argument("--max-chars", type=int, default=32, help="max chars per line before wrapping")
-    ap.add_argument("--no-whisperx", action="store_true", help="Disable whisperx even if installed")
+    ap.add_argument("--audio", required=True)
+    ap.add_argument("--artist", default=None)
+    ap.add_argument("--title", default=None)
+    ap.add_argument("--use-demucs", action="store_true")
+    ap.add_argument("--demucs-model", default="htdemucs_6s")
+    ap.add_argument("--demucs-latency", type=float, default=None)
+    ap.add_argument("--model", default="large-v3")
+    ap.add_argument("--language", default=None)
+    ap.add_argument("--out-json", default=None)
+    ap.add_argument("--out-csv", default=None)
+    ap.add_argument("--out-lines-csv", default=None)
+    ap.add_argument("--gap-threshold", type=float, default=0.60)
+    ap.add_argument("--max-chars", type=int, default=32)
+    ap.add_argument("--no-whisperx", action="store_true")
     args = ap.parse_args()
 
-    input_audio = args.audio
-    if not Path(input_audio).exists():
-        print(f"[err] audio file not found: {input_audio}", file=sys.stderr)
+    if not Path(args.audio).exists():
+        print(f"[err] audio file not found: {args.audio}", file=sys.stderr)
         sys.exit(1)
 
     workdir = tempfile.mkdtemp(prefix="whisper_timing_")
     print(f"[tmp] working dir: {workdir}")
 
     demucs_offset_applied = 0.0
-    audio_for_whisper = input_audio
+    audio_for_whisper = args.audio
 
     if args.use_demucs:
         demucs_out_dir = str(Path(workdir) / "demucs_out")
-        vocals = run_demucs(input_audio, args.demucs_model, demucs_out_dir)
+        vocals = run_demucs(args.audio, args.demucs_model, demucs_out_dir)
         if vocals:
-            if args.demucs_latency is not None:
-                latency = args.demucs_latency
-            else:
-                latency = KNOWN_DEMUCS_LATENCIES.get(args.demucs_model, 0.0)
+            latency = args.demucs_latency if args.demucs_latency is not None else KNOWN_DEMUCS_LATENCIES.get(args.demucs_model, 0.0)
             if latency > 0:
                 trimmed_vocals = str(Path(workdir) / "vocals_trimmed.wav")
                 vocals = ffmpeg_trim(vocals, trimmed_vocals, latency)
@@ -391,12 +361,6 @@ def main() -> None:
     initial_prompt = " ".join(prompt_parts)
 
     whisper_res = try_whisper(audio_for_whisper, args.model, args.language, initial_prompt)
-
-    aligned_res = None
-    if not args.no-whisperx:
-        aligned_res = try_whisperx_align(audio_for_whisper, whisper_res, args.language)
-
-        whisper_res = try_whisper(audio_for_whisper, args.model, args.language, initial_prompt)
 
     aligned_res = None
     if not args.no_whisperx:
@@ -424,4 +388,8 @@ def main() -> None:
         print(f"{w['start']:.3f}-{w['end']:.3f}: {w['word']} ({w['conf']:.3f})")
 
     print("[done]")
+
+
+if __name__ == "__main__":
+    main()
 # end of whisper_timing_pipeline.py
