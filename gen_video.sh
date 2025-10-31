@@ -1,18 +1,9 @@
 #!/usr/bin/env bash
 # gen_video.sh — pipeline: lyrics → audio → align → demucs → render (multi-variant)
 # now with:
-#  - intro screen
-#  - gap filler symbols
-#  - gap-threshold + gap-delay pass-through
-#  - REAL per-vocal-pct audio from demucs stems (when available)
-#  - ✅ REUSE EXISTING STEMS
-#  - ✅ PRE-NUKE output/<name>.mp4 if it's a dir/file
-#  - ✅ optional --car-font-size passthrough
-#  - ✅ accent-friendly slugify
-#  - ✅ YouTube: PASS POSITIONAL QUERY (no --artist/--title)
-#  - ✅ --force-audio, --force-align
-#  - ✅ --preview-seconds, --preview-interactive (forwarded to youtube_audio_picker.py)
-#  - ✅ 2025-10-31: prefer scripts/auto_lyrics_fetcher.py when present
+#  - prefer scripts/auto_lyrics_fetcher.py
+#  - VALIDATE existing lyrics; refetch if polluted or mismatched title/artist
+#  - if we refetch lyrics, nuke CSV so align re-runs
 
 set -euo pipefail
 
@@ -52,7 +43,7 @@ slugify() {
   printf '%s\n' "$s"
 }
 
-# deaccent but KEEP SPACES (for YouTube queries)
+# deaccent but KEEP SPACES (for YouTube queries and title match)
 deaccent_keep_spaces() {
   local s="$1"
   s=$(printf '%s' "$s" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')
@@ -76,7 +67,6 @@ find_demucs_bin() {
   echo ""
 }
 
-# detect existing stems for this song and reuse
 find_existing_stems_dir() {
   local stems_export_dir="$1"
   local audio_base="$2"
@@ -164,11 +154,6 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ $HAS_VOCAL_PCTS -eq 1 ] && [ $USER_SELECTED_STEMS -eq 1 ]; then
-  err "You can't mix --vocal-pcts with --vocals/--bass/--drums/--guitar. Pick one."
-  exit 1
-fi
-
 ARTIST_SLUG="$(slugify "$ARTIST")"
 TITLE_SLUG="$(slugify "$TITLE")"
 
@@ -182,22 +167,53 @@ mkdir -p "$STEMS_EXPORT_DIR"
 
 info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 
-# 1) lyrics ---------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 1) LYRICS (with validation)
+# ---------------------------------------------------------------------------
+need_fetch=1
 if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
-  info "[INFO] Lyrics already exist at $LYRICS_PATH — skipping fetch."
-else
+  # validate existing lyrics file
+  first_line="$(head -n1 "$LYRICS_PATH" | tr -d '\r')"
+  expected="${TITLE}//by//${ARTIST}"
+  plain_first="$(echo "$first_line" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
+  plain_expected="$(echo "$expected"   | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
+
+  if [ "$plain_first" = "$plain_expected" ]; then
+    # also check for bad/prose contamination
+    if grep -qi "valverde de lucerna" "$LYRICS_PATH" || \
+       grep -qi "ángela carballino" "$LYRICS_PATH" || \
+       grep -qi "don manuel bueno" "$LYRICS_PATH"; then
+      warn "[WARN] Existing lyrics look contaminated (novel/prose) — will refetch."
+      need_fetch=1
+    else
+      info "[INFO] Lyrics look good — reusing $LYRICS_PATH"
+      need_fetch=0
+    fi
+  else
+    warn "[WARN] Existing lyrics header mismatch:"
+    warn "       got:      '$first_line'"
+    warn "       expected: '$expected'"
+    need_fetch=1
+  fi
+fi
+
+if [ $need_fetch -eq 1 ]; then
   if [ -f "$SCRIPTS_DIR/auto_lyrics_fetcher.py" ]; then
     info ">>> Fetching lyrics (auto_lyrics_fetcher, accent-aware) for \"${TITLE}\" by ${ARTIST}..."
     if python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" --artist "$ARTIST" --title "$TITLE" --merge-strategy merge --no-prompt > "$LYRICS_PATH"; then
       ok "[OK] Lyrics saved to $LYRICS_PATH (auto_lyrics_fetcher.py)"
+      # because we fixed lyrics, drop old CSV so align re-runs:
+      rm -f "$CSV_PATH"
     else
       warn "[WARN] auto_lyrics_fetcher.py failed — falling back to legacy lyrics fetcher."
       if [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
         python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
         ok "[OK] Lyrics saved to $LYRICS_PATH"
+        rm -f "$CSV_PATH"
       elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
         python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
         ok "[OK] Lyrics saved to $LYRICS_PATH"
+        rm -f "$CSV_PATH"
       else
         err "[ERROR] no lyrics fetcher found."
         exit 1
@@ -207,17 +223,21 @@ else
     info ">>> Fetching lyrics (smart) for \"${TITLE}\" by ${ARTIST}..."
     python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
     ok "[OK] Lyrics saved to $LYRICS_PATH"
+    rm -f "$CSV_PATH"
   elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
     info ">>> Fetching lyrics for \"${TITLE}\" by ${ARTIST}..."
     python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
     ok "[OK] Lyrics saved to $LYRICS_PATH"
+    rm -f "$CSV_PATH"
   else
     err "[ERROR] no lyrics fetcher found."
     exit 1
   fi
 fi
 
-# 2) audio from YouTube ----------------------------------------------------
+# ---------------------------------------------------------------------------
+# 2) AUDIO (YouTube) — unchanged
+# ---------------------------------------------------------------------------
 NEED_AUDIO=1
 if [ -f "$AUDIO_PATH" ] && [ $FORCE_AUDIO -eq 0 ]; then
   info "[INFO] Audio already exists at $AUDIO_PATH — skipping YouTube download."
