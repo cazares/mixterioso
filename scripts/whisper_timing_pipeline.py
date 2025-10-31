@@ -14,9 +14,8 @@ Pipeline:
   - karaoke txt (no blank lines)
 
 Additive:
-- --lyrics-txt makes the TXT the source of truth
-- lines that fail to match are snapped forward to the next available ASR word,
-  not held at the previous time, so repeated lines right after each other do not collide
+- --lyrics-txt = source-of-truth
+- unmatched lines snap forward to next ASR word (prevents 23.96 collisions)
 """
 
 import argparse
@@ -36,10 +35,10 @@ KNOWN_DEMUCS_LATENCIES = {
 
 
 def run_cmd(cmd: List[str], cwd: Optional[str] = None, capture: bool = False) -> Tuple[int, str]:
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=capture, text=True)
+    p = subprocess.run(cmd, cwd=cwd, capture_output=capture, text=True)
     if capture:
-        return proc.returncode, proc.stdout + proc.stderr
-    return proc.returncode, ""
+        return p.returncode, p.stdout + p.stderr
+    return p.returncode, ""
 
 
 def have_program(name: str) -> bool:
@@ -52,30 +51,31 @@ def ensure_dir(path: str) -> None:
 
 def run_demucs(audio: str, model: str, out_dir: str) -> Optional[str]:
     if not have_program("demucs"):
-        print("[demucs] not installed. skipping demucs step.", file=sys.stderr)
+        print("[demucs] not installed. skipping.", file=sys.stderr)
         return None
-    print(f"[demucs] separating with model {model} ...")
-    cmd = ["demucs", "-n", model, "-o", out_dir, audio]
-    code, out = run_cmd(cmd, capture=True)
+    print(f"[demucs] separating with model {model} …")
+    code, out = run_cmd(["demucs", "-n", model, "-o", out_dir, audio], capture=True)
     if code != 0:
         print("[demucs] failed:", out, file=sys.stderr)
         return None
     out_path = Path(out_dir)
-    candidates = list(out_path.rglob("vocals.*"))
-    if not candidates:
-        candidates = list(out_path.rglob("vocals.wav"))
-    if not candidates:
-        print("[demucs] vocals not found in output.", file=sys.stderr)
+    cands = list(out_path.rglob("vocals.*"))
+    if not cands:
+        cands = list(out_path.rglob("vocals.wav"))
+    if not cands:
+        print("[demucs] vocals.* not found.", file=sys.stderr)
         return None
-    vocals_path = str(candidates[0])
-    print(f"[demucs] got vocals at {vocals_path}")
-    return vocals_path
+    v = str(cands[0])
+    print(f"[demucs] got vocals at {v}")
+    return v
 
 
 def ffmpeg_trim(in_path: str, out_path: str, offset_s: float) -> str:
-    print(f"[ffmpeg] trimming {offset_s} seconds from demucs stem …")
-    cmd = ["ffmpeg", "-y", "-ss", f"{offset_s:.3f}", "-i", in_path, "-acodec", "pcm_s16le", out_path]
-    code, out = run_cmd(cmd, capture=True)
+    print(f"[ffmpeg] trimming {offset_s:.3f}s …")
+    code, out = run_cmd(
+        ["ffmpeg", "-y", "-ss", f"{offset_s:.3f}", "-i", in_path, "-acodec", "pcm_s16le", out_path],
+        capture=True,
+    )
     if code != 0:
         print("[ffmpeg] trim failed:", out, file=sys.stderr)
         return in_path
@@ -85,8 +85,10 @@ def ffmpeg_trim(in_path: str, out_path: str, offset_s: float) -> str:
 def ffmpeg_to_mono16k_loudnorm(in_path: str, out_path: str) -> str:
     print("[ffmpeg] creating mono, 16kHz, loudnorm version …")
     af = "pan=mono|c0=0.5*c0+0.5*c1,loudnorm=I=-16:LRA=11:TP=-1.5"
-    cmd = ["ffmpeg", "-y", "-i", in_path, "-af", af, "-ar", "16000", "-ac", "1", out_path]
-    code, out = run_cmd(cmd, capture=True)
+    code, out = run_cmd(
+        ["ffmpeg", "-y", "-i", in_path, "-af", af, "-ar", "16000", "-ac", "1", out_path],
+        capture=True,
+    )
     if code != 0:
         print("[ffmpeg] mono/loudnorm failed:", out, file=sys.stderr)
         return in_path
@@ -98,20 +100,20 @@ def run_whisper_python(audio_path: str, model_name: str, language: Optional[str]
         import whisper  # type: ignore
     except ImportError:
         return None
-    print(f"[whisper(py)] loading model {model_name} …")
+    print(f"[whisper(py)] loading {model_name} …")
     model = whisper.load_model(model_name)
     print("[whisper(py)] transcribing …")
-    kwargs: Dict[str, Any] = {"word_timestamps": True, "condition_on_previous_text": False}
+    kw: Dict[str, Any] = {"word_timestamps": True, "condition_on_previous_text": False}
     if language:
-        kwargs["language"] = language
+        kw["language"] = language
     if prompt:
-        kwargs["initial_prompt"] = prompt
-    return model.transcribe(audio_path, **kwargs)
+        kw["initial_prompt"] = prompt
+    return model.transcribe(audio_path, **kw)
 
 
 def run_whisper_cli(audio_path: str, model_name: str, language: Optional[str], prompt: Optional[str]) -> Optional[Dict[str, Any]]:
     if not have_program("whisper"):
-        print("[whisper(cli)] not installed. cannot run whisper.", file=sys.stderr)
+        print("[whisper(cli)] not installed.", file=sys.stderr)
         return None
     tmpdir = tempfile.mkdtemp(prefix="whisper_cli_")
     cmd = [
@@ -135,20 +137,19 @@ def run_whisper_cli(audio_path: str, model_name: str, language: Optional[str], p
         "5",
     ]
     if language:
-        cmd.extend(["--language", language])
+        cmd += ["--language", language]
     if prompt:
-        cmd.extend(["--initial_prompt", prompt])
+        cmd += ["--initial_prompt", prompt]
     print("[whisper(cli)] running …")
     code, out = run_cmd(cmd, capture=True)
     if code != 0:
         print("[whisper(cli)] failed:", out, file=sys.stderr)
         return None
-    json_files = list(Path(tmpdir).glob("*.json"))
-    if not json_files:
-        print("[whisper(cli)] no json output produced.", file=sys.stderr)
+    js = list(Path(tmpdir).glob("*.json"))
+    if not js:
+        print("[whisper(cli)] no json output.", file=sys.stderr)
         return None
-    with open(json_files[0], "r", encoding="utf-8") as f:
-        return json.load(f)
+    return json.loads(js[0].read_text(encoding="utf-8"))
 
 
 def try_whisper(audio_path: str, model_name: str, language: Optional[str], prompt: Optional[str]) -> Dict[str, Any]:
@@ -158,7 +159,7 @@ def try_whisper(audio_path: str, model_name: str, language: Optional[str], promp
     res = run_whisper_cli(audio_path, model_name, language, prompt)
     if res is not None:
         return res
-    raise RuntimeError("Neither Python whisper nor CLI whisper is available.")
+    raise RuntimeError("no whisper backend")
 
 
 def try_whisperx_align(audio_path: str, whisper_result: Dict[str, Any], language: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -166,10 +167,10 @@ def try_whisperx_align(audio_path: str, whisper_result: Dict[str, Any], language
         import torch  # type: ignore
         import whisperx  # type: ignore
     except ImportError:
-        print("[whisperx] not installed. skipping alignment.", file=sys.stderr)
+        print("[whisperx] not installed. skipping.", file=sys.stderr)
         return None
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[whisperx] loading model on {device} …")
+    print(f"[whisperx] loading on {device} …")
     if language is None:
         language = whisper_result.get("language", "en")
     model = whisperx.load_model("large-v3", device)
@@ -259,22 +260,22 @@ def write_lines_csv(lines: List[Dict[str, Any]], out_path: str) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("line,start\n")
         for L in lines:
-            text = L["line"].strip()
-            if not text:
+            t = L["line"].strip()
+            if not t:
                 continue
-            f.write(f"{text},{L['start']:.3f}\n")
-    print(f"[out] wrote karaoke-style CSV to {out_path}")
+            f.write(f"{t},{L['start']:.3f}\n")
+    print(f"[out] wrote karaoke CSV to {out_path}")
 
 
 def write_lines_txt(lines: List[Dict[str, Any]], out_path: str) -> None:
     ensure_dir(out_path)
     with open(out_path, "w", encoding="utf-8") as f:
         for L in lines:
-            text = L["line"].strip()
-            if not text:
+            t = L["line"].strip()
+            if not t:
                 continue
-            f.write(text + "\n")
-    print(f"[out] wrote karaoke-style TXT to {out_path}")
+            f.write(t + "\n")
+    print(f"[out] wrote karaoke TXT to {out_path}")
 
 
 _WORD_RE = re.compile(r"[a-z0-9áéíóúüñ']+", re.IGNORECASE)
@@ -299,7 +300,8 @@ def _search_range(
     skip_max: int,
 ) -> Optional[Tuple[float, int, int]]:
     best = None
-    for k in range(start_i, min(end_i, len(W))):
+    upper = min(end_i, len(W))
+    for k in range(start_i, upper):
         if W[k] != tokens[0]:
             continue
         m = 1
@@ -344,16 +346,16 @@ def align_txt_lines_to_words(
         if not tokens:
             out.append({"line": line, "start": last_ts})
             continue
-        # tight window: from wi until last_ts+local_dt
+        # tight window near last_ts
         tight_end_ts = last_ts + local_dt
         tight_end_idx = wi
         while tight_end_idx < len(words) and words[tight_end_idx]["start"] <= tight_end_ts:
             tight_end_idx += 1
         best = _search_range(W, words, tokens, wi, tight_end_idx, skip_max)
-        # if tight fails, try wide
+        # wide window
         if not best or best[0] < min_cover:
-            wide_end_i = min(len(W), wi + search_ahead)
-            best = _search_range(W, words, tokens, wi, wide_end_i, skip_max)
+            wide_end_idx = min(len(W), wi + search_ahead)
+            best = _search_range(W, words, tokens, wi, wide_end_idx, skip_max)
         if best and best[0] >= min_cover:
             _, si, ei = best
             ts = words[si]["start"]
@@ -364,7 +366,7 @@ def align_txt_lines_to_words(
             else:
                 wi = min(ei + 1, si + search_ahead)
         else:
-            # snap forward to next actual word time
+            # snap forward to next actual word
             snap_ts = last_ts
             for ww in words:
                 if ww["start"] > last_ts:
@@ -399,7 +401,7 @@ def main() -> None:
     ap.add_argument("--gap-threshold", type=float, default=0.60)
     ap.add_argument("--max-chars", type=int, default=32)
     ap.add_argument("--no-whisperx", action="store_true")
-    ap.add_argument("--lyrics-txt", default=None, help="source-of-truth line-by-line lyrics")
+    ap.add_argument("--lyrics-txt", default=None)
     args = ap.parse_args()
 
     if not Path(args.audio).exists():
@@ -412,21 +414,21 @@ def main() -> None:
     demucs_offset_applied = 0.0
     audio_for_whisper = args.audio
 
-    if args.use-demucs:
-        demucs_out_dir = str(Path(workdir) / "demucs_out")
-        vocals = run_demucs(args.audio, args.demucs_model, demucs_out_dir)
+    if args.use_demucs:
+        d_out = str(Path(workdir) / "demucs_out")
+        vocals = run_demucs(args.audio, args.demucs_model, d_out)
         if vocals:
             if args.demucs_latency is not None:
                 latency = args.demucs_latency
             else:
                 latency = KNOWN_DEMUCS_LATENCIES.get(args.demucs_model, 0.0)
             if latency > 0:
-                trimmed_vocals = str(Path(workdir) / "vocals_trimmed.wav")
-                vocals = ffmpeg_trim(vocals, trimmed_vocals, latency)
+                trimmed = str(Path(workdir) / "vocals_trimmed.wav")
+                vocals = ffmpeg_trim(vocals, trimmed, latency)
                 demucs_offset_applied = latency
             audio_for_whisper = vocals
         else:
-            print("[demucs] using original audio since demucs failed.", file=sys.stderr)
+            print("[demucs] falling back to original audio.", file=sys.stderr)
 
     proc_audio = str(Path(workdir) / "mono16k.wav")
     audio_for_whisper = ffmpeg_to_mono16k_loudnorm(audio_for_whisper, proc_audio)
@@ -449,7 +451,7 @@ def main() -> None:
     words = extract_words_from_whisper(result_to_use)
 
     if demucs_offset_applied != 0.0:
-        print(f"[offset] re-applying demucs offset {demucs_offset_applied:.3f}s to all tokens.")
+        print(f"[offset] applying demucs offset {demucs_offset_applied:.3f}s …")
         apply_offset(words, demucs_offset_applied)
 
     if args.out_csv:
@@ -458,11 +460,11 @@ def main() -> None:
     if args.lyrics_txt:
         src = Path(args.lyrics_txt)
         if src.exists():
-            print(f"[lines] using source-of-truth TXT: {args.lyrics_txt}")
+            print(f"[lines] using source TXT: {args.lyrics_txt}")
             raw_lines = src.read_text(encoding="utf-8").splitlines()
             lines = align_txt_lines_to_words(words, raw_lines)
         else:
-            print(f"[lines] WARNING: {args.lyrics_txt} not found; falling back to auto grouping.")
+            print(f"[lines] {args.lyrics_txt} not found, auto-grouping.", file=sys.stderr)
             lines = group_words_to_lines(words, args.gap_threshold, args.max_chars)
     else:
         lines = group_words_to_lines(words, args.gap_threshold, args.max_chars)
