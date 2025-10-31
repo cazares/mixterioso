@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # gen_video.sh — pipeline: lyrics → audio → align → demucs → render (multi-variant)
-# generic + intro-hold (feature-detected)
+# now with:
+#  - prefer scripts/auto_lyrics_fetcher.py
+#  - VALIDATE existing lyrics; refetch if title/artist header mismatch
+#  - CSV nuked when lyrics refetched
+#  - **RENDER ALWAYS USES MONO (48k) AS SOURCE OF TRUTH**
 
 set -euo pipefail
 
@@ -66,7 +70,6 @@ find_demucs_bin() {
 find_existing_stems_dir() {
   local stems_export_dir="$1"
   local audio_base="$2"
-
   if [ -d "$stems_export_dir/htdemucs_6s/$audio_base" ]; then
     echo "$stems_export_dir/htdemucs_6s/$audio_base"; return
   fi
@@ -78,7 +81,7 @@ find_existing_stems_dir() {
 
 # --- args -----------------------------------------------------------------
 if [ $# -lt 2 ]; then
-  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--car-font-size N] [--max-chars N] [--offset-video SEC] [--extra-delay SEC] [--hpad-pct N] [--valign ...] [--vocal-pcts \"0 20 100\"] [--gap-threshold 5.0] [--gap-delay 2.0] [--force-audio] [--force-align] [--preview-seconds N] [--preview-interactive] [--intro-hold SEC]"
+  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--car-font-size N] [--max-chars N] [--offset-video SEC] [--extra-delay SEC] [--hpad-pct N] [--valign ...] [--vocal-pcts \"0 20 100\"] [--gap-threshold 5.0] [--gap-delay 2.0] [--force-audio] [--force-align] [--preview-seconds N] [--preview-interactive]"
   exit 1
 fi
 
@@ -94,7 +97,6 @@ HPAD_PCT=6
 VALIGN=middle
 GAP_THRESHOLD=5.0
 GAP_DELAY=2.0
-INTRO_HOLD=5.0   # default 5s
 
 HAS_VOCAL_PCTS=0
 VOCAL_PCTS_STR=""
@@ -121,7 +123,6 @@ while [ $# -gt 0 ]; do
     --valign)        VALIGN="$2"; shift 2;;
     --gap-threshold) GAP_THRESHOLD="$2"; shift 2;;
     --gap-delay)     GAP_DELAY="$2"; shift 2;;
-    --intro-hold)    INTRO_HOLD="$2"; shift 2;;
     --vocal-pcts)
       HAS_VOCAL_PCTS=1
       VOCAL_PCTS_STR="$2"
@@ -166,43 +167,20 @@ mkdir -p "$STEMS_EXPORT_DIR"
 info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 
 # ---------------------------------------------------------------------------
-# 1) LYRICS (generic validation)
+# 1) LYRICS
 # ---------------------------------------------------------------------------
 need_fetch=1
-looks_like_lyrics() {
-  local path="$1"
-  local line_count
-  line_count=$(wc -l < "$path" | tr -d ' ')
-  if [ "$line_count" -lt 3 ]; then
-    return 1
-  fi
-  local size_bytes
-  size_bytes=$(stat -f%z "$path" 2>/dev/null || stat -c%s "$path")
-  if [ "$size_bytes" -gt 65535 ]; then
-    return 1
-  fi
-  local long_lines
-  long_lines=$(awk 'length>170{c++} END{print c+0}' "$path")
-  if [ "$line_count" -gt 0 ]; then
-    local pct=$(( long_lines * 100 / line_count ))
-    if [ "$pct" -gt 40 ]; then
-      return 1
-    fi
-  fi
-  return 0
-}
-
 if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
   first_line="$(head -n1 "$LYRICS_PATH" | tr -d '\r')"
   expected="${TITLE}//by//${ARTIST}"
-  plain_first="$(echo "$first_line"   | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
-  plain_expected="$(echo "$expected" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
-
-  if [ "$plain_first" = "$plain_expected" ] && looks_like_lyrics "$LYRICS_PATH"; then
+  # deaccent both
+  plain_first="$(echo "$first_line" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
+  plain_expected="$(echo "$expected"   | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
+  if [ "$plain_first" = "$plain_expected" ]; then
     info "[INFO] Lyrics look good — reusing $LYRICS_PATH"
     need_fetch=0
   else
-    warn "[WARN] Existing lyrics failed generic checks — will refetch."
+    warn "[WARN] Existing lyrics header mismatch — will refetch."
     need_fetch=1
   fi
 fi
@@ -214,7 +192,7 @@ if [ $need_fetch -eq 1 ]; then
       ok "[OK] Lyrics saved to $LYRICS_PATH (auto_lyrics_fetcher.py)"
       rm -f "$CSV_PATH"
     else
-      warn "[WARN] auto_lyrics_fetcher.py failed — falling back to legacy lyrics fetcher."
+      warn "[WARN] auto_lyrics_fetcher.py failed — falling back."
       if [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
         python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
         ok "[OK] Lyrics saved to $LYRICS_PATH"
@@ -229,18 +207,8 @@ if [ $need_fetch -eq 1 ]; then
       fi
     fi
   else
-    if [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
-      python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
-      ok "[OK] Lyrics saved to $LYRICS_PATH"
-      rm -f "$CSV_PATH"
-    elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
-      python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
-      ok "[OK] Lyrics saved to $LYRICS_PATH"
-      rm -f "$CSV_PATH"
-    else
-      err "[ERROR] no lyrics fetcher found."
-      exit 1
-    fi
+    err "[ERROR] scripts/auto_lyrics_fetcher.py not found and no fallbacks."
+    exit 1
   fi
 fi
 
@@ -282,7 +250,7 @@ if [ $NEED_AUDIO -eq 1 ]; then
   fi
 fi
 
-# 2b) TRUE MONO ------------------------------------------------------------
+# 2b) TRUE MONO (source of truth for align + render) -----------------------
 if [ -f "$AUDIO_MONO_PATH" ]; then
   if [ $FORCE_AUDIO -eq 1 ] || [ "$AUDIO_PATH" -nt "$AUDIO_MONO_PATH" ]; then
     info ">>> Source MP3 is newer (or --force-audio) — re-converting to TRUE MONO..."
@@ -296,6 +264,9 @@ else
   ffmpeg -y -i "$AUDIO_PATH" -ac 1 -ar 48000 -b:a 192k "$AUDIO_MONO_PATH" >/dev/null 2>&1
   ok "[OK] Mono audio at $AUDIO_MONO_PATH"
 fi
+
+# IMPORTANT: from here on, render MUST use this:
+RENDER_AUDIO="$AUDIO_MONO_PATH"
 
 # 3) align -----------------------------------------------------------------
 if [ -f "$CSV_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
@@ -330,7 +301,6 @@ if [ -n "$DEMUCS_BIN" ]; then
   else
     info ">>> [DEMUCS] Running separation (6 → 4 → 2) …"
     DEMUCS_BASE_OUT="$STEMS_EXPORT_DIR"
-
     if $DEMUCS_BIN -n htdemucs_6s -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH" 2>&1 | tee "$DEMUCS_BASE_OUT/demucs_6s.log"; then
       BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs_6s/$AUDIO_BASE_NOEXT"
       ok "[OK] Demucs 6-stem succeeded → $BEST_STEMS_DIR"
@@ -345,7 +315,7 @@ if [ -n "$DEMUCS_BIN" ]; then
           BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs/$AUDIO_BASE_NOEXT"
           ok "[OK] Demucs 2-stem succeeded → $BEST_STEMS_DIR"
         else
-          err "[ERROR] All demucs attempts failed — will use mono for ALL variants."
+          warn "[WARN] All demucs attempts failed — will use mono for ALL variants."
           BEST_STEMS_DIR=""
         fi
       fi
@@ -366,20 +336,14 @@ fi
 
 info ">>> Rendering karaoke video(s): ${RENDER_PCTS[*]}"
 
-# 5.5) detect whether render_from_csv.py supports --intro-hold -------------
-RENDER_SUPPORTS_INTRO=0
-if python3 "$SCRIPTS_DIR/render_from_csv.py" --help 2>/dev/null | grep -q -- "--intro-hold"; then
-  RENDER_SUPPORTS_INTRO=1
-fi
-
-# 6) per-pct: build audio --------------------------------------------------
+# 6) per-pct: build audio (still done, but video uses mono) ----------------
 MIXED_AUDIO_DIR="$SONGS_DIR/mixed"
 mkdir -p "$MIXED_AUDIO_DIR"
 
 for pct in "${RENDER_PCTS[@]}"; do
   OUT_NAME="${ARTIST_SLUG}-${TITLE_SLUG}_v${pct}"
-  AUDIO_FOR_THIS="$AUDIO_MONO_PATH"
 
+  # we still TRY to build a pct mix (for future use), but not used for render
   if [ -n "${BEST_STEMS_DIR:-}" ] && [ -d "$BEST_STEMS_DIR" ]; then
     inputs=()
     filters=()
@@ -420,20 +384,15 @@ EOF
       MIXED_PATH="$MIXED_AUDIO_DIR/${TITLE_SLUG}_v${pct}.wav"
       info "[MIX] building mix for ${pct}% → $MIXED_PATH"
 
-      if ffmpeg -y "${inputs[@]}" -filter_complex "$fc" -map "[outa]" -ar 48000 -ac 1 -b:a 192k "$MIXED_PATH" >/dev/null 2>&1; then
-        AUDIO_FOR_THIS="$MIXED_PATH"
-      else
-        warn "[WARN] mix for ${pct}% failed, falling back to mono."
-        AUDIO_FOR_THIS="$AUDIO_MONO_PATH"
+      if ! ffmpeg -y "${inputs[@]}" -filter_complex "$fc" -map "[outa]" -ar 48000 -ac 1 -b:a 192k "$MIXED_PATH" >/dev/null 2>&1; then
+        warn "[WARN] mix for ${pct}% failed, ignoring (we will render with mono)."
       fi
     else
-      warn "[WARN] demucs produced no usable stems — falling back to mono."
-      AUDIO_FOR_THIS="$AUDIO_MONO_PATH"
+      warn "[WARN] demucs produced no usable stems — skipping mix build."
     fi
-  else
-    warn "[WARN] No demucs stems — ${pct}% will sound same as others."
   fi
 
+  # PRE-NUKE bad existing output (file OR directory)
   FINAL_MP4="$OUTPUT_DIR/${OUT_NAME}.mp4"
   if [ -d "$FINAL_MP4" ]; then
     warn "[CLEANUP] $FINAL_MP4 was a directory — removing it so we can write the mp4."
@@ -443,35 +402,25 @@ EOF
     rm -f "$FINAL_MP4"
   fi
 
-  PY_ARGS=(
-    "$SCRIPTS_DIR/render_from_csv.py"
-    --csv "$CSV_PATH"
-    --audio "$AUDIO_FOR_THIS"
-    --font-size "$FONT_SIZE"
-    --repo-root "$ROOT"
-    --offset-video "$OFFSET_VIDEO"
-    --extra-delay "$EXTRA_DELAY"
-    --hpad-pct "$HPAD_PCT"
-    --valign "$VALIGN"
-    --output-name "$OUT_NAME"
-    --max-chars "$MAX_CHARS"
-    --artist "$ARTIST"
-    --title "$TITLE"
-    --gap-threshold "$GAP_THRESHOLD"
-    --gap-delay "$GAP_DELAY"
+  # RENDER: **force** using RENDER_AUDIO (mono, 48k, align source-of-truth)
+  python3 "$SCRIPTS_DIR/render_from_csv.py" \
+    --csv "$CSV_PATH" \
+    --audio "$RENDER_AUDIO" \
+    --font-size "$FONT_SIZE" \
+    --repo-root "$ROOT" \
+    --offset-video "$OFFSET_VIDEO" \
+    --extra-delay "$EXTRA_DELAY" \
+    --hpad-pct "$HPAD_PCT" \
+    --valign "$VALIGN" \
+    --output-name "$OUT_NAME" \
+    --max-chars "$MAX_CHARS" \
+    --artist "$ARTIST" \
+    --title "$TITLE" \
+    --gap-threshold "$GAP_THRESHOLD" \
+    --gap-delay "$GAP_DELAY" \
+    ${CAR_FONT_SIZE:+--car-font-size "$CAR_FONT_SIZE"} \
     --no-open
-  )
 
-  if [ -n "$CAR_FONT_SIZE" ]; then
-    PY_ARGS+=( --car-font-size "$CAR_FONT_SIZE" )
-  fi
-
-  # only pass --intro-hold if python script supports it
-  if [ $RENDER_SUPPORTS_INTRO -eq 1 ]; then
-    PY_ARGS+=( --intro-hold "$INTRO_HOLD" )
-  fi
-
-  python3 "${PY_ARGS[@]}"
 done
 
 ok "[DONE] Karaoke video(s) for ${ARTIST} – \"${TITLE}\" are in $OUTPUT_DIR/"
