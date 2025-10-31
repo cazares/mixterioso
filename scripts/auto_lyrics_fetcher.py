@@ -11,11 +11,11 @@ Output (strict):
 
     <clean, merged, normalized lyrics...>
 
-Now with:
-- verbose .env loading (tells you EXACTLY which files it tried)
-- warns if python-dotenv is NOT installed (your case right now)
-- prints which env vars were finally seen
-- still colorized
+Now:
+- if python-dotenv is missing, we still read .env manually
+- we map GENIUS_TOKEN -> GENIUS_ACCESS_TOKEN
+- we ignore empty values like MUSIXMATCH_API_KEY=
+- we colorize console output
 """
 
 import os
@@ -39,10 +39,38 @@ DOTENV_OK = False
 ENV_FILES_TRIED: List[str] = []
 
 
+def _manual_load_env_file(path: Path) -> None:
+    """Very small .env parser for when python-dotenv is not installed."""
+    if not path.exists():
+        return
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                # strip optional quotes
+                if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                    val = val[1:-1]
+                # ignore empty values
+                if val == "":
+                    continue
+                # set in env if not already there
+                os.environ.setdefault(key, val)
+    except Exception:
+        pass
+
+
 def _load_envs() -> None:
     """
-    Try to load .env from several places, and record what we tried.
-    If python-dotenv is missing, print a colored hint.
+    Try to load .env from several places. If python-dotenv is missing, fall back
+    to manual parsing.
+    Also normalize GENIUS_TOKEN -> GENIUS_ACCESS_TOKEN.
     """
     global DOTENV_OK, ENV_FILES_TRIED
     cwd = Path.cwd()
@@ -57,27 +85,45 @@ def _load_envs() -> None:
         script_dir / ".env.local",
         repo_root / ".env",
         repo_root / ".env.local",
-        Path.home() / ".env",  # just in case you keep it in ~
+        Path.home() / ".env",
     ]
 
     try:
         from dotenv import load_dotenv  # type: ignore
     except Exception:
-        # this is almost certainly why your run said "missing" even though you have .env
-        print(
-            f"{C_RED}[env] python-dotenv is NOT installed in this env. "
-            f"Run: pip3 install python-dotenv{C_RESET}",
-            file=sys.stderr,
-        )
+        # python-dotenv not installed; do manual
         for p in candidates:
             ENV_FILES_TRIED.append(str(p))
+            _manual_load_env_file(p)
+        # after manual load, we can normalize names
+        _normalize_env_aliases()
         return
 
+    # if we get here, python-dotenv is available
     DOTENV_OK = True
     for p in candidates:
         ENV_FILES_TRIED.append(str(p))
         if p.exists():
             load_dotenv(p)
+    _normalize_env_aliases()
+
+
+def _normalize_env_aliases() -> None:
+    """
+    Map alt names to the ones the script uses.
+    e.g. GENIUS_TOKEN -> GENIUS_ACCESS_TOKEN
+    """
+    # genius
+    if not os.getenv("GENIUS_ACCESS_TOKEN"):
+        alt = os.getenv("GENIUS_TOKEN") or os.getenv("GENIUS_API_TOKEN")
+        if alt:
+            os.environ["GENIUS_ACCESS_TOKEN"] = alt
+
+    # youtube sometimes is GOOGLE_API_KEY or YT_API_KEY
+    if not os.getenv("YOUTUBE_API_KEY"):
+        alt = os.getenv("GOOGLE_API_KEY") or os.getenv("YT_API_KEY")
+        if alt:
+            os.environ["YOUTUBE_API_KEY"] = alt
 
 
 _load_envs()
@@ -88,7 +134,7 @@ except ImportError:
     print("This script needs 'requests'. Install with: pip3 install requests")
     sys.exit(1)
 
-USER_AGENT = "auto-lyrics-fetcher/1.4 (karaoke-time)"
+USER_AGENT = "auto-lyrics-fetcher/1.5 (karaoke-time)"
 DEFAULT_TIMEOUT = 12
 ENABLE_DEBUG = False
 ALLOW_PROMPTS = True
@@ -201,9 +247,6 @@ def clean_lyrics_junk(text: str) -> str:
 
 
 def normalize_sections_and_headers(text: str, title: str, artist: str) -> str:
-    """
-    Drop junk + expand CORO X2 / CHORUS X2 into previous stanza twice.
-    """
     if not text:
         return text
 
@@ -278,7 +321,7 @@ def _mask_val(v: str) -> str:
 def print_env_status() -> None:
     print(f"{C_CYAN}[env] .env load status:{C_RESET}", file=sys.stderr)
     if not DOTENV_OK:
-        print(f"{C_RED}[env] python-dotenv NOT installed, so .env was NOT actually loaded.{C_RESET}", file=sys.stderr)
+        print(f"{C_YELLOW}[env] python-dotenv NOT installed; used manual parser instead.{C_RESET}", file=sys.stderr)
     print(f"{C_YELLOW}[env] tried files:{C_RESET}", file=sys.stderr)
     for p in ENV_FILES_TRIED:
         print(f"  - {p}", file=sys.stderr)
@@ -298,7 +341,6 @@ def print_env_status() -> None:
         else:
             print(f"{C_RED}[env] {k}: missing{C_RESET}", file=sys.stderr)
 
-    # extra: show *any* env that looks like genius/youtube so we can spot misnamed vars
     possibles = [x for x in os.environ.keys() if "GENIUS" in x.upper() or "YOUTUBE" in x.upper()]
     if possibles:
         print(f"{C_MAG}[env] other GENIUS/YOUTUBE-like vars I see:{C_RESET}", file=sys.stderr)
@@ -715,7 +757,7 @@ def postprocess_lyrics(lyrics: str, title: str, artist: str, force_spanish: bool
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch lyrics from many sources, merge, clean, expand CORO X2, load .env, colorize env status."
+        description="Fetch lyrics from many sources, merge, clean, expand CORO X2, load .env (even without python-dotenv), colorize env status."
     )
     parser.add_argument("--artist", help="Artist name")
     parser.add_argument("--title", help="Song title")
@@ -730,7 +772,6 @@ def main():
     if args.no_prompt:
         ALLOW_PROMPTS = False
 
-    # show env situation UP FRONT
     print_env_status()
 
     artist = args.artist or input("Artist: ").strip()
