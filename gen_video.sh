@@ -4,6 +4,7 @@
 #  - prefer scripts/auto_lyrics_fetcher.py
 #  - VALIDATE existing lyrics generically (no artist/song-specific strings)
 #  - if we refetch lyrics, nuke CSV so align re-runs
+#  - HOLD INTRO (title/artist slide) for 5.0s by default before lyrics/notes
 
 set -euo pipefail
 
@@ -67,7 +68,6 @@ find_demucs_bin() {
   echo ""
 }
 
-# detect existing stems for this song and reuse
 find_existing_stems_dir() {
   local stems_export_dir="$1"
   local audio_base="$2"
@@ -83,7 +83,7 @@ find_existing_stems_dir() {
 
 # --- args -----------------------------------------------------------------
 if [ $# -lt 2 ]; then
-  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--car-font-size N] [--max-chars N] [--offset-video SEC] [--extra-delay SEC] [--hpad-pct N] [--valign ...] [--vocal-pcts \"0 20 100\"] [--gap-threshold 5.0] [--gap-delay 2.0] [--force-audio] [--force-align] [--preview-seconds N] [--preview-interactive]"
+  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--car-font-size N] [--max-chars N] [--offset-video SEC] [--extra-delay SEC] [--hpad-pct N] [--valign ...] [--vocal-pcts \"0 20 100\"] [--gap-threshold 5.0] [--gap-delay 2.0] [--force-audio] [--force-align] [--preview-seconds N] [--preview-interactive] [--intro-hold SEC]"
   exit 1
 fi
 
@@ -99,6 +99,7 @@ HPAD_PCT=6
 VALIGN=middle
 GAP_THRESHOLD=5.0
 GAP_DELAY=2.0
+INTRO_HOLD=5.0   # ← show artist/title slide for at least 5s
 
 HAS_VOCAL_PCTS=0
 VOCAL_PCTS_STR=""
@@ -125,6 +126,7 @@ while [ $# -gt 0 ]; do
     --valign)        VALIGN="$2"; shift 2;;
     --gap-threshold) GAP_THRESHOLD="$2"; shift 2;;
     --gap-delay)     GAP_DELAY="$2"; shift 2;;
+    --intro-hold)    INTRO_HOLD="$2"; shift 2;;
     --vocal-pcts)
       HAS_VOCAL_PCTS=1
       VOCAL_PCTS_STR="$2"
@@ -175,19 +177,16 @@ need_fetch=1
 
 looks_like_lyrics() {
   local path="$1"
-  # must have at least a few lines
   local line_count
   line_count=$(wc -l < "$path" | tr -d ' ')
   if [ "$line_count" -lt 3 ]; then
     return 1
   fi
-  # must not be huge
   local size_bytes
   size_bytes=$(stat -f%z "$path" 2>/dev/null || stat -c%s "$path")
   if [ "$size_bytes" -gt 65535 ]; then
     return 1
   fi
-  # too many very long lines → looks like prose
   local long_lines
   long_lines=$(awk 'length>170{c++} END{print c+0}' "$path")
   if [ "$line_count" -gt 0 ]; then
@@ -219,7 +218,6 @@ if [ $need_fetch -eq 1 ]; then
     info ">>> Fetching lyrics (auto_lyrics_fetcher, accent-aware) for \"${TITLE}\" by ${ARTIST}..."
     if python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" --artist "$ARTIST" --title "$TITLE" --merge-strategy merge --no-prompt > "$LYRICS_PATH"; then
       ok "[OK] Lyrics saved to $LYRICS_PATH (auto_lyrics_fetcher.py)"
-      # lyrics changed → force re-align
       rm -f "$CSV_PATH"
     else
       warn "[WARN] auto_lyrics_fetcher.py failed — falling back to legacy lyrics fetcher."
@@ -436,7 +434,6 @@ EOF
     warn "[WARN] No demucs stems — ${pct}% will sound same as others."
   fi
 
-  # PRE-NUKE bad existing output (file OR directory)
   FINAL_MP4="$OUTPUT_DIR/${OUT_NAME}.mp4"
   if [ -d "$FINAL_MP4" ]; then
     warn "[CLEANUP] $FINAL_MP4 was a directory — removing it so we can write the mp4."
@@ -462,6 +459,7 @@ EOF
     --title "$TITLE"
     --gap-threshold "$GAP_THRESHOLD"
     --gap-delay "$GAP_DELAY"
+    --intro-hold "$INTRO_HOLD"
     --no-open
   )
   if [ -n "$CAR_FONT_SIZE" ]; then
