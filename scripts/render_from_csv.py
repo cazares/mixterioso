@@ -3,8 +3,9 @@
 # CSV (line,start[,end]) -> ASS -> ffmpeg -> MP4
 # features:
 # - intro screen (title/artist) from t=0 until first lyric
-# - NOW: can force a minimum intro hold (e.g. 5s) via --intro-hold
+# - default intro hold = 5.0s (can override with --intro-hold)
 # - gap filler (♬♫♪♩) when gap >= --gap-threshold, but only after --gap-delay
+# - gap filler is NEVER shown on the intro screen
 # - vertical alignment (top|middle|bottom)
 # - horizontal padding via --hpad-pct
 # - --offset-video AND --extra-delay both applied:
@@ -41,7 +42,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--title", default="", help="For intro screen")
     p.add_argument("--gap-threshold", type=float, default=5.0, help="Seconds of silence to trigger filler")
     p.add_argument("--gap-delay", type=float, default=2.0, help="Seconds AFTER line end before filler shows")
-    p.add_argument("--intro-hold", type=float, default=0.0, help="Force intro (title/artist) to stay up at least this many seconds")
+    p.add_argument(
+        "--intro-hold",
+        type=float,
+        default=5.0,   # ← default 5s now
+        help="Force intro (title/artist) to stay up at least this many seconds",
+    )
     p.add_argument("--no-open", action="store_true", help="Do not open output dir on macOS")
     return p.parse_args()
 
@@ -66,7 +72,6 @@ def read_csv_rows(path: str) -> List[Dict[str, Any]]:
 
 
 def wrap_line(text: str, max_chars: int) -> str:
-    # returns text with ASS line breaks (\\N)
     if max_chars <= 0:
         return text
     words = text.split()
@@ -87,16 +92,15 @@ def wrap_line(text: str, max_chars: int) -> str:
     return "\\N".join(lines)
 
 
-def make_ass_style(font_name: str,
-                   font_size: int,
-                   hpad_pct: float,
-                   valign: str,
-                   car_font_size: int = None) -> str:
-    # 1280x720 fixed canvas
+def make_ass_style(
+    font_name: str,
+    font_size: int,
+    hpad_pct: float,
+    valign: str,
+    car_font_size: int = None,
+) -> str:
     margin_lr = int(1280 * (hpad_pct / 100.0))
 
-    # ASS alignment codes:
-    # 8 = top-center, 5 = middle-center, 2 = bottom-center
     if valign == "top":
         alignment = 8
         margin_v = 30
@@ -124,11 +128,13 @@ def make_ass_style(font_name: str,
     )
 
 
-def make_ass_header(font_name: str,
-                    font_size: int,
-                    hpad_pct: float,
-                    valign: str,
-                    car_font_size: int = None) -> str:
+def make_ass_header(
+    font_name: str,
+    font_size: int,
+    hpad_pct: float,
+    valign: str,
+    car_font_size: int = None,
+) -> str:
     return (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -144,53 +150,62 @@ def make_ass_header(font_name: str,
 
 def sec_to_ass_time(sec: float) -> str:
     if sec < 0:
-      sec = 0.0
+        sec = 0.0
     h = int(sec // 3600)
     m = int((sec % 3600) // 60)
     s = sec % 60.0
     return f"{h:d}:{m:02d}:{s:05.2f}"
 
 
-def build_intro_events(artist: str, title: str, first_start: float, intro_hold: float) -> List[str]:
+def build_intro_events(artist: str, title: str, first_start: float, intro_hold: float) -> (List[str], float):
+    """
+    returns (events, intro_end_time)
+    """
     if not artist and not title:
-        return []
-    # first_start is after shifts; we want "at least" intro_hold
-    # if first_start <= 0 (weird timing), still show intro_hold
-    min_end = intro_hold if intro_hold > 0 else 0.0
-    target_end = first_start if first_start > 0 else 0.0
-    end_time = max(min_end, target_end, 3.0)  # always at least 3s
+        return [], 0.0
+    # how long should intro stay?
+    # - at least intro_hold
+    # - at least 3s
+    # - and if first line starts later, stay until then
+    end_time = max(intro_hold, first_start, 3.0)
     if artist and title:
         text = f"{title}\\Nby\\N{artist}"
     elif title:
         text = title
     else:
         text = artist
-    return [
+    ev = [
         f"Dialogue: 0,{sec_to_ass_time(0.0)},{sec_to_ass_time(end_time)},Default,,0,0,0,,{text}"
     ]
+    return ev, end_time
 
 
 def build_gap_event(start: float, end: float) -> str:
+    # always its own screen
     symbols = ["♬", "♫", "♪", "♩"]
     random.shuffle(symbols)
     text = "".join(symbols)
     return f"Dialogue: 0,{sec_to_ass_time(start)},{sec_to_ass_time(end)},Gap,,0,0,0,,{text}"
 
 
-def build_ass_events(rows: List[Dict[str, Any]],
-                     extra_delay: float,
-                     offset_video: float,
-                     gap_threshold: float,
-                     gap_delay: float,
-                     artist: str,
-                     title: str,
-                     intro_hold: float) -> List[str]:
+def build_ass_events(
+    rows: List[Dict[str, Any]],
+    extra_delay: float,
+    offset_video: float,
+    gap_threshold: float,
+    gap_delay: float,
+    artist: str,
+    title: str,
+    intro_hold: float,
+) -> List[str]:
     events: List[str] = []
     if not rows:
         return events
 
     first_start = rows[0]["start"] + extra_delay - offset_video
-    events.extend(build_intro_events(artist, title, first_start, intro_hold))
+
+    intro_events, intro_end = build_intro_events(artist, title, first_start, intro_hold)
+    events.extend(intro_events)
 
     for i, row in enumerate(rows):
         start = row["start"] + extra_delay - offset_video
@@ -210,23 +225,28 @@ def build_ass_events(rows: List[Dict[str, Any]],
             f"Dialogue: 0,{sec_to_ass_time(start)},{sec_to_ass_time(end)},Default,,0,0,0,,{text}"
         )
 
+        # gap filler (but NEVER overlapping the intro screen)
         if i + 1 < len(rows):
             next_start = rows[i + 1]["start"] + extra_delay - offset_video
             gap = next_start - end
             if gap >= gap_threshold:
                 gap_start = end + gap_delay
                 if gap_start < next_start:
-                    gap_end = next_start
-                    events.append(build_gap_event(gap_start, gap_end))
+                    # NEW: don't show gap notes during intro
+                    if gap_start >= intro_end:
+                        gap_end = next_start
+                        events.append(build_gap_event(gap_start, gap_end))
         else:
             pass
 
     return events
 
 
-def write_ass(tmp_ass: str,
-              rows: List[Dict[str, Any]],
-              args: argparse.Namespace) -> None:
+def write_ass(
+    tmp_ass: str,
+    rows: List[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> None:
     header = make_ass_header(
         args.font_name,
         args.font_size,
@@ -252,10 +272,19 @@ def write_ass(tmp_ass: str,
 
 def get_audio_duration(path: str) -> float:
     try:
-        out = subprocess.check_output([
-            "ffprobe", "-v", "error", "-show_entries",
-            "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path
-        ], encoding="utf-8")
+        out = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            encoding="utf-8",
+        )
         return float(out.strip())
     except Exception:
         return 0.0
@@ -265,14 +294,22 @@ def run_ffmpeg(ass_path: str, audio_path: str, duration: float, out_path: str):
     cmd = [
         "ffmpeg",
         "-y",
-        "-f", "lavfi",
-        "-i", f"color=c=black:s=1280x720:d={duration:.2f}",
-        "-i", audio_path,
-        "-vf", f"ass={ass_path}",
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "192k",
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c=black:s=1280x720:d={duration:.2f}",
+        "-i",
+        audio_path,
+        "-vf",
+        f"ass={ass_path}",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
         "-shortest",
         out_path,
     ]
@@ -298,14 +335,12 @@ def main():
         write_ass(ass_path, rows, args)
 
         audio_dur = get_audio_duration(args.audio)
-
-        csv_last_end = max((r["end"] if r["end"] is not None else r["start"] + 2.0) for r in rows)
+        csv_last_end = max(
+            (r["end"] if r["end"] is not None else r["start"] + 2.0) for r in rows
+        )
         csv_last_end = csv_last_end + args.extra_delay - args.offset_video
 
-        # final duration must cover:
-        #  - audio
-        #  - last lyric
-        #  - forced intro hold
+        # also guarantee we cover intro-hold
         duration = max(audio_dur, csv_last_end + 0.25, args.intro_hold + 0.25)
 
         try:
