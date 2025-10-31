@@ -3,8 +3,7 @@
 whisper_timing_pipeline.py
 
 Additive update:
-- can now emit karaoke-friendly CSV in the exact format of scar_tissue.csv:
-  header: line,start
+- emit karaoke-friendly CSV: header: line,start
 - grouping is heuristic: time gap and max chars
 """
 
@@ -16,7 +15,6 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Heuristic demucs latencies (seconds). Adjust when you measure your model.
 KNOWN_DEMUCS_LATENCIES = {
     "htdemucs": 0.18,
     "htdemucs_6s": 0.18,
@@ -233,7 +231,7 @@ def extract_words_from_whisper(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                         "word": text,
                         "start": float(segment_start),
                         "end": float(segment_end),
-                        "conf": float(seg.get("avg_logprob", 0.0))),
+                        "conf": float(seg.get("avg_logprob", 0.0)),
                     }
                 )
     return words
