@@ -12,6 +12,7 @@
 #  - ✅ YouTube: PASS POSITIONAL QUERY (no --artist/--title)
 #  - ✅ --force-audio, --force-align
 #  - ✅ --preview-seconds, --preview-interactive (forwarded to youtube_audio_picker.py)
+#  - ✅ 2025-10-31: prefer scripts/auto_lyrics_fetcher.py when present
 
 set -euo pipefail
 
@@ -185,7 +186,24 @@ info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
   info "[INFO] Lyrics already exist at $LYRICS_PATH — skipping fetch."
 else
-  if [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
+  if [ -f "$SCRIPTS_DIR/auto_lyrics_fetcher.py" ]; then
+    info ">>> Fetching lyrics (auto_lyrics_fetcher, accent-aware) for \"${TITLE}\" by ${ARTIST}..."
+    if python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" --artist "$ARTIST" --title "$TITLE" --merge-strategy merge --no-prompt > "$LYRICS_PATH"; then
+      ok "[OK] Lyrics saved to $LYRICS_PATH (auto_lyrics_fetcher.py)"
+    else
+      warn "[WARN] auto_lyrics_fetcher.py failed — falling back to legacy lyrics fetcher."
+      if [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
+        python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
+        ok "[OK] Lyrics saved to $LYRICS_PATH"
+      elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
+        python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
+        ok "[OK] Lyrics saved to $LYRICS_PATH"
+      else
+        err "[ERROR] no lyrics fetcher found."
+        exit 1
+      fi
+    fi
+  elif [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
     info ">>> Fetching lyrics (smart) for \"${TITLE}\" by ${ARTIST}..."
     python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
     ok "[OK] Lyrics saved to $LYRICS_PATH"
