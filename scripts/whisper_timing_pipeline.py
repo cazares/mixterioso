@@ -2,15 +2,21 @@
 """
 whisper_timing_pipeline.py
 
-Goal:
-- run whisper on preprocessed audio
-- extract word-level timings
-- map to karaoke-friendly line,start
-- if --lyrics-txt is given, that TXT is the source of truth
-- repeated lines are matched FIRST to a small local window (next few seconds)
-  before searching the whole song, so "Me dice que me ama" right after "llover."
-  lands at ~23.96, not at the later 48.x instance
-- CSV/TXT skip blank lines
+Pipeline:
+- optional: demucs vocal isolation
+- ffmpeg → mono 16kHz + loudnorm
+- whisper (py or cli) with word timestamps
+- optional: whisperx align
+- emit:
+  - raw whisper json
+  - word-level csv
+  - karaoke line,start csv (no blank lines)
+  - karaoke txt (no blank lines)
+
+Additive:
+- --lyrics-txt makes the TXT the source of truth
+- lines that fail to match are snapped forward to the next available ASR word,
+  not held at the previous time, so repeated lines right after each other do not collide
 """
 
 import argparse
@@ -284,15 +290,6 @@ def _is_header_line(line: str) -> bool:
     return "//by//" in l or "///by///" in l
 
 
-def _tight_window_indices(words: List[Dict[str, Any]], start_idx: int, last_ts: float, max_dt: float = 6.0) -> Tuple[int, int]:
-    end_ts = last_ts + max_dt
-    i = start_idx
-    n = len(words)
-    while i < n and words[i]["start"] <= end_ts:
-        i += 1
-    return start_idx, i  # [start_idx, i)
-
-
 def _search_range(
     W: List[str],
     words: List[Dict[str, Any]],
@@ -347,13 +344,16 @@ def align_txt_lines_to_words(
         if not tokens:
             out.append({"line": line, "start": last_ts})
             continue
-        # 1) try tight window right after last_ts
-        start_tight, end_tight = _tight_window_indices(words, wi, last_ts, max_dt=local_dt)
-        best = _search_range(W, words, tokens, start_tight, end_tight, skip_max)
-        # 2) if tight failed, try wide window
+        # tight window: from wi until last_ts+local_dt
+        tight_end_ts = last_ts + local_dt
+        tight_end_idx = wi
+        while tight_end_idx < len(words) and words[tight_end_idx]["start"] <= tight_end_ts:
+            tight_end_idx += 1
+        best = _search_range(W, words, tokens, wi, tight_end_idx, skip_max)
+        # if tight fails, try wide
         if not best or best[0] < min_cover:
-            end_wide = min(len(W), wi + search_ahead)
-            best = _search_range(W, words, tokens, wi, end_wide, skip_max)
+            wide_end_i = min(len(W), wi + search_ahead)
+            best = _search_range(W, words, tokens, wi, wide_end_i, skip_max)
         if best and best[0] >= min_cover:
             _, si, ei = best
             ts = words[si]["start"]
@@ -364,8 +364,14 @@ def align_txt_lines_to_words(
             else:
                 wi = min(ei + 1, si + search_ahead)
         else:
-            # no match: hold
-            out.append({"line": line, "start": last_ts})
+            # snap forward to next actual word time
+            snap_ts = last_ts
+            for ww in words:
+                if ww["start"] > last_ts:
+                    snap_ts = ww["start"]
+                    break
+            out.append({"line": line, "start": snap_ts})
+            last_ts = snap_ts
     return out
 
 
@@ -393,7 +399,7 @@ def main() -> None:
     ap.add_argument("--gap-threshold", type=float, default=0.60)
     ap.add_argument("--max-chars", type=int, default=32)
     ap.add_argument("--no-whisperx", action="store_true")
-    ap.add_argument("--lyrics-txt", default=None, help="source-of-truth line-by-line lyrics (will drive timestamps)")
+    ap.add_argument("--lyrics-txt", default=None, help="source-of-truth line-by-line lyrics")
     args = ap.parse_args()
 
     if not Path(args.audio).exists():
@@ -406,7 +412,7 @@ def main() -> None:
     demucs_offset_applied = 0.0
     audio_for_whisper = args.audio
 
-    if args.use_demucs:
+    if args.use-demucs:
         demucs_out_dir = str(Path(workdir) / "demucs_out")
         vocals = run_demucs(args.audio, args.demucs_model, demucs_out_dir)
         if vocals:
