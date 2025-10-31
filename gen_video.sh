@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # gen_video.sh — pipeline: lyrics → audio → align → demucs → render (multi-variant)
-# now with:
-#  - prefer scripts/auto_lyrics_fetcher.py
-#  - validate lyrics header "<title>//by//<artist>"
-#  - on mismatch: refetch + nuke CSV
-#  - ALIGN prefers: existing vocal stem → original stereo → mono
-#  - post-align fix: fix_early_lines_from_audio.py (0–40s)
-#  - post-align sanity: csv_sanity_fill_improbables.py (snap improbable line to just before next)
-#  - NEW: --timings-csv to bypass internal alignment and use user-provided CSV directly
+# Features kept:
+#  - prefers scripts/auto_lyrics_fetcher.py
+#  - header check "<title>//by//<artist>"
+#  - auto DL audio (yt)
+#  - true mono
+#  - alignment to CSV (stable-whisper) with --no-vad compat
+#  - early-lines fix + sanity pass
+#  - Demucs with reuse of existing stems
+#  - multi vocal-pcts rendering
+#  - FINAL ffmpeg A/V shift to force --offset-video
+#  - NEW: demucs auto-prepare (install torchcodec into demucs_env if missing)
 
 set -euo pipefail
 
@@ -34,15 +37,13 @@ SCRIPTS_DIR="$ROOT/scripts"
 LYRICS_DIR="$ROOT/auto_lyrics"
 SONGS_DIR="$ROOT/songs"
 OUTPUT_DIR="$ROOT/output"
-STEMS_ROOT="$OUTPUT_DIR/stems"
+STEMS_EXPORT_DIR="$ROOT/output/stems"
+MIXED_AUDIO_DIR="$ROOT/songs/mixed"
+DEMUCS_ENV_DIR="$ROOT/demucs_env"
 
-mkdir -p "$LYRICS_DIR" "$SONGS_DIR" "$OUTPUT_DIR" "$STEMS_ROOT"
-
-# --- helpers --------------------------------------------------------------
 slugify() {
   local s="$1"
   s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
-  s=$(printf '%s' "$s" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')
   s=$(printf '%s' "$s" | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
   printf '%s\n' "$s"
 }
@@ -57,16 +58,29 @@ is_pct() {
   [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 0 ] && [ "$1" -le 100 ]
 }
 
-find_demucs_bin() {
+# ensure demucs_env can actually run demucs (this was the failing point)
+ensure_demucs_ready() {
+  # 1) prefer local env
+  if [ -x "$DEMUCS_ENV_DIR/bin/demucs" ]; then
+    local py="$DEMUCS_ENV_DIR/bin/python3"
+    if [ ! -x "$py" ]; then
+      py="$DEMUCS_ENV_DIR/bin/python"
+    fi
+    if [ -x "$py" ]; then
+      if ! "$py" -c "import torchcodec" >/dev/null 2>&1; then
+        info "[DEMUCS] torchcodec missing in demucs_env, installing..."
+        "$DEMUCS_ENV_DIR/bin/pip3" install --quiet torchcodec || "$DEMUCS_ENV_DIR/bin/pip" install --quiet torchcodec || true
+      fi
+    fi
+    echo "$DEMUCS_ENV_DIR/bin/demucs"
+    return
+  fi
+  # 2) fallback to PATH
   if command -v demucs >/dev/null 2>&1; then
-    echo "demucs"; return
+    echo "demucs"
+    return
   fi
-  if [ -x "$ROOT/demucs_env/bin/demucs" ]; then
-    echo "$ROOT/demucs_env/bin/demucs"; return
-  fi
-  if python3 -m demucs --help >/dev/null 2>&1; then
-    echo "python3 -m demucs"; return
-  fi
+  # 3) none
   echo ""
 }
 
@@ -75,25 +89,35 @@ find_existing_stems_dir() {
   local audio_base="$2"
 
   if [ -d "$stems_export_dir/htdemucs_6s/$audio_base" ]; then
-    echo "$stems_export_dir/htdemucs_6s/$audio_base"; return
+    printf '%s\n' "$stems_export_dir/htdemucs_6s/$audio_base"
+    return 0
   fi
   if [ -d "$stems_export_dir/htdemucs/$audio_base" ]; then
-    echo "$stems_export_dir/htdemucs/$audio_base"; return
+    printf '%s\n' "$stems_export_dir/htdemucs/$audio_base"
+    return 0
   fi
-  echo ""
+  if [ -d "$stems_export_dir/htdemucs_6s" ]; then
+    local d
+    d="$(find "$stems_export_dir/htdemucs_6s" -maxdepth 2 -type d -name "$audio_base" 2>/dev/null | head -n1 || true)"
+    if [ -n "$d" ]; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+  fi
+  printf '%s\n' ""
+  return 1
 }
 
-# --- args -----------------------------------------------------------------
 if [ $# -lt 2 ]; then
-  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--car-font-size N] [--max-chars N] [--offset-video SEC] [--extra-delay SEC] [--hpad-pct N] [--valign ...] [--vocal-pcts \"0 20 100\"] [--gap-threshold 5.0] [--gap-delay 2.0] [--force-audio] [--force-align] [--timings-csv file.csv]"
+  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--max-chars N] [--offset-video SECS] [--extra-delay SECS] [--gap-threshold N] [--gap-delay N] [--vocal-pcts \"0 35 100\"] [--force-audio] [--force-align] [--timings-csv file.csv]"
   exit 1
 fi
 
 ARTIST="$1"; shift
 TITLE="$1"; shift
 
-FONT_SIZE=140
 CAR_FONT_SIZE=""
+FONT_SIZE=120
 MAX_CHARS=18
 OFFSET_VIDEO=-1.0
 EXTRA_DELAY=0.0
@@ -141,14 +165,13 @@ while [ $# -gt 0 ]; do
     --guitar)
       USER_SELECTED_STEMS=1; SEL_GUITAR=1
       if [ $# -gt 1 ] && is_pct "$2"; then GUITAR_LEVEL="$2"; shift 2; else shift 1; fi;;
-    --force-audio)
-      FORCE_AUDIO=1; shift 1;;
-    --force-align)
-      FORCE_ALIGN=1; shift 1;;
-    --timings-csv)
-      USER_TIMINGS_CSV="$2"; shift 2;;
+    --force-audio)   FORCE_AUDIO=1; shift 1;;
+    --force-align)   FORCE_ALIGN=1; shift 1;;
+    --preview-seconds)    PREVIEW_SECONDS="$2"; shift 2;;
+    --preview-interactive) PREVIEW_INTERACTIVE=1; shift 1;;
+    --timings-csv)   USER_TIMINGS_CSV="$2"; shift 2;;
     *)
-      warn "Unknown arg: $1 (ignored)"
+      warn "[WARN] Unknown arg: $1"
       shift 1;;
   esac
 done
@@ -160,19 +183,13 @@ LYRICS_PATH="$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.txt"
 CSV_PATH="$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.csv"
 AUDIO_PATH="$SONGS_DIR/auto_${ARTIST_SLUG}-${TITLE_SLUG}.mp3"
 AUDIO_MONO_PATH="$SONGS_DIR/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono.mp3"
-STEMS_EXPORT_DIR="$STEMS_ROOT/${ARTIST_SLUG}-${TITLE_SLUG}"
-mkdir -p "$STEMS_EXPORT_DIR"
 
-# if user provided a timings csv, prefer that and skip align later
-if [ -n "$USER_TIMINGS_CSV" ]; then
-  info "[INFO] Using user-provided timings CSV: $USER_TIMINGS_CSV"
-  CSV_PATH="$USER_TIMINGS_CSV"
-fi
+mkdir -p "$LYRICS_DIR" "$SONGS_DIR" "$OUTPUT_DIR" "$STEMS_EXPORT_DIR" "$MIXED_AUDIO_DIR"
 
 info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 
 # ---------------------------------------------------------------------------
-# 1) LYRICS (with validation)
+# 1) LYRICS
 # ---------------------------------------------------------------------------
 need_fetch=1
 if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ] && [ -z "$USER_TIMINGS_CSV" ]; then
@@ -184,40 +201,26 @@ if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ] && [ -z "$USER_TIMINGS_CSV" ]
     info "[INFO] Lyrics header matches — reusing $LYRICS_PATH"
     need_fetch=0
   else
-    warn "[WARN] Lyrics header mismatch — will refetch."
-    need_fetch=1
+    warn "[WARN] Lyrics header mismatch (got: \"$first_line\" vs expected: \"$expected\"). Will refetch."
   fi
 fi
 
 if [ $need_fetch -eq 1 ] && [ -z "$USER_TIMINGS_CSV" ]; then
   if [ -f "$SCRIPTS_DIR/auto_lyrics_fetcher.py" ]; then
-    info ">>> Fetching lyrics (auto_lyrics_fetcher) for \"${TITLE}\" by ${ARTIST}..."
-    if python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" --artist "$ARTIST" --title "$TITLE" --merge-strategy merge --no-prompt > "$LYRICS_PATH"; then
-      ok "[OK] Lyrics saved to $LYRICS_PATH (auto_lyrics_fetcher.py)"
-      rm -f "$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.csv"
-    else
-      warn "[WARN] auto_lyrics_fetcher.py failed — trying legacy fetchers."
-      if [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
-        python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
-        ok "[OK] Lyrics saved to $LYRICS_PATH"
-        rm -f "$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.csv"
-      elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
-        python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
-        ok "[OK] Lyrics saved to $LYRICS_PATH"
-        rm -f "$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.csv"
-      else
-        err "[ERROR] no lyrics fetcher found."
-        exit 1
-      fi
-    fi
+    info ">>> Fetching lyrics (smart) for \"$TITLE\" by $ARTIST..."
+    python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" \
+      --artist "$ARTIST" \
+      --title "$TITLE" \
+      --out "$LYRICS_PATH"
+    ok "[OK] Lyrics saved to $LYRICS_PATH (auto_lyrics_fetcher.py)"
   else
-    err "[ERROR] no lyrics fetcher script found."
+    err "[ERROR] scripts/auto_lyrics_fetcher.py not found."
     exit 1
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# 2) AUDIO (YouTube)
+# 2) AUDIO
 # ---------------------------------------------------------------------------
 NEED_AUDIO=1
 if [ -f "$AUDIO_PATH" ] && [ $FORCE_AUDIO -eq 0 ]; then
@@ -250,7 +253,7 @@ if [ $NEED_AUDIO -eq 1 ]; then
   fi
 fi
 
-# 2b) TRUE MONO ------------------------------------------------------------
+# 2b) TRUE MONO
 if [ -f "$AUDIO_MONO_PATH" ]; then
   if [ $FORCE_AUDIO -eq 1 ] || [ "$AUDIO_PATH" -nt "$AUDIO_MONO_PATH" ]; then
     info ">>> Source MP3 is newer (or --force-audio) — re-converting to TRUE MONO..."
@@ -266,18 +269,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3) ALIGN (prefer vocal stem → stereo → mono) + post-fixers
+# 3) ALIGN
 # ---------------------------------------------------------------------------
-ALIGN_AUDIO="$AUDIO_MONO_PATH"
+if [ -n "$USER_TIMINGS_CSV" ]; then
+  info "[INFO] user provided --timings-csv: $USER_TIMINGS_CSV"
+  cp "$USER_TIMINGS_CSV" "$CSV_PATH"
+fi
 
-POSSIBLE_VOCAL_DIR="$STEMS_ROOT/${ARTIST_SLUG}-${TITLE_SLUG}/htdemucs_6s/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono"
-if [ -f "$POSSIBLE_VOCAL_DIR/vocals.wav" ]; then
-  info "[ALIGN] using existing Demucs vocal stem for alignment → $POSSIBLE_VOCAL_DIR/vocals.wav"
-  ALIGN_AUDIO="$POSSIBLE_VOCAL_DIR/vocals.wav"
+ALIGN_AUDIO=""
+if [ -n "$USER_TIMINGS_CSV" ]; then
+  :
 else
-  if [ -f "$AUDIO_PATH" ]; then
-    info "[ALIGN] no vocal stem yet; using ORIGINAL STEREO for alignment → $AUDIO_PATH"
-    ALIGN_AUDIO="$AUDIO_PATH"
+  if [ -d "$STEMS_EXPORT_DIR" ]; then
+    STEM_CANDIDATE="$STEMS_EXPORT_DIR/${TITLE_SLUG}/vocals.wav"
+    if [ -f "$STEM_CANDIDATE" ]; then
+      info "[ALIGN] using existing Demucs vocal stem for alignment → $STEM_CANDIDATE"
+      ALIGN_AUDIO="$STEM_CANDIDATE"
+    else
+      info "[ALIGN] using mono for alignment → $AUDIO_MONO_PATH"
+      ALIGN_AUDIO="$AUDIO_MONO_PATH"
+    fi
   else
     info "[ALIGN] using mono for alignment → $AUDIO_MONO_PATH"
     ALIGN_AUDIO="$AUDIO_MONO_PATH"
@@ -296,7 +307,8 @@ else
         --audio "$ALIGN_AUDIO" \
         --lyrics "$LYRICS_PATH" \
         --out "$CSV_PATH" \
-  --model large-v3
+        --model large-v3 \
+        --no-vad
       ok "[OK] CSV saved to $CSV_PATH"
     else
       err "[ERROR] scripts/align_to_csv.py not found."
@@ -323,9 +335,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4) DEMUCS with REUSE
+# 4) DEMUCS (with auto-prepare)
 # ---------------------------------------------------------------------------
-DEMUCS_BIN="$(find_demucs_bin)"
+DEMUCS_BIN="$(ensure_demucs_ready)"
 BEST_STEMS_DIR=""
 AUDIO_BASENAME="$(basename "$AUDIO_MONO_PATH")"
 AUDIO_BASE_NOEXT="${AUDIO_BASENAME%.*}"
@@ -336,52 +348,29 @@ if [ -n "$DEMUCS_BIN" ]; then
     ok "[REUSE] Found existing Demucs stems at $EXISTING_DIR — skipping separation."
     BEST_STEMS_DIR="$EXISTING_DIR"
   else
-    info ">>> [DEMUCS] Running separation (6 → 4 → 2) …"
-    DEMUCS_BASE_OUT="$STEMS_EXPORT_DIR"
-
-    if $DEMUCS_BIN -n htdemucs_6s -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH" 2>&1 | tee "$DEMUCS_BASE_OUT/demucs_6s.log"; then
-      BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs_6s/$AUDIO_BASE_NOEXT"
+    info ">>> [DEMUCS] Running separation via $DEMUCS_BIN …"
+    if $DEMUCS_BIN -n htdemucs_6s -o "$STEMS_EXPORT_DIR" "$AUDIO_MONO_PATH" 2>&1 | tee "$STEMS_EXPORT_DIR/demucs_6s.log"; then
+      BEST_STEMS_DIR="$STEMS_EXPORT_DIR/htdemucs_6s/$AUDIO_BASE_NOEXT"
       ok "[OK] Demucs 6-stem succeeded → $BEST_STEMS_DIR"
     else
-      warn "[WARN] 6-stem failed, trying 4-stem (htdemucs)…"
-      if $DEMUCS_BIN -n htdemucs -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH" 2>&1 | tee "$DEMUCS_BASE_OUT/demucs_4s.log"; then
-        BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs/$AUDIO_BASE_NOEXT"
-        ok "[OK] Demucs 4-stem succeeded → $BEST_STEMS_DIR"
-      else
-        warn "[WARN] 4-stem failed, trying 2-stem (vocals)…"
-        if $DEMUCS_BIN --two-stems=vocals -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH" 2>&1 | tee "$DEMUCS_BASE_OUT/demucs_2s.log"; then
-          BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs/$AUDIO_BASE_NOEXT"
-          ok "[OK] Demucs 2-stem succeeded → $BEST_STEMS_DIR"
-        else
-          err "[ERROR] All demucs attempts failed — will use mono for ALL variants."
-          BEST_STEMS_DIR=""
-        fi
-      fi
+      warn "[WARN] 6-stem failed, will continue with mono."
+      BEST_STEMS_DIR=""
     fi
   fi
 else
-  warn "[WARN] demucs not found — ALL variants will sound the same (mono)."
+  warn "[WARN] demucs not found — will render with mono audio."
 fi
 
 # ---------------------------------------------------------------------------
-# 5) decide what to render
+# 5) RENDER
 # ---------------------------------------------------------------------------
-RENDER_PCTS=()
 if [ $HAS_VOCAL_PCTS -eq 1 ]; then
-  RENDER_PCTS=($VOCAL_PCTS_STR)
+  IFS=' ' read -r -a PCTS <<<"$VOCAL_PCTS_STR"
 else
-  RENDER_PCTS=("100")
+  PCTS=(0 35 100)
 fi
 
-info ">>> Rendering karaoke video(s): ${RENDER_PCTS[*]}"
-
-# ---------------------------------------------------------------------------
-# 6) per-pct: build audio + render
-# ---------------------------------------------------------------------------
-MIXED_AUDIO_DIR="$SONGS_DIR/mixed"
-mkdir -p "$MIXED_AUDIO_DIR"
-
-for pct in "${RENDER_PCTS[@]}"; do
+for pct in "${PCTS[@]}"; do
   OUT_NAME="${ARTIST_SLUG}-${TITLE_SLUG}_v${pct}"
   AUDIO_FOR_THIS="$AUDIO_MONO_PATH"
 
@@ -468,6 +457,20 @@ EOF
   fi
 
   python3 "${PY_ARGS[@]}"
+
+  # post-render A/V shift to FORCE your offset-video even if earlier stages stomped it
+  if [[ "$OFFSET_VIDEO" != "0" && "$OFFSET_VIDEO" != "0.0" && "$OFFSET_VIDEO" != "" ]]; then
+    TMP_SHIFTED="$OUTPUT_DIR/${OUT_NAME}_shifted.mp4"
+    if [[ "$OFFSET_VIDEO" == -* ]]; then
+      SHIFT="${OFFSET_VIDEO#-}"
+      ffmpeg -y -i "$FINAL_MP4" -itsoffset "$SHIFT" -i "$FINAL_MP4" \
+        -map 0:v -map 1:a -c copy "$TMP_SHIFTED" >/dev/null 2>&1 && mv "$TMP_SHIFTED" "$FINAL_MP4"
+    else
+      SHIFT="$OFFSET_VIDEO"
+      ffmpeg -y -itsoffset "$SHIFT" -i "$FINAL_MP4" -i "$FINAL_MP4" \
+        -map 1:v -map 0:a -c copy "$TMP_SHIFTED" >/dev/null 2>&1 && mv "$TMP_SHIFTED" "$FINAL_MP4"
+    fi
+  fi
 done
 
 ok "[DONE] Karaoke video(s) for ${ARTIST} – \"${TITLE}\" are in $OUTPUT_DIR/"
