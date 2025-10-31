@@ -2,9 +2,11 @@
 # gen_video.sh — pipeline: lyrics → audio → align → demucs → render (multi-variant)
 # now with:
 #  - prefer scripts/auto_lyrics_fetcher.py
-#  - VALIDATE existing lyrics; refetch if polluted or mismatched title/artist
-#  - if we refetch lyrics, nuke CSV so align re-runs
-#  - auto-fix early lyric lines from REAL audio (0–40s) using Whisper window
+#  - validate lyrics header "<title>//by//<artist>"
+#  - on mismatch: refetch + nuke CSV
+#  - ALIGN prefers: existing vocal stem → original stereo → mono
+#  - post-align fix: fix_early_lines_from_audio.py (0–40s)
+#  - post-align sanity: csv_sanity_fill_improbables.py (snap improbable line to just before next)
 
 set -euo pipefail
 
@@ -44,7 +46,6 @@ slugify() {
   printf '%s\n' "$s"
 }
 
-# deaccent but KEEP SPACES (for YouTube queries and title match)
 deaccent_keep_spaces() {
   local s="$1"
   s=$(printf '%s' "$s" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')
@@ -83,7 +84,7 @@ find_existing_stems_dir() {
 
 # --- args -----------------------------------------------------------------
 if [ $# -lt 2 ]; then
-  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--car-font-size N] [--max-chars N] [--offset-video SEC] [--extra-delay SEC] [--hpad-pct N] [--valign ...] [--vocal-pcts \"0 20 100\"] [--gap-threshold 5.0] [--gap-delay 2.0] [--force-audio] [--force-align] [--preview-seconds N] [--preview-interactive]"
+  err "Usage: $0 \"Artist\" \"Title\" [--font-size N] [--car-font-size N] [--max-chars N] [--offset-video SEC] [--extra-delay SEC] [--hpad-pct N] [--valign ...] [--vocal-pcts \"0 20 100\"] [--gap-threshold 5.0] [--gap-delay 2.0] [--force-audio] [--force-align]"
   exit 1
 fi
 
@@ -99,16 +100,13 @@ HPAD_PCT=6
 VALIGN=middle
 GAP_THRESHOLD=5.0
 GAP_DELAY=2.0
-
 HAS_VOCAL_PCTS=0
 VOCAL_PCTS_STR=""
-
 USER_SELECTED_STEMS=0
 SEL_VOCALS=0;  VOCALS_LEVEL=100
 SEL_DRUMS=0;   DRUMS_LEVEL=100
 SEL_BASS=0;    BASS_LEVEL=100
 SEL_GUITAR=0;  GUITAR_LEVEL=100
-
 FORCE_AUDIO=0
 FORCE_ALIGN=0
 PREVIEW_SECONDS=0
@@ -145,10 +143,6 @@ while [ $# -gt 0 ]; do
       FORCE_AUDIO=1; shift 1;;
     --force-align)
       FORCE_ALIGN=1; shift 1;;
-    --preview-seconds)
-      PREVIEW_SECONDS="$2"; shift 2;;
-    --preview-interactive)
-      PREVIEW_INTERACTIVE=1; shift 1;;
     *)
       warn "Unknown arg: $1 (ignored)"
       shift 1;;
@@ -162,7 +156,6 @@ LYRICS_PATH="$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.txt"
 CSV_PATH="$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.csv"
 AUDIO_PATH="$SONGS_DIR/auto_${ARTIST_SLUG}-${TITLE_SLUG}.mp3"
 AUDIO_MONO_PATH="$SONGS_DIR/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono.mp3"
-
 STEMS_EXPORT_DIR="$STEMS_ROOT/${ARTIST_SLUG}-${TITLE_SLUG}"
 mkdir -p "$STEMS_EXPORT_DIR"
 
@@ -177,7 +170,6 @@ if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
   expected="${TITLE}//by//${ARTIST}"
   plain_first="$(echo "$first_line" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
   plain_expected="$(echo "$expected"   | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
-
   if [ "$plain_first" = "$plain_expected" ]; then
     info "[INFO] Lyrics header matches — reusing $LYRICS_PATH"
     need_fetch=0
@@ -208,18 +200,8 @@ if [ $need_fetch -eq 1 ]; then
         exit 1
       fi
     fi
-  elif [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
-    info ">>> Fetching lyrics (smart) for \"${TITLE}\" by ${ARTIST}..."
-    python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
-    ok "[OK] Lyrics saved to $LYRICS_PATH"
-    rm -f "$CSV_PATH"
-  elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
-    info ">>> Fetching lyrics for \"${TITLE}\" by ${ARTIST}..."
-    python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
-    ok "[OK] Lyrics saved to $LYRICS_PATH"
-    rm -f "$CSV_PATH"
   else
-    err "[ERROR] no lyrics fetcher found."
+    err "[ERROR] no lyrics fetcher script found."
     exit 1
   fi
 fi
@@ -238,22 +220,17 @@ if [ $NEED_AUDIO -eq 1 ]; then
     info ">>> Downloading audio from YouTube (yt-dlp)..."
     if python3 "$SCRIPTS_DIR/youtube_audio_picker.py" \
         --query "$ARTIST $TITLE" \
-        --out "$AUDIO_PATH" \
-        ${PREVIEW_SECONDS:+--preview-seconds "$PREVIEW_SECONDS"} \
-        $([ $PREVIEW_INTERACTIVE -eq 1 ] && echo --preview-interactive); then
+        --out "$AUDIO_PATH"
       ok "[OK] Audio saved to $AUDIO_PATH"
     else
       warn "[WARN] YouTube search with accents failed, retrying without accents…"
       PLAIN_Q="$(deaccent_keep_spaces "$ARTIST $TITLE")"
       if python3 "$SCRIPTS_DIR/youtube_audio_picker.py" \
           --query "$PLAIN_Q" \
-          --out "$AUDIO_PATH" \
-          ${PREVIEW_SECONDS:+--preview-seconds "$PREVIEW_SECONDS"} \
-          $([ $PREVIEW_INTERACTIVE -eq 1 ] && echo --preview-interactive); then
+          --out "$AUDIO_PATH"
         ok "[OK] Audio saved to $AUDIO_PATH"
       else
         err "[ERROR] Could not download audio from YouTube for: $PLAIN_Q"
-        err "      Try: python3 scripts/youtube_audio_picker.py --query \"$PLAIN_Q\" --out \"$AUDIO_PATH\""
         exit 1
       fi
     fi
@@ -279,17 +256,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3) ALIGN (now: prefer vocal stem → stereo → mono)
+# 3) ALIGN (prefer vocal stem → stereo → mono) + post-fixers
 # ---------------------------------------------------------------------------
 ALIGN_AUDIO="$AUDIO_MONO_PATH"
 
-# 3a) try to find an existing *vocal* stem from a previous demucs run
+# existing vocal stem from previous run?
 POSSIBLE_VOCAL_DIR="$STEMS_ROOT/${ARTIST_SLUG}-${TITLE_SLUG}/htdemucs_6s/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono"
 if [ -f "$POSSIBLE_VOCAL_DIR/vocals.wav" ]; then
   info "[ALIGN] using existing Demucs vocal stem for alignment → $POSSIBLE_VOCAL_DIR/vocals.wav"
   ALIGN_AUDIO="$POSSIBLE_VOCAL_DIR/vocals.wav"
 else
-  # 3b) no vocal stem yet → try ORIGINAL STEREO before falling back to mono
   if [ -f "$AUDIO_PATH" ]; then
     info "[ALIGN] no vocal stem yet; using ORIGINAL STEREO for alignment → $AUDIO_PATH"
     ALIGN_AUDIO="$AUDIO_PATH"
@@ -317,7 +293,7 @@ else
   fi
 fi
 
-# --- auto-fix early lyric lines using real audio (0–40s) ---
+# post-align: audio-window-based correction
 if [ -f "$SCRIPTS_DIR/fix_early_lines_from_audio.py" ] && [ -f "$SCRIPTS_DIR/transcribe_window.py" ]; then
   info "[FIX] Auto-correcting early lyric lines from real audio (0–40s)…"
   python3 "$SCRIPTS_DIR/fix_early_lines_from_audio.py" \
@@ -330,12 +306,17 @@ if [ -f "$SCRIPTS_DIR/fix_early_lines_from_audio.py" ] && [ -f "$SCRIPTS_DIR/tra
     --language es || true
 fi
 
+# post-align: improbables → snap to just before next
+if [ -f "$SCRIPTS_DIR/csv_sanity_fill_improbables.py" ]; then
+  info "[SANITY] Checking for improbable-fast lines (snap-to-next)…"
+  python3 "$SCRIPTS_DIR/csv_sanity_fill_improbables.py" --csv "$CSV_PATH" || true
+fi
+
 # ---------------------------------------------------------------------------
 # 4) DEMUCS with REUSE
 # ---------------------------------------------------------------------------
 DEMUCS_BIN="$(find_demucs_bin)"
 BEST_STEMS_DIR=""
-
 AUDIO_BASENAME="$(basename "$AUDIO_MONO_PATH")"
 AUDIO_BASE_NOEXT="${AUDIO_BASENAME%.*}"
 
@@ -425,15 +406,12 @@ EOF
     if [ ${#inputs[@]} -gt 0 ]; then
       fc=""
       for f in "${filters[@]}"; do fc+="$f;"; done
-
       outs=""
       for ((j=0; j<idx; j++)); do outs+="[a${j}]"; done
-
       fc+="${outs}amix=inputs=${idx}:normalize=0[outa]"
 
       MIXED_PATH="$MIXED_AUDIO_DIR/${TITLE_SLUG}_v${pct}.wav"
       info "[MIX] building mix for ${pct}% → $MIXED_PATH"
-
       if ffmpeg -y "${inputs[@]}" -filter_complex "$fc" -map "[outa]" -ar 48000 -ac 1 -b:a 192k "$MIXED_PATH" >/dev/null 2>&1; then
         AUDIO_FOR_THIS="$MIXED_PATH"
       else
