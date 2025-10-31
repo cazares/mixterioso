@@ -2,31 +2,20 @@
 """
 whisper_timing_pipeline.py
 
-Additive baseline (original-style):
+Additive baseline (original-style) with tiny improvements:
 - optional Demucs to isolate vocals
-- ffmpeg → mono, 16kHz, loudnorm
+- ffmpeg → mono, 16kHz, loudnorm (can disable with --no-loudnorm)
 - Whisper (py preferred, CLI fallback)
-- optional WhisperX alignment
+- optional WhisperX alignment (now reuses explicit language)
 - extract word-level timings
 - heuristically group words → karaoke CSV (line,start) using gap + max chars
-- no TXT alignment, no coalescing, no forced monotonic
-
-Example:
-python3 whisper_timing_pipeline.py \
-  --audio songs/scar_tissue.mp3 \
-  --artist "Red Hot Chili Peppers" \
-  --title "Scar Tissue" \
-  --use-demucs --demucs-model htdemucs_6s --demucs-latency 0.18 \
-  --out-json auto_lyrics/scar_tissue_whisper.json \
-  --out-csv  auto_lyrics/scar_tissue_words.csv \
-  --out-lines-csv auto_lyrics/scar_tissue.csv \
-  --gap-threshold 0.60 \
-  --max-chars 32
+- safer CSV (escape quotes, no commas breaking columns)
+- guards for empty Whisper result
+- clearer Demucs offset logging
 """
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -62,14 +51,7 @@ def run_demucs(audio: str, model: str, out_dir: str) -> Optional[str]:
         return None
 
     print(f"[demucs] separating with model {model} ...")
-    cmd = [
-        "demucs",
-        "-n",
-        model,
-        "-o",
-        out_dir,
-        audio,
-    ]
+    cmd = ["demucs", "-n", model, "-o", out_dir, audio]
     code, out = run_cmd(cmd, capture=True)
     if code != 0:
         print("[demucs] failed:", out, file=sys.stderr)
@@ -89,29 +71,12 @@ def run_demucs(audio: str, model: str, out_dir: str) -> Optional[str]:
     return vocals_path
 
 
-def ffmpeg_trim(in_path: str, out_path: str, offset_s: float) -> str:
-    print(f"[ffmpeg] trimming {offset_s} seconds from demucs stem …")
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-ss",
-        f"{offset_s:.3f}",
-        "-i",
-        in_path,
-        "-acodec",
-        "pcm_s16le",
-        out_path,
-    ]
-    code, out = run_cmd(cmd, capture=True)
-    if code != 0:
-        print("[ffmpeg] trim failed:", out, file=sys.stderr)
-        return in_path
-    return out_path
-
-
-def ffmpeg_to_mono16k_loudnorm(in_path: str, out_path: str) -> str:
-    print("[ffmpeg] creating mono, 16kHz, loudnorm version …")
-    af = "pan=mono|c0=0.5*c0+0.5*c1,loudnorm=I=-16:LRA=11:TP=-1.5"
+def ffmpeg_to_mono16k_loudnorm(in_path: str, out_path: str, use_loudnorm: bool = True) -> str:
+    print("[ffmpeg] creating mono, 16kHz{} …".format(", loudnorm" if use_loudnorm else ""))
+    if use_loudnorm:
+        af = "pan=mono|c0=0.5*c0+0.5*c1,loudnorm=I=-16:LRA=11:TP=-1.5"
+    else:
+        af = "pan=mono|c0=0.5*c0+0.5*c1"
     cmd = [
         "ffmpeg",
         "-y",
@@ -211,7 +176,7 @@ def try_whisper(audio_path: str, model_name: str, language: Optional[str], promp
     raise RuntimeError("Neither Python whisper nor CLI whisper is available.")
 
 
-def try_whisperx_align(audio_path: str, whisper_result: Dict[str, Any], language: Optional[str]) -> Optional[Dict[str, Any]]:
+def try_whisperx_align(audio_path: str, whisper_result: Dict[str, Any], lang_hint: Optional[str]) -> Optional[Dict[str, Any]]:
     try:
         import torch  # type: ignore
         import whisperx  # type: ignore
@@ -222,8 +187,8 @@ def try_whisperx_align(audio_path: str, whisper_result: Dict[str, Any], language
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[whisperx] loading model on {device} …")
 
-    if language is None:
-        language = whisper_result.get("language", "en")
+    # minimal improvement: reuse explicit language if given, else fallback to whisper's
+    language = lang_hint or whisper_result.get("language", "en")
 
     model = whisperx.load_model("large-v3", device)
     audio = whisperx.load_audio(audio_path)
@@ -244,14 +209,15 @@ def extract_words_from_whisper(result: Dict[str, Any]) -> List[Dict[str, Any]]:
             for w in seg["words"]:
                 words.append(
                     {
-                        "word": w.get("word", "").strip(),
+                        # minimal improvement: strip and also replace commas to avoid CSV col drift
+                        "word": w.get("word", "").strip().replace(",", " "),
                         "start": float(w.get("start", segment_start)),
                         "end": float(w.get("end", segment_end)),
                         "conf": float(w.get("probability", seg.get("avg_logprob", 0.0))),
                     }
                 )
         else:
-            text = seg.get("text", "").strip()
+            text = seg.get("text", "").strip().replace(",", " ")
             if text:
                 words.append(
                     {
@@ -268,6 +234,12 @@ def apply_offset(words: List[Dict[str, Any]], offset: float) -> None:
     for w in words:
         w["start"] = max(0.0, w["start"] + offset)
         w["end"] = max(0.0, w["end"] + offset)
+
+
+def sanitize_csv_text(s: str) -> str:
+    # wrap in quotes and escape quotes
+    s = s.replace('"', '""')
+    return f"\"{s}\""
 
 
 def write_csv(words: List[Dict[str, Any]], csv_path: str) -> None:
@@ -326,7 +298,10 @@ def write_lines_csv(lines: List[Dict[str, Any]], out_path: str) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("line,start\n")
         for L in lines:
-            f.write(f"{L['line']},{L['start']:.3f}\n")
+            line_txt = L["line"].strip()
+            if not line_txt:
+                continue
+            f.write(f"{sanitize_csv_text(line_txt)},{L['start']:.3f}\n")
     print(f"[out] wrote karaoke-style CSV to {out_path}")
 
 
@@ -353,6 +328,7 @@ def main() -> None:
     ap.add_argument("--gap-threshold", type=float, default=0.60, help="seconds between words to force new line")
     ap.add_argument("--max-chars", type=int, default=32, help="max chars per line before wrapping")
     ap.add_argument("--no-whisperx", dest="no_whisperx", action="store_true", help="Disable whisperx even if installed")
+    ap.add_argument("--no-loudnorm", dest="no_loudnorm", action="store_true", help="Skip loudnorm, just mono 16k")
     args = ap.parse_args()
 
     input_audio = args.audio
@@ -378,12 +354,13 @@ def main() -> None:
                 trimmed_vocals = str(Path(workdir) / "vocals_trimmed.wav")
                 vocals = ffmpeg_trim(vocals, trimmed_vocals, latency)
                 demucs_offset_applied = latency
+                print(f"[demucs] applied latency {latency:.3f}s for model {args.demucs_model}")
             audio_for_whisper = vocals
         else:
             print("[demucs] using original audio since demucs failed.", file=sys.stderr)
 
     proc_audio = str(Path(workdir) / "mono16k.wav")
-    audio_for_whisper = ffmpeg_to_mono16k_loudnorm(audio_for_whisper, proc_audio)
+    audio_for_whisper = ffmpeg_to_mono16k_loudnorm(audio_for_whisper, proc_audio, use_loudnorm=not args.no_loudnorm)
 
     prompt_parts = []
     if args.artist:
@@ -394,6 +371,19 @@ def main() -> None:
     initial_prompt = " ".join(prompt_parts)
 
     whisper_res = try_whisper(audio_for_whisper, args.model, args.language, initial_prompt)
+
+    # minimal improvement: handle empty result
+    if not whisper_res.get("segments"):
+        print("[warn] whisper produced no segments; writing empty CSVs.", file=sys.stderr)
+        if args.out_csv:
+            ensure_dir(args.out_csv)
+            Path(args.out_csv).write_text("word,start,end,conf\n", encoding="utf-8")
+        if args.out_lines_csv:
+            ensure_dir(args.out_lines_csv)
+            Path(args.out_lines_csv).write_text("line,start\n", encoding="utf-8")
+        if args.out_json:
+            write_json(whisper_res, args.out_json)
+        sys.exit(0)
 
     aligned_res = None
     if not args.no_whisperx:
