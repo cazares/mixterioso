@@ -4,7 +4,9 @@
 #  - prefer scripts/auto_lyrics_fetcher.py
 #  - VALIDATE existing lyrics; refetch if title/artist header mismatch
 #  - CSV nuked when lyrics refetched
-#  - **RENDER ALWAYS USES MONO (48k) AS SOURCE OF TRUTH**
+#  - RENDER ALWAYS USES MONO (48k) AS SOURCE OF TRUTH
+#  - ALIGN PREFERS DEMUCS VOCAL STEM (if present), otherwise falls back to mono
+#  - ALIGN asks for --no-vad to avoid early triggers on noisy mixes
 
 set -euo pipefail
 
@@ -173,7 +175,6 @@ need_fetch=1
 if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
   first_line="$(head -n1 "$LYRICS_PATH" | tr -d '\r')"
   expected="${TITLE}//by//${ARTIST}"
-  # deaccent both
   plain_first="$(echo "$first_line" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
   plain_expected="$(echo "$expected"   | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')"
   if [ "$plain_first" = "$plain_expected" ]; then
@@ -265,20 +266,58 @@ else
   ok "[OK] Mono audio at $AUDIO_MONO_PATH"
 fi
 
-# IMPORTANT: from here on, render MUST use this:
+# render must ALWAYS use mono
 RENDER_AUDIO="$AUDIO_MONO_PATH"
 
-# 3) align -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 3) ALIGN — now try to use vocals stem if we already have it
+#    (first run: likely no stems yet → we fall back to mono)
+# ---------------------------------------------------------------------------
+ALIGN_AUDIO="$AUDIO_MONO_PATH"
+ALIGN_EXTRA_ARGS=()
+
+# try to reuse existing demucs stems for ALIGN (vocals-only is best SNR)
+POSSIBLE_STEMS_DIR="$STEMS_ROOT/${ARTIST_SLUG}-${TITLE_SLUG}/htdemucs_6s/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono"
+if [ -f "$POSSIBLE_STEMS_DIR/vocals.wav" ]; then
+  info "[ALIGN] Using existing Demucs vocal stem for alignment: $POSSIBLE_STEMS_DIR/vocals.wav"
+  ALIGN_AUDIO="$POSSIBLE_STEMS_DIR/vocals.wav"
+else
+  # optional: try a quick 2-stem just for align (additive, safe)
+  DEMUCS_BIN_FOR_ALIGN="$(find_demucs_bin)"
+  if [ -n "$DEMUCS_BIN_FOR_ALIGN" ] && [ $FORCE_ALIGN -eq 1 ]; then
+    info "[ALIGN] No existing vocal stem — running quick demucs 2-stem for ALIGN..."
+    ALIGN_STEMS_DIR="$STEMS_ROOT/${ARTIST_SLUG}-${TITLE_SLUG}/align_stems"
+    mkdir -p "$ALIGN_STEMS_DIR"
+    if $DEMUCS_BIN_FOR_ALIGN --two-stems=vocals -o "$ALIGN_STEMS_DIR" "$AUDIO_MONO_PATH" >/dev/null 2>&1; then
+      # demucs will drop under .../htdemucs/... usually
+      if [ -d "$ALIGN_STEMS_DIR/htdemucs/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono" ] && [ -f "$ALIGN_STEMS_DIR/htdemucs/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono/vocals.wav" ]; then
+        ALIGN_AUDIO="$ALIGN_STEMS_DIR/htdemucs/auto_${ARTIST_SLUG}-${TITLE_SLUG}_mono/vocals.wav"
+        info "[ALIGN] Using freshly separated vocal stem for alignment."
+      else
+        warn "[ALIGN] quick demucs 2-stem didn't produce expected layout; falling back to mono."
+      fi
+    else
+      warn "[ALIGN] demucs 2-stem for ALIGN failed; falling back to mono."
+    fi
+  else
+    info "[ALIGN] No existing vocal stem — aligning on mono."
+  fi
+fi
+
+# we want to tell aligner: DON'T VAD, trust timestamps
+ALIGN_EXTRA_ARGS+=(--no-vad)
+
 if [ -f "$CSV_PATH" ] && [ $FORCE_ALIGN -eq 0 ]; then
   info "[INFO] CSV already exists at $CSV_PATH — skipping alignment."
 else
   if [ -f "$SCRIPTS_DIR/align_to_csv.py" ]; then
-    info ">>> Aligning lyrics to audio (large-v3)..."
+    info ">>> Aligning lyrics to audio (large-v3) — src: $ALIGN_AUDIO ..."
     python3 "$SCRIPTS_DIR/align_to_csv.py" \
-      --audio "$AUDIO_MONO_PATH" \
+      --audio "$ALIGN_AUDIO" \
       --lyrics "$LYRICS_PATH" \
       --out "$CSV_PATH" \
-      --model large-v3
+      --model large-v3 \
+      "${ALIGN_EXTRA_ARGS[@]}"
     ok "[OK] CSV saved to $CSV_PATH"
   else
     err "[ERROR] scripts/align_to_csv.py not found."
@@ -343,7 +382,6 @@ mkdir -p "$MIXED_AUDIO_DIR"
 for pct in "${RENDER_PCTS[@]}"; do
   OUT_NAME="${ARTIST_SLUG}-${TITLE_SLUG}_v${pct}"
 
-  # we still TRY to build a pct mix (for future use), but not used for render
   if [ -n "${BEST_STEMS_DIR:-}" ] && [ -d "$BEST_STEMS_DIR" ]; then
     inputs=()
     filters=()
@@ -392,7 +430,6 @@ EOF
     fi
   fi
 
-  # PRE-NUKE bad existing output (file OR directory)
   FINAL_MP4="$OUTPUT_DIR/${OUT_NAME}.mp4"
   if [ -d "$FINAL_MP4" ]; then
     warn "[CLEANUP] $FINAL_MP4 was a directory — removing it so we can write the mp4."
@@ -402,7 +439,6 @@ EOF
     rm -f "$FINAL_MP4"
   fi
 
-  # RENDER: **force** using RENDER_AUDIO (mono, 48k, align source-of-truth)
   python3 "$SCRIPTS_DIR/render_from_csv.py" \
     --csv "$CSV_PATH" \
     --audio "$RENDER_AUDIO" \
@@ -428,3 +464,4 @@ if command -v open >/dev/null 2>&1; then
   open "$OUTPUT_DIR" >/dev/null 2>&1 || true
 fi
 # end of gen_video.sh
+ 
