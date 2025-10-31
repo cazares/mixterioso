@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 # gen_video.sh — pipeline: lyrics → audio → align → demucs → render (multi-variant)
-# generic version
-#  - prefer scripts/auto_lyrics_fetcher.py
-#  - VALIDATE existing lyrics generically (no artist/song-specific strings)
-#  - if we refetch lyrics, nuke CSV so align re-runs
-#  - HOLD INTRO (title/artist slide) for 5.0s by default before lyrics/notes
+# generic + intro-hold (feature-detected)
 
 set -euo pipefail
 
@@ -44,7 +40,6 @@ slugify() {
   printf '%s\n' "$s"
 }
 
-# deaccent but KEEP SPACES (for YouTube queries and title match)
 deaccent_keep_spaces() {
   local s="$1"
   s=$(printf '%s' "$s" | tr 'áéíóúüñÁÉÍÓÚÜÑ' 'aeiouunaeiouun')
@@ -99,7 +94,7 @@ HPAD_PCT=6
 VALIGN=middle
 GAP_THRESHOLD=5.0
 GAP_DELAY=2.0
-INTRO_HOLD=5.0   # ← show artist/title slide for at least 5s
+INTRO_HOLD=5.0   # default 5s
 
 HAS_VOCAL_PCTS=0
 VOCAL_PCTS_STR=""
@@ -171,10 +166,9 @@ mkdir -p "$STEMS_EXPORT_DIR"
 info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 
 # ---------------------------------------------------------------------------
-# 1) LYRICS (generic validation, no song-specific strings)
+# 1) LYRICS (generic validation)
 # ---------------------------------------------------------------------------
 need_fetch=1
-
 looks_like_lyrics() {
   local path="$1"
   local line_count
@@ -251,7 +245,7 @@ if [ $need_fetch -eq 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2) AUDIO (YouTube) — generic, accent-aware
+# 2) AUDIO (YouTube)
 # ---------------------------------------------------------------------------
 NEED_AUDIO=1
 if [ -f "$AUDIO_PATH" ] && [ $FORCE_AUDIO -eq 0 ]; then
@@ -372,6 +366,12 @@ fi
 
 info ">>> Rendering karaoke video(s): ${RENDER_PCTS[*]}"
 
+# 5.5) detect whether render_from_csv.py supports --intro-hold -------------
+RENDER_SUPPORTS_INTRO=0
+if python3 "$SCRIPTS_DIR/render_from_csv.py" --help 2>/dev/null | grep -q -- "--intro-hold"; then
+  RENDER_SUPPORTS_INTRO=1
+fi
+
 # 6) per-pct: build audio --------------------------------------------------
 MIXED_AUDIO_DIR="$SONGS_DIR/mixed"
 mkdir -p "$MIXED_AUDIO_DIR"
@@ -459,11 +459,16 @@ EOF
     --title "$TITLE"
     --gap-threshold "$GAP_THRESHOLD"
     --gap-delay "$GAP_DELAY"
-    --intro-hold "$INTRO_HOLD"
     --no-open
   )
+
   if [ -n "$CAR_FONT_SIZE" ]; then
     PY_ARGS+=( --car-font-size "$CAR_FONT_SIZE" )
+  fi
+
+  # only pass --intro-hold if python script supports it
+  if [ $RENDER_SUPPORTS_INTRO -eq 1 ]; then
+    PY_ARGS+=( --intro-hold "$INTRO_HOLD" )
   fi
 
   python3 "${PY_ARGS[@]}"
