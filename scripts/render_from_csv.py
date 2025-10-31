@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # render_from_csv.py
 # CSV (line,start[,end]) -> ASS -> ffmpeg -> MP4
-# intro-hold is now clamped to the *raw* time of the 2nd lyric (before offset-video),
-# so a huge --intro-hold (e.g. 100s) won't make offset-video *look* ignored.
+# - intro screen (title/artist) at t=0
+# - --intro-hold is clamped to raw start of 2nd lyric (no offset)
+# - first CSV row that matches "<title>//by//<artist>" is DROPPED
+# - any lyric starting at/before intro_end is pushed to intro_end+0.05s
+# - gap screen never during intro
 
 import argparse
 import csv
@@ -10,7 +13,11 @@ import os
 import random
 import subprocess
 import tempfile
+import unicodedata
 from typing import List, Dict, Any, Optional
+
+
+EPS = 0.05  # 50ms safety so intro & lyric never share a frame
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,8 +36,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--valign", default="middle", choices=["top", "middle", "bottom"], help="Vertical alignment")
     p.add_argument("--output-name", default="output", help="Base name (no extension) for output mp4")
     p.add_argument("--max-chars", type=int, default=0, help="Hard wrap at this many chars (0 = no wrap)")
-    p.add_argument("--artist", default="", help="For intro screen")
-    p.add_argument("--title", default="", help="For intro screen")
+    p.add_argument("--artist", default="", help="For intro screen / header filtering")
+    p.add_argument("--title", default="", help="For intro screen / header filtering")
     p.add_argument("--gap-threshold", type=float, default=5.0, help="Seconds of silence to trigger filler")
     p.add_argument("--gap-delay", type=float, default=2.0, help="Seconds AFTER line end before filler shows")
     p.add_argument(
@@ -59,6 +66,30 @@ def read_csv_rows(path: str) -> List[Dict[str, Any]]:
             end_val = float(end_raw) if end_raw else None
             rows.append({"line": text, "start": start, "end": end_val})
     rows.sort(key=lambda x: x["start"])
+    return rows
+
+
+def normalize_for_compare(s: str) -> str:
+    # lower, deaccent, strip spaces
+    s = s.lower()
+    s = "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+    s = s.replace(" ", "")
+    return s
+
+
+def maybe_drop_header_row(rows: List[Dict[str, Any]], title: str, artist: str) -> List[Dict[str, Any]]:
+    if not rows:
+      return rows
+    if not title or not artist:
+      return rows
+    expected = f"{title}//by//{artist}"
+    norm_expected = normalize_for_compare(expected)
+    first_line = normalize_for_compare(rows[0]["line"])
+    if first_line == norm_expected:
+        return rows[1:]
     return rows
 
 
@@ -153,7 +184,9 @@ def build_intro_events(artist: str, title: str, intro_end: float) -> List[str]:
         text = title
     else:
         text = artist
-    return [f"Dialogue: 0,{sec_to_ass_time(0.0)},{sec_to_ass_time(intro_end)},Default,,0,0,0,,{text}"]
+    return [
+        f"Dialogue: 0,{sec_to_ass_time(0.0)},{sec_to_ass_time(intro_end)},Default,,0,0,0,,{text}"
+    ]
 
 
 def build_gap_event(start: float, end: float) -> str:
@@ -172,6 +205,7 @@ def build_ass_events(rows: List[Dict[str, Any]],
                      title: str,
                      intro_end: float) -> List[str]:
     events: List[str] = []
+    # intro first
     events.extend(build_intro_events(artist, title, intro_end))
 
     for i, row in enumerate(rows):
@@ -185,17 +219,26 @@ def build_ass_events(rows: List[Dict[str, Any]],
         else:
             end = end + extra_delay - offset_video
 
-        text = row["line"]
+        # make sure NO lyric appears on same frame as intro
+        if start < intro_end + EPS:
+            shift = (intro_end + EPS) - start
+            start = intro_end + EPS
+            end = max(end + shift, start + 0.25)
+
         events.append(
-            f"Dialogue: 0,{sec_to_ass_time(start)},{sec_to_ass_time(end)},Default,,0,0,0,,{text}"
+            f"Dialogue: 0,{sec_to_ass_time(start)},{sec_to_ass_time(end)},Default,,0,0,0,,{row['line']}"
         )
 
+        # gap
         if i + 1 < len(rows):
             next_start = rows[i + 1]["start"] + extra_delay - offset_video
+            if next_start < intro_end + EPS:
+                next_start = intro_end + EPS
+
             gap = next_start - end
             if gap >= gap_threshold:
                 gap_start = end + gap_delay
-                if gap_start < next_start and gap_start >= intro_end:
+                if gap_start < next_start and gap_start >= intro_end + EPS:
                     events.append(build_gap_event(gap_start, next_start))
 
     return events
@@ -264,23 +307,22 @@ def main():
     if not rows:
         raise SystemExit("CSV has no usable rows")
 
-    # hard wrap first
+    # drop auto header row like "Title//by//Artist"
+    rows = maybe_drop_header_row(rows, args.title, args.artist)
+
     if args.max_chars and args.max_chars > 0:
         for r in rows:
             r["line"] = wrap_line(r["line"], args.max_chars)
 
-    # raw (NO offset-video) lyric times
+    # raw times (no offset) to clamp intro
     first_raw = rows[0]["start"] + args.extra_delay
     second_raw: Optional[float] = None
     if len(rows) > 1:
         second_raw = rows[1]["start"] + args.extra_delay
 
-    # clamp intro-hold to second_raw (if exists), never below 3s, and never before first_raw
-    intro_end = max(3.0, args.intro_hold)
+    intro_end = max(3.0, args.intro_hold, first_raw)
     if second_raw is not None and intro_end > second_raw:
         intro_end = second_raw
-    if intro_end < first_raw:
-        intro_end = first_raw
 
     out_dir = os.path.join(args.repo_root, "output")
     os.makedirs(out_dir, exist_ok=True)
@@ -293,7 +335,6 @@ def main():
         audio_dur = get_audio_duration(args.audio)
         csv_last_end = max((r["end"] if r["end"] is not None else r["start"] + 2.0) for r in rows)
         csv_last_end = csv_last_end + args.extra_delay - args.offset_video
-
         duration = max(audio_dur, csv_last_end + 0.25, intro_end + 0.25)
 
         try:
