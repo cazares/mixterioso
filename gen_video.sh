@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 # gen_video.sh — pipeline: lyrics → audio → align → demucs → render (multi-variant)
-# Features kept:
-#  - prefers scripts/auto_lyrics_fetcher.py
-#  - header check "<title>//by//<artist>"
-#  - auto DL audio (yt)
-#  - true mono
-#  - alignment to CSV (stable-whisper) with --no-vad compat
-#  - early-lines fix + sanity pass
-#  - Demucs with reuse of existing stems
-#  - multi vocal-pcts rendering
-#  - FINAL ffmpeg A/V shift to force --offset-video
-#  - NEW: demucs auto-prepare (install torchcodec into demucs_env if missing)
+#  - prefer scripts/auto_lyrics_fetcher.py
+#  - validate lyrics header "<title>//by//<artist>"
+#  - on mismatch: refetch + nuke CSV
+#  - ALIGN prefers: existing vocal stem → original stereo → mono
+#  - post-align fix: fix_early_lines_from_audio.py (0–40s)
+#  - post-align sanity: csv_sanity_fill_improbables.py (snap improbable line to just before next)
+#  - NEW: --timings-csv to bypass internal alignment and use user-provided CSV directly
 
 set -euo pipefail
 
@@ -39,7 +35,6 @@ SONGS_DIR="$ROOT/songs"
 OUTPUT_DIR="$ROOT/output"
 STEMS_EXPORT_DIR="$ROOT/output/stems"
 MIXED_AUDIO_DIR="$ROOT/songs/mixed"
-DEMUCS_ENV_DIR="$ROOT/demucs_env"
 
 slugify() {
   local s="$1"
@@ -58,29 +53,16 @@ is_pct() {
   [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 0 ] && [ "$1" -le 100 ]
 }
 
-# ensure demucs_env can actually run demucs (this was the failing point)
-ensure_demucs_ready() {
-  # 1) prefer local env
-  if [ -x "$DEMUCS_ENV_DIR/bin/demucs" ]; then
-    local py="$DEMUCS_ENV_DIR/bin/python3"
-    if [ ! -x "$py" ]; then
-      py="$DEMUCS_ENV_DIR/bin/python"
-    fi
-    if [ -x "$py" ]; then
-      if ! "$py" -c "import torchcodec" >/dev/null 2>&1; then
-        info "[DEMUCS] torchcodec missing in demucs_env, installing..."
-        "$DEMUCS_ENV_DIR/bin/pip3" install --quiet torchcodec || "$DEMUCS_ENV_DIR/bin/pip" install --quiet torchcodec || true
-      fi
-    fi
-    echo "$DEMUCS_ENV_DIR/bin/demucs"
-    return
-  fi
-  # 2) fallback to PATH
+find_demucs_bin() {
   if command -v demucs >/dev/null 2>&1; then
-    echo "demucs"
-    return
+    echo "demucs"; return
   fi
-  # 3) none
+  if [ -x "$ROOT/demucs_env/bin/demucs" ]; then
+    echo "$ROOT/demucs_env/bin/demucs"; return
+  fi
+  if python3 -m demucs --help >/dev/null 2>&1; then
+    echo "python3 -m demucs"; return
+  fi
   echo ""
 }
 
@@ -189,7 +171,7 @@ mkdir -p "$LYRICS_DIR" "$SONGS_DIR" "$OUTPUT_DIR" "$STEMS_EXPORT_DIR" "$MIXED_AU
 info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 
 # ---------------------------------------------------------------------------
-# 1) LYRICS
+# 1) LYRICS (with validation)
 # ---------------------------------------------------------------------------
 need_fetch=1
 if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ] && [ -z "$USER_TIMINGS_CSV" ]; then
@@ -201,26 +183,43 @@ if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ] && [ -z "$USER_TIMINGS_CSV" ]
     info "[INFO] Lyrics header matches — reusing $LYRICS_PATH"
     need_fetch=0
   else
-    warn "[WARN] Lyrics header mismatch (got: \"$first_line\" vs expected: \"$expected\"). Will refetch."
+    warn "[WARN] Lyrics header mismatch — will refetch."
+    need_fetch=1
   fi
 fi
 
 if [ $need_fetch -eq 1 ] && [ -z "$USER_TIMINGS_CSV" ]; then
   if [ -f "$SCRIPTS_DIR/auto_lyrics_fetcher.py" ]; then
-    info ">>> Fetching lyrics (smart) for \"$TITLE\" by $ARTIST..."
-    python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" \
-      --artist "$ARTIST" \
-      --title "$TITLE" \
-      --out "$LYRICS_PATH"
-    ok "[OK] Lyrics saved to $LYRICS_PATH (auto_lyrics_fetcher.py)"
+    info ">>> Fetching lyrics (auto_lyrics_fetcher) for \"${TITLE}\" by ${ARTIST}..."
+    if python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" --artist "$ARTIST" --title "$TITLE" --merge-strategy merge --no-prompt > "$LYRICS_PATH"; then
+      ok "[OK] Lyrics saved to $LYRICS_PATH (auto_lyrics_fetcher.py)"
+    else
+      # ADDITIVE: fallback for fetchers that do not accept --out / redirection
+      if [ $? -ne 0 ]; then
+        python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" --artist "$ARTIST" --title "$TITLE" --lang auto --merge-strategy best --no-prompt
+      fi
+      warn "[WARN] auto_lyrics_fetcher.py failed — trying legacy fetchers."
+      if [ -f "$SCRIPTS_DIR/lyrics_fetcher_smart.py" ]; then
+        python3 "$SCRIPTS_DIR/lyrics_fetcher_smart.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
+        ok "[OK] Lyrics saved to $LYRICS_PATH"
+        rm -f "$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.csv"
+      elif [ -f "$SCRIPTS_DIR/lyrics_fetcher.py" ]; then
+        python3 "$SCRIPTS_DIR/lyrics_fetcher.py" "$ARTIST" "$TITLE" -o "$LYRICS_PATH"
+        ok "[OK] Lyrics saved to $LYRICS_PATH"
+        rm -f "$LYRICS_DIR/${ARTIST_SLUG}-${TITLE_SLUG}.csv"
+      else
+        err "[ERROR] no lyrics fetcher found."
+        exit 1
+      fi
+    fi
   else
-    err "[ERROR] scripts/auto_lyrics_fetcher.py not found."
+    err "[ERROR] no lyrics fetcher script found."
     exit 1
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# 2) AUDIO
+# 2) AUDIO (YT → mp3 → true mono)
 # ---------------------------------------------------------------------------
 NEED_AUDIO=1
 if [ -f "$AUDIO_PATH" ] && [ $FORCE_AUDIO -eq 0 ]; then
@@ -253,7 +252,7 @@ if [ $NEED_AUDIO -eq 1 ]; then
   fi
 fi
 
-# 2b) TRUE MONO
+# 2b) TRUE MONO ------------------------------------------------------------
 if [ -f "$AUDIO_MONO_PATH" ]; then
   if [ $FORCE_AUDIO -eq 1 ] || [ "$AUDIO_PATH" -nt "$AUDIO_MONO_PATH" ]; then
     info ">>> Source MP3 is newer (or --force-audio) — re-converting to TRUE MONO..."
@@ -269,7 +268,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3) ALIGN
+# 3) ALIGN (unless user gave CSV)
 # ---------------------------------------------------------------------------
 if [ -n "$USER_TIMINGS_CSV" ]; then
   info "[INFO] user provided --timings-csv: $USER_TIMINGS_CSV"
@@ -335,9 +334,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4) DEMUCS (with auto-prepare)
+# 4) DEMUCS with REUSE
 # ---------------------------------------------------------------------------
-DEMUCS_BIN="$(ensure_demucs_ready)"
+DEMUCS_BIN="$(find_demucs_bin)"
 BEST_STEMS_DIR=""
 AUDIO_BASENAME="$(basename "$AUDIO_MONO_PATH")"
 AUDIO_BASE_NOEXT="${AUDIO_BASENAME%.*}"
@@ -348,21 +347,40 @@ if [ -n "$DEMUCS_BIN" ]; then
     ok "[REUSE] Found existing Demucs stems at $EXISTING_DIR — skipping separation."
     BEST_STEMS_DIR="$EXISTING_DIR"
   else
-    info ">>> [DEMUCS] Running separation via $DEMUCS_BIN …"
-    if $DEMUCS_BIN -n htdemucs_6s -o "$STEMS_EXPORT_DIR" "$AUDIO_MONO_PATH" 2>&1 | tee "$STEMS_EXPORT_DIR/demucs_6s.log"; then
-      BEST_STEMS_DIR="$STEMS_EXPORT_DIR/htdemucs_6s/$AUDIO_BASE_NOEXT"
+    info ">>> [DEMUCS] Running separation (6 → 4 → 2) …"
+    # ADDITIVE: ensure demucs_env has torchcodec, ignore failures
+    if [ -x "$ROOT/demucs_env/bin/python3" ]; then
+      "$ROOT/demucs_env/bin/python3" -c "import torchcodec" >/dev/null 2>&1 || \
+      "$ROOT/demucs_env/bin/pip3" install torchcodec >/dev/null 2>&1 || true
+    fi
+    DEMUCS_BASE_OUT="$STEMS_EXPORT_DIR"
+
+    if $DEMUCS_BIN -n htdemucs_6s -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH" 2>&1 | tee "$DEMUCS_BASE_OUT/demucs_6s.log"; then
+      BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs_6s/$AUDIO_BASE_NOEXT"
       ok "[OK] Demucs 6-stem succeeded → $BEST_STEMS_DIR"
     else
-      warn "[WARN] 6-stem failed, will continue with mono."
-      BEST_STEMS_DIR=""
+      warn "[WARN] 6-stem failed, trying 4-stem (htdemucs)…"
+      if $DEMUCS_BIN -n htdemucs -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH" 2>&1 | tee "$DEMUCS_BASE_OUT/demucs_4s.log"; then
+        BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs/$AUDIO_BASE_NOEXT"
+        ok "[OK] Demucs 4-stem succeeded → $BEST_STEMS_DIR"
+      else
+        warn "[WARN] 4-stem failed, trying 2-stem (vocals)…"
+        if $DEMUCS_BIN --two-stems=vocals -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH" 2>&1 | tee "$DEMUCS_BASE_OUT/demucs_2s.log"; then
+          BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs/$AUDIO_BASE_NOEXT"
+          ok "[OK] Demucs 2-stem succeeded → $BEST_STEMS_DIR"
+        else
+          err "[ERROR] All demucs attempts failed — will use mono for ALL variants."
+          BEST_STEMS_DIR=""
+        fi
+      fi
     fi
   fi
 else
-  warn "[WARN] demucs not found — will render with mono audio."
+  warn "[WARN] demucs not found — ALL variants will sound the same (mono)."
 fi
 
 # ---------------------------------------------------------------------------
-# 5) RENDER
+# 5) RENDER variants (per vocal pct)
 # ---------------------------------------------------------------------------
 if [ $HAS_VOCAL_PCTS -eq 1 ]; then
   IFS=' ' read -r -a PCTS <<<"$VOCAL_PCTS_STR"
@@ -457,8 +475,7 @@ EOF
   fi
 
   python3 "${PY_ARGS[@]}"
-
-  # post-render A/V shift to FORCE your offset-video even if earlier stages stomped it
+  # post-render offset fix: force final A/V shift if renderer ignored --offset-video
   if [[ "$OFFSET_VIDEO" != "0" && "$OFFSET_VIDEO" != "0.0" && "$OFFSET_VIDEO" != "" ]]; then
     TMP_SHIFTED="$OUTPUT_DIR/${OUT_NAME}_shifted.mp4"
     if [[ "$OFFSET_VIDEO" == -* ]]; then
