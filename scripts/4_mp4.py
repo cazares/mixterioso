@@ -95,26 +95,61 @@ def read_meta(slug: str) -> tuple[str, str]:
 
 
 def read_timings(slug: str) -> list[tuple[float, str]]:
+    """
+    Read timings CSV for slug and return a list of (time_secs, text).
+
+    Supports the format written by 3_timing.py:
+        line_index,time_secs,text
+    and falls back to a 2-column (time,text) format if present.
+    """
     timing_path = TIMINGS_DIR / f"{slug}.csv"
     if not timing_path.exists():
         raise SystemExit(f"Timings CSV not found: {timing_path}")
+
     rows: list[tuple[float, str]] = []
     with timing_path.open(newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
         header = next(reader, None)
-        for row in reader:
-            if len(row) < 2:
-                continue
-            t_str = row[0].strip()
-            text = row[1]
-            if not t_str:
-                continue
+
+        if header and "time_secs" in header:
+            # Preferred format: line_index,time_secs,text
             try:
-                t = float(t_str)
+                idx_time = header.index("time_secs")
             except ValueError:
-                continue
-            rows.append((t, text))
+                idx_time = 1
+            idx_text = header.index("text") if "text" in header else None
+
+            for row in reader:
+                if not row or len(row) <= idx_time:
+                    continue
+                t_str = row[idx_time].strip()
+                if not t_str:
+                    continue
+                try:
+                    t = float(t_str)
+                except ValueError:
+                    continue
+                text = ""
+                if idx_text is not None and len(row) > idx_text:
+                    text = row[idx_text]
+                rows.append((t, text))
+        else:
+            # Fallback: treat first column as time, second as text
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                t_str = row[0].strip()
+                if not t_str:
+                    continue
+                try:
+                    t = float(t_str)
+                except ValueError:
+                    continue
+                text = row[1]
+                rows.append((t, text))
+
     rows.sort(key=lambda x: x[0])
+    log("TIMINGS", f"Loaded {len(rows)} timing rows from {timing_path}", CYAN)
     return rows
 
 
