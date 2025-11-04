@@ -3,6 +3,7 @@ import os
 import re
 import sys
 import time
+import json
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -15,6 +16,7 @@ MM_BASE = "https://api.musixmatch.com/ws/1.1"
 BASE_DIR = Path(__file__).resolve().parent.parent
 TXTS_DIR = BASE_DIR / "txts"
 MP3S_DIR = BASE_DIR / "mp3s"
+META_DIR = BASE_DIR / "meta"
 DOTENV_PATH = BASE_DIR / ".env"
 
 # ANSI colors
@@ -191,6 +193,14 @@ def download_youtube_audio(artist: str, title: str, slug: str) -> tuple[Path, fl
     return target, t1 - t0
 
 
+def write_meta(slug: str, artist: str, title: str, query: str) -> None:
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    meta_path = META_DIR / f"{slug}.json"
+    data = {"slug": slug, "artist": artist, "title": title, "query": query}
+    meta_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    log("META", f"Saved metadata to {meta_path}", GREEN)
+
+
 def suggest_tracking_command(slug: str) -> None:
     cmd = (
         f"python3 scripts/tracking.py "
@@ -234,6 +244,9 @@ def main():
     artist, title, t_genius = get_genius_artist_title(query)
     slug = slugify_title(title)
     log("SLUG", f'Title slug: "{slug}"', GREEN)
+
+    # save metadata for downstream (title card)
+    write_meta(slug, artist, title, query)
 
     TXTS_DIR.mkdir(parents=True, exist_ok=True)
     MP3S_DIR.mkdir(parents=True, exist_ok=True)
