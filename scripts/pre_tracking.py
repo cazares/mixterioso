@@ -71,6 +71,19 @@ def slugify_title(title: str) -> str:
     return base or "song"
 
 
+def confirm_overwrite(path: Path, kind: str) -> bool:
+    log("WARN", f'{kind} "{path}" already exists.', YELLOW)
+    try:
+        ans = input(f'{kind} "{path}" exists. Overwrite / re-download? [y/N]: ').strip().lower()
+    except EOFError:
+        ans = ""
+    if ans == "y":
+        log("WARN", f"User chose to overwrite {kind.lower()} at {path}", YELLOW)
+        return True
+    log("WARN", f"Keeping existing {kind.lower()} at {path}", YELLOW)
+    return False
+
+
 def get_genius_artist_title(query: str):
     token = get_required_env("GENIUS_ACCESS_TOKEN")
 
@@ -147,7 +160,7 @@ def get_musixmatch_lyrics(artist: str, title: str) -> str:
 
 def download_youtube_audio(artist: str, title: str, slug: str) -> Path:
     query = f"{artist} {title}"
-    MP3S_DIR.mkdir(parents=True, exist_ok=True)
+    target = MP3S_DIR / f"{slug}.mp3"
     output_template = str(MP3S_DIR / f"{slug}.%(ext)s")
 
     log("YT", f'Starting yt-dlp search/download for "{query}" → {slug}.mp3', YELLOW)
@@ -175,7 +188,7 @@ def download_youtube_audio(artist: str, title: str, slug: str) -> Path:
 
     t1 = time.perf_counter()
     log("YT", f"yt-dlp finished in {t1 - t0:.2f}s", YELLOW)
-    return MP3S_DIR / f"{slug}.mp3"
+    return target
 
 
 def suggest_tracking_command(slug: str) -> None:
@@ -206,112 +219,79 @@ def suggest_tracking_command(slug: str) -> None:
             print(f"{RED}[NEXT] pbcopy failed with code {e.returncode}.{RESET}", file=sys.stderr)
 
 
-def run_sequential(query: str):
-    log("MODE", f'Sequential pre-tracking for "{query}"', BOLD)
+def main():
+    if len(sys.argv) < 2:
+        print(f"usage: {sys.argv[0]} <search query>", file=sys.stderr)
+        sys.exit(1)
 
-    t0 = time.perf_counter()
+    query = " ".join(sys.argv[1:])
+    log("MODE", f'Pre-tracking (parallel) for "{query}"', BOLD)
+
+    t0_total = time.perf_counter()
+    t0_genius = time.perf_counter()
     artist, title = get_genius_artist_title(query)
-    t1 = time.perf_counter()
+    t1_genius = time.perf_counter()
 
     slug = slugify_title(title)
     log("SLUG", f'Title slug: "{slug}"', GREEN)
-
-    lyrics = get_musixmatch_lyrics(artist, title)
-    t2 = time.perf_counter()
 
     TXTS_DIR.mkdir(parents=True, exist_ok=True)
+    MP3S_DIR.mkdir(parents=True, exist_ok=True)
+
     lyrics_path = TXTS_DIR / f"{slug}.txt"
-    log("FILE", f"Writing lyrics to {lyrics_path}", GREEN)
-    lyrics_path.write_text(lyrics, encoding="utf-8")
-    t3 = time.perf_counter()
+    audio_path = MP3S_DIR / f"{slug}.mp3"
 
-    audio_path = download_youtube_audio(artist, title, slug)
-    t4 = time.perf_counter()
+    # Decide what to do with existing files
+    want_lyrics = True
+    want_audio = True
 
-    print(f'{BOLD}{GREEN}Genius top hit: "{artist} - {title}"{RESET}')
-    print(f"{GREEN}Wrote lyrics to {lyrics_path}{RESET}")
-    print(f"{GREEN}Downloaded audio to {audio_path}{RESET}")
+    if lyrics_path.exists():
+        want_lyrics = confirm_overwrite(lyrics_path, "Lyrics file")
+        # want_lyrics == False means keep existing file
+    if audio_path.exists():
+        want_audio = confirm_overwrite(audio_path, "Audio file")
+        # want_audio == False means keep existing file
 
-    print("\n[timings sequential]")
-    print(f"Genius search:     {t1 - t0:6.2f} s")
-    print(f"Musixmatch lyrics: {t2 - t1:6.2f} s")
-    print(f"Write txt:         {t3 - t2:6.2f} s")
-    print(f"yt-dlp download:   {t4 - t3:6.2f} s")
-    print(f"Total:             {t4 - t0:6.2f} s")
-
-    suggest_tracking_command(slug)
-
-
-def run_parallel(query: str):
-    log("MODE", f'Parallel pre-tracking for "{query}"', BOLD)
-
-    t0 = time.perf_counter()
-    artist, title = get_genius_artist_title(query)
-    t1 = time.perf_counter()
-
-    slug = slugify_title(title)
-    log("SLUG", f'Title slug: "{slug}"', GREEN)
-
+    # Parallel block: only network / disk, no prompts
     t_par_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=2) as ex:
         lyrics_start = time.perf_counter()
-        fut_lyrics = ex.submit(get_musixmatch_lyrics, artist, title)
+        fut_lyrics = ex.submit(get_musixmatch_lyrics, artist, title) if want_lyrics else None
         audio_start = time.perf_counter()
-        fut_audio = ex.submit(download_youtube_audio, artist, title, slug)
+        fut_audio = ex.submit(download_youtube_audio, artist, title, slug) if want_audio else None
 
-        lyrics = fut_lyrics.result()
+        if fut_lyrics is not None:
+            lyrics = fut_lyrics.result()
+        else:
+            lyrics = lyrics_path.read_text(encoding="utf-8") if lyrics_path.exists() else ""
         lyrics_end = time.perf_counter()
-        audio_path = fut_audio.result()
+
+        if fut_audio is not None:
+            audio_path = fut_audio.result()
         audio_end = time.perf_counter()
     t_par_end = time.perf_counter()
 
-    TXTS_DIR.mkdir(parents=True, exist_ok=True)
-    lyrics_path = TXTS_DIR / f"{slug}.txt"
-    log("FILE", f"Writing lyrics to {lyrics_path}", GREEN)
-    lyrics_path.write_text(lyrics, encoding="utf-8")
+    # Write lyrics file if needed
+    if want_lyrics or not lyrics_path.exists():
+        log("FILE", f"Writing lyrics to {lyrics_path}", GREEN)
+        lyrics_path.write_text(lyrics, encoding="utf-8")
+    else:
+        log("FILE", f"Keeping existing lyrics at {lyrics_path}", GREEN)
+
     t_end = time.perf_counter()
 
     print(f'{BOLD}{GREEN}Genius top hit: "{artist} - {title}"{RESET}')
-    print(f"{GREEN}Wrote lyrics to {lyrics_path}{RESET}")
-    print(f"{GREEN}Downloaded audio to {audio_path}{RESET}")
+    print(f"{GREEN}Lyrics file: {lyrics_path}{RESET}")
+    print(f"{GREEN}Audio file:  {audio_path}{RESET}")
 
-    print("\n[timings parallel]")
-    print(f"Genius search:          {t1 - t0:6.2f} s")
+    print("\n[timings]")
+    print(f"Genius search:          {t1_genius - t0_genius:6.2f} s")
     print(f"Musixmatch lyrics call: {lyrics_end - lyrics_start:6.2f} s")
     print(f"yt-dlp download call:   {audio_end - audio_start:6.2f} s")
     print(f"Parallel block (wall):  {t_par_end - t_par_start:6.2f} s")
-    print(f"Write txt:              {t_end - t_par_end:6.2f} s")
-    print(f"Total:                  {t_end - t0:6.2f} s")
+    print(f"Total:                  {t_end - t0_total:6.2f} s")
 
     suggest_tracking_command(slug)
-
-
-def parse_args(argv):
-    mode = "parallel"
-    query_parts = []
-    for arg in argv[1:]:
-        if arg == "--sequential":
-            mode = "sequential"
-        elif arg == "--parallel":
-            mode = "parallel"
-        else:
-            query_parts.append(arg)
-
-    if not query_parts:
-        print(f"usage: {argv[0]} [--sequential|--parallel] <search query>", file=sys.stderr)
-        sys.exit(1)
-
-    query = " ".join(query_parts)
-    return mode, query
-
-
-def main():
-    mode, query = parse_args(sys.argv)
-
-    if mode == "sequential":
-        run_sequential(query)
-    else:
-        run_parallel(query)
 
 
 if __name__ == "__main__":
