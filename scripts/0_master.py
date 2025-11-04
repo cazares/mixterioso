@@ -58,7 +58,7 @@ def run(cmd: list[str], section: str) -> float:
 def detect_slug_from_latest_mp3() -> str:
     mp3s = sorted(MP3_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
     if not mp3s:
-        raise SystemExit("No mp3s found in mp3s/ after gen_txt_mp3.")
+        raise SystemExit("No mp3s found in mp3s/ after 1_txt_mp3.")
     return slugify(mp3s[-1].stem)
 
 
@@ -83,7 +83,7 @@ def detect_assets(slug: str, profile: str) -> dict:
 
     step1_done = txt.exists() and mp3.exists() and meta.exists()
     if profile == "lyrics":
-        step2_done = True  # stems not required
+        step2_done = True
     else:
         step2_done = mix_wav.exists()
     step3_done = timing_csv.exists()
@@ -101,10 +101,10 @@ def print_asset_status(slug: str, profile: str, status: dict) -> None:
     print()
     print(f"{BOLD}Pipeline status for slug={slug}, profile={profile}{RESET}")
     labels = {
-        1: "txt+mp3 generation (gen_txt_mp3)",
+        1: "txt+mp3 generation (1_txt_mp3)",
         2: "stems/mix (demucs + 2_stems)",
-        3: "timings CSV (gen_timing)",
-        4: "mp4 generation (gen_mp4)",
+        3: "timings CSV (3_timing)",
+        4: "mp4 generation (4_mp4)",
     }
     for step in range(1, 5):
         s = "DONE" if status.get(step) else "MISSING"
@@ -129,16 +129,16 @@ def parse_steps_string(s: str) -> list[int]:
     return steps
 
 
-def run_step1_gen_txt_mp3(query: str) -> tuple[str, float]:
+def run_step1_txt_mp3(query: str) -> tuple[str, float]:
     t = run([sys.executable, str(SCRIPTS_DIR / "1_txt_mp3.py"), query], "STEP1")
     slug = detect_slug_from_latest_mp3()
-    log("STEP1", f"gen_txt_mp3 slug detected: {slug}", GREEN)
+    log("STEP1", f"1_txt_mp3 slug detected: {slug}", GREEN)
     return slug, t
 
 
-def run_step2_stems(slug: str, profile: str, model: str) -> float:
+def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> float:
     if profile == "lyrics":
-        log("STEP2", "Profile 'lyrics' selected, skipping stem generation and mix.", YELLOW)
+        log("STEP2", "Profile 'lyrics' selected, skipping stems/mix.", YELLOW)
         return 0.0
 
     mp3_path = MP3_DIR / f"{slug}.mp3"
@@ -146,7 +146,23 @@ def run_step2_stems(slug: str, profile: str, model: str) -> float:
     if not mp3_path.exists() or not txt_path.exists():
         raise SystemExit(f"Missing assets for step 2: {mp3_path} or {txt_path}.")
 
-    t_demucs = run(["demucs", "-n", model, str(mp3_path)], "STEP2-DEMUX")
+    separated_dir = BASE_DIR / "separated" / model / slug
+    reuse_stems = False
+    if separated_dir.exists():
+        if interactive:
+            ans = input(
+                f"Stems already exist at {separated_dir}. "
+                "Reuse them and skip Demucs? [Y/n]: "
+            ).strip().lower()
+            reuse_stems = ans in ("", "y", "yes")
+        else:
+            reuse_stems = True
+
+    t_demucs = 0.0
+    if not reuse_stems:
+        t_demucs = run(["demucs", "-n", model, str(mp3_path)], "STEP2-DEMUX")
+    else:
+        log("STEP2", f"Reusing existing stems at {separated_dir}", YELLOW)
 
     t_mix_ui = run(
         [
@@ -186,7 +202,7 @@ def run_step2_stems(slug: str, profile: str, model: str) -> float:
     return total
 
 
-def run_step3_gen_timing(slug: str) -> float:
+def run_step3_timing(slug: str) -> float:
     mp3_path = MP3_DIR / f"{slug}.mp3"
     txt_path = TXT_DIR / f"{slug}.txt"
     timing_path = TIMINGS_DIR / f"{slug}.csv"
@@ -208,7 +224,7 @@ def run_step3_gen_timing(slug: str) -> float:
     return t
 
 
-def run_step4_gen_mp4(slug: str, profile: str) -> float:
+def run_step4_mp4(slug: str, profile: str) -> float:
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "4_mp4.py"),
@@ -226,7 +242,7 @@ def parse_args(argv=None):
         description="Karaoke pipeline master (1=txt/mp3, 2=stems, 3=timing, 4=mp4)."
     )
     src = p.add_mutually_exclusive_group()
-    src.add_argument("--query", type=str, help="Search query for step 1 (gen_txt_mp3)")
+    src.add_argument("--query", type=str, help="Search query for step 1 (1_txt_mp3)")
     src.add_argument("--slug", type=str, help="Slug to operate on (e.g. californication)")
     p.add_argument(
         "--profile",
@@ -245,8 +261,8 @@ def interactive_slug_and_steps(args):
     t1 = 0.0
 
     if args.query and not slug:
-        log("MASTER", f'Running step 1 gen_txt_mp3 for query "{args.query}"', CYAN)
-        slug, t1 = run_step1_gen_txt_mp3(args.query)
+        log("MASTER", f'Running step 1 (1_txt_mp3) for query "{args.query}"', CYAN)
+        slug, t1 = run_step1_txt_mp3(args.query)
 
     if not slug:
         try:
@@ -254,8 +270,8 @@ def interactive_slug_and_steps(args):
         except EOFError:
             q = ""
         if q:
-            log("MASTER", f'Running step 1 gen_txt_mp3 for query "{q}"', CYAN)
-            slug, t1 = run_step1_gen_txt_mp3(q)
+            log("MASTER", f'Running step 1 (1_txt_mp3) for query "{q}"', CYAN)
+            slug, t1 = run_step1_txt_mp3(q)
         else:
             try:
                 slug = input("Enter existing slug (e.g. californication): ").strip()
@@ -284,7 +300,7 @@ def interactive_slug_and_steps(args):
     steps = parse_steps_string(s)
     if 1 in steps and not args.query:
         try:
-            q = input("Step 1 selected. Enter search query for gen_txt_mp3: ").strip()
+            q = input("Step 1 selected. Enter search query for 1_txt_mp3: ").strip()
         except EOFError:
             q = ""
         if not q:
@@ -307,7 +323,7 @@ def noninteractive_slug_and_steps(args):
     if 1 in steps:
         if not args.query:
             raise SystemExit("Step 1 selected but no --query given.")
-        slug, _ = run_step1_gen_txt_mp3(args.query)
+        slug, _ = run_step1_txt_mp3(args.query)
 
     if not slug:
         raise SystemExit("Slug is required for steps 2–4 (use --slug or include step 1 with --query).")
@@ -336,16 +352,16 @@ def main(argv=None):
     if 1 in steps and not args.skip_ui and t1 == 0.0:
         if not args.query:
             raise SystemExit("Interactive step 1 requires a query.")
-        slug, t1 = run_step1_gen_txt_mp3(args.query)
+        slug, t1 = run_step1_txt_mp3(args.query)
 
     if 2 in steps:
-        t2 = run_step2_stems(slug, args.profile, args.model)
+        t2 = run_step2_stems(slug, args.profile, args.model, interactive=not args.skip_ui)
 
     if 3 in steps:
-        t3 = run_step3_gen_timing(slug)
+        t3 = run_step3_timing(slug)
 
     if 4 in steps:
-        t4 = run_step4_gen_mp4(slug, args.profile)
+        t4 = run_step4_mp4(slug, args.profile)
 
     total_end = time.perf_counter()
     total = total_end - total_start
