@@ -77,7 +77,7 @@ def parse_time_string(s: str) -> float:
 def load_timings(timing_path: Path, num_lines: int) -> list[dict]:
     if not timing_path.exists():
         return []
-    out = []
+    out: list[dict] = []
     with timing_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -95,13 +95,16 @@ def load_timings(timing_path: Path, num_lines: int) -> list[dict]:
 class AudioPlayer:
     def __init__(self, audio_path: Path):
         self.audio_path = audio_path
-        self.proc = None
+        self.proc: subprocess.Popen | None = None
         self.offset = 0.0
-        self.start_wall = None
+        self.start_wall: float | None = None
         self.duration = ffprobe_duration(audio_path)
+        self.paused = False
+        self._paused_pos: float | None = None
 
     def start(self, offset: float) -> None:
         self.stop()
+        self.paused = False
         self.offset = max(0.0, min(self.duration, offset))
         self.start_wall = time.monotonic()
         cmd = [
@@ -126,6 +129,10 @@ class AudioPlayer:
         self.proc = None
 
     def current_pos(self) -> float:
+        if self.paused:
+            if self._paused_pos is not None:
+                return self._paused_pos
+            return self.offset
         if self.start_wall is None:
             return self.offset
         if self.proc is not None and self.proc.poll() is None:
@@ -133,7 +140,24 @@ class AudioPlayer:
         return min(self.duration, self.offset + (time.monotonic() - self.start_wall))
 
     def finished(self) -> bool:
+        if self.paused:
+            return False
         return self.current_pos() >= self.duration - 0.01
+
+    def pause_toggle(self) -> None:
+        if not self.paused:
+            self._paused_pos = self.current_pos()
+            self.stop()
+            self.paused = True
+        else:
+            pos = self._paused_pos if self._paused_pos is not None else self.current_pos()
+            self.start(pos)
+            self.paused = False
+
+    def restart(self) -> None:
+        self._paused_pos = 0.0
+        self.start(0.0)
+        self.paused = False
 
 
 def fmt_time(sec: float) -> str:
@@ -143,15 +167,25 @@ def fmt_time(sec: float) -> str:
     return f"{m:02d}:{s:05.2f}"
 
 
-def timing_ui(stdscr, lyrics, timings, history, player: AudioPlayer, timing_path: Path, rewind_step: float, start_pos: float):
+def timing_ui(
+    stdscr,
+    lyrics,
+    timings,
+    history,
+    player: AudioPlayer,
+    timing_path: Path,
+    rewind_step: float,
+    start_pos: float,
+):
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)   # current line
-    curses.init_pair(2, curses.COLOR_CYAN, -1)                   # header
+    curses.init_pair(2, curses.COLOR_CYAN, -1)                   # status bar
     curses.init_pair(3, curses.COLOR_YELLOW, -1)                 # controls
     curses.init_pair(4, curses.COLOR_GREEN, -1)                  # previous
     curses.init_pair(5, curses.COLOR_MAGENTA, -1)                # next
+    curses.init_pair(6, curses.COLOR_YELLOW, -1)                 # time highlight
 
     num_lines = len(lyrics)
 
@@ -173,32 +207,69 @@ def timing_ui(stdscr, lyrics, timings, history, player: AudioPlayer, timing_path
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         pos = player.current_pos()
-        top = f"[TIMING] {timing_path.name}  pos={fmt_time(pos)}/{fmt_time(player.duration)}  line={current_index+1}/{num_lines}"
-        stdscr.attron(curses.color_pair(2))
-        stdscr.addstr(0, 0, top[: w - 1])
-        stdscr.attroff(curses.color_pair(2))
 
+        # Top controls bar
+        controls = (
+            "[SPACE/ENTER] tag  "
+            "[1] rewind  "
+            "[0] undo/ff  "
+            "[p] pause/play  "
+            "[r] restart  "
+            "[g] goto time  "
+            "[q] save+quit  "
+            "[ESC] abort"
+        )
+        stdscr.attron(curses.color_pair(3))
+        stdscr.addstr(0, 0, controls[: w - 1])
+        stdscr.attroff(curses.color_pair(3))
+
+        # Lyric lines
         prev_line = lyrics[current_index - 1] if current_index > 0 else ""
         curr_line = lyrics[current_index] if current_index < num_lines else "<done>"
         next_line = lyrics[current_index + 1] if current_index + 1 < num_lines else ""
 
         mid = h // 2
-        if prev_line:
+        if prev_line and mid - 2 > 0:
             stdscr.attron(curses.color_pair(4))
             stdscr.addstr(mid - 2, 0, prev_line[: w - 1])
             stdscr.attroff(curses.color_pair(4))
         stdscr.attron(curses.color_pair(1))
         stdscr.addstr(mid, 0, curr_line[: w - 1])
         stdscr.attroff(curses.color_pair(1))
-        if next_line:
+        if next_line and mid + 2 < h - 1:
             stdscr.attron(curses.color_pair(5))
             stdscr.addstr(mid + 2, 0, next_line[: w - 1])
             stdscr.attroff(curses.color_pair(5))
 
-        controls = "[SPACE/ENTER] tag  [1] rewind  [0] undo-rewind  [g] goto time  [q] save+quit  [ESC] abort"
-        stdscr.attron(curses.color_pair(3))
-        stdscr.addstr(h - 1, 0, controls[: w - 1])
-        stdscr.attroff(curses.color_pair(3))
+        # Bottom status bar with highlighted time
+        status_left = f"[TIMING] {timing_path.name}  "
+        pos_str = f"pos={fmt_time(pos)}/{fmt_time(player.duration)}"
+        status_right = f"  line={current_index+1}/{num_lines}"
+        if player.paused:
+            status_right += "  [PAUSED]"
+
+        row = h - 1
+        col = 0
+        stdscr.attron(curses.color_pair(2))
+        if col < w:
+            s = status_left[: w - col - 1]
+            stdscr.addstr(row, col, s)
+            col += len(s)
+        stdscr.attroff(curses.color_pair(2))
+
+        if col < w:
+            stdscr.attron(curses.color_pair(6) | curses.A_BOLD)
+            s = pos_str[: w - col - 1]
+            stdscr.addstr(row, col, s)
+            col += len(s)
+            stdscr.attroff(curses.A_BOLD)
+            stdscr.attroff(curses.color_pair(6))
+
+        if col < w:
+            stdscr.attron(curses.color_pair(2))
+            s = status_right[: w - col - 1]
+            stdscr.addstr(row, col, s)
+            stdscr.attroff(curses.color_pair(2))
 
         stdscr.refresh()
 
@@ -216,11 +287,13 @@ def timing_ui(stdscr, lyrics, timings, history, player: AudioPlayer, timing_path
         if ch in (ord("q"), ord("Q")):
             saving = True
             break
+
         if ch in (ord(" "), 10, 13):
             if current_index < num_lines:
                 timings.append({"line_index": current_index, "time": player.current_pos()})
                 current_index = min(current_index + 1, num_lines)
             continue
+
         if ch == ord("1"):
             pos = player.current_pos()
             if pos <= 0.1:
@@ -232,21 +305,49 @@ def timing_ui(stdscr, lyrics, timings, history, player: AudioPlayer, timing_path
             current_index = recompute_current_index(new_pos)
             player.start(new_pos)
             continue
+
         if ch == ord("0"):
-            if not history:
-                continue
-            prev_pos, prev_timings, prev_idx = history.pop()
-            timings[:] = prev_timings
-            current_index = prev_idx
-            player.start(prev_pos)
+            if history:
+                prev_pos, prev_timings, prev_idx = history.pop()
+                timings[:] = prev_timings
+                current_index = prev_idx
+                player.start(prev_pos)
+            else:
+                pos = player.current_pos()
+                new_pos = min(player.duration, pos + rewind_step)
+                current_index = recompute_current_index(new_pos)
+                player.start(new_pos)
             continue
+
+        if ch in (ord("p"), ord("P")):
+            player.pause_toggle()
+            continue
+
+        if ch in (ord("r"), ord("R")):
+            history.clear()
+            timings[:] = []
+            current_index = 0
+            player.restart()
+            continue
+
         if ch in (ord("g"), ord("G")):
             curses.echo()
-            stdscr.addstr(h - 2, 0, "Go to time (mm:ss or seconds): ")
+            stdscr.timeout(-1)
+            prompt = "Go to time (mm:ss or seconds): "
+            stdscr.move(h - 2, 0)
             stdscr.clrtoeol()
+            stdscr.attron(curses.color_pair(3))
+            stdscr.addstr(h - 2, 0, prompt[: w - 1])
+            stdscr.attroff(curses.color_pair(3))
             stdscr.refresh()
-            s = stdscr.getstr(h - 2, 32).decode("utf-8")
+            try:
+                s = stdscr.getstr(h - 2, len(prompt)).decode("utf-8")
+            except Exception:
+                s = ""
             curses.noecho()
+            stdscr.timeout(50)
+            if not s.strip():
+                continue
             try:
                 tgt = parse_time_string(s)
             except Exception:
@@ -303,7 +404,7 @@ def main(argv=None):
         raise SystemExit("No lyrics lines found.")
 
     timings = load_timings(timing_path, len(lyrics))
-    history = []
+    history: list[tuple[float, list[dict], int]] = []
 
     player = AudioPlayer(audio_path)
     if args.start:
@@ -342,3 +443,5 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
+# end of timing_editor.py
