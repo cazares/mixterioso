@@ -25,7 +25,6 @@ def log(section: str, msg: str, color: str = CYAN) -> None:
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = BASE_DIR / "scripts"
 TXT_DIR = BASE_DIR / "txts"
 MP3_DIR = BASE_DIR / "mp3s"
 META_DIR = BASE_DIR / "meta"
@@ -81,11 +80,9 @@ def genius_search(query: str, token: str) -> dict:
 
 def musixmatch_search_track(artist: str, title: str, api_key: str) -> int:
     url = "https://api.musixmatch.com/ws/1.1/track.search"
-    q_track = f"{title}"
-    q_artist = artist
     params = {
-        "q_track": q_track,
-        "q_artist": q_artist,
+        "q_track": title,
+        "q_artist": artist,
         "f_has_lyrics": 1,
         "page_size": 1,
         "s_track_rating": "desc",
@@ -222,7 +219,7 @@ def copy_to_clipboard(text: str) -> bool:
 
 
 def suggest_next_command(slug: str) -> None:
-    cmd = f"python3 scripts/gen_master.py --slug {slug}"
+    cmd = f"python3 scripts/0_master.py --slug {slug}"
     print()
     print(f"{BOLD}{CYAN}Next suggested command (to continue pipeline):{RESET}")
     print(f"  {BOLD}{cmd}{RESET}")
@@ -283,4 +280,4 @@ def main(argv=None):
 if __name__ == "__main__":
     main()
 
-# end of gen_txt_mp3.py
+# end of 1_txt_mp3.py

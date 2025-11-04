@@ -81,11 +81,19 @@ def detect_assets(slug: str, profile: str) -> dict:
     timing_csv = TIMINGS_DIR / f"{slug}.csv"
     mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
 
+    step1_done = txt.exists() and mp3.exists() and meta.exists()
+    if profile == "lyrics":
+        step2_done = True  # stems not required
+    else:
+        step2_done = mix_wav.exists()
+    step3_done = timing_csv.exists()
+    step4_done = mp4.exists()
+
     return {
-        1: txt.exists() and mp3.exists() and meta.exists(),
-        2: mix_wav.exists(),
-        3: timing_csv.exists(),
-        4: mp4.exists(),
+        1: step1_done,
+        2: step2_done,
+        3: step3_done,
+        4: step4_done,
     }
 
 
@@ -94,7 +102,7 @@ def print_asset_status(slug: str, profile: str, status: dict) -> None:
     print(f"{BOLD}Pipeline status for slug={slug}, profile={profile}{RESET}")
     labels = {
         1: "txt+mp3 generation (gen_txt_mp3)",
-        2: "stems/mix (demucs + gen_stems)",
+        2: "stems/mix (demucs + 2_stems)",
         3: "timings CSV (gen_timing)",
         4: "mp4 generation (gen_mp4)",
     }
@@ -122,54 +130,51 @@ def parse_steps_string(s: str) -> list[int]:
 
 
 def run_step1_gen_txt_mp3(query: str) -> tuple[str, float]:
-    t = run([sys.executable, str(SCRIPTS_DIR / "gen_txt_mp3.py"), query], "STEP1")
+    t = run([sys.executable, str(SCRIPTS_DIR / "1_txt_mp3.py"), query], "STEP1")
     slug = detect_slug_from_latest_mp3()
     log("STEP1", f"gen_txt_mp3 slug detected: {slug}", GREEN)
     return slug, t
 
 
-def run_step2_gen_stems(slug: str, profile: str, model: str) -> float:
+def run_step2_stems(slug: str, profile: str, model: str) -> float:
+    if profile == "lyrics":
+        log("STEP2", "Profile 'lyrics' selected, skipping stem generation and mix.", YELLOW)
+        return 0.0
+
     mp3_path = MP3_DIR / f"{slug}.mp3"
     txt_path = TXT_DIR / f"{slug}.txt"
     if not mp3_path.exists() or not txt_path.exists():
         raise SystemExit(f"Missing assets for step 2: {mp3_path} or {txt_path}.")
 
-    # 2a: Demucs separation
     t_demucs = run(["demucs", "-n", model, str(mp3_path)], "STEP2-DEMUX")
 
-    # 2b: Mix UI (writes mixes/<slug>.json)
     t_mix_ui = run(
         [
             sys.executable,
-            str(SCRIPTS_DIR / "gen_stems.py"),
-            "--txt",
-            str(txt_path),
+            str(SCRIPTS_DIR / "2_stems.py"),
             "--mp3",
             str(mp3_path),
             "--profile",
             profile,
+            "--model",
+            model,
             "--mix-ui-only",
         ],
         "STEP2-MIXUI",
     )
 
-    # 2c: Render mix WAV
-    mix_cfg = MIXES_DIR / f"{slug}.json"
     out_wav = MIXES_DIR / f"{slug}_{profile}.wav"
     t_render = run(
         [
             sys.executable,
-            str(SCRIPTS_DIR / "gen_stems.py"),
+            str(SCRIPTS_DIR / "2_stems.py"),
             "--mp3",
             str(mp3_path),
             "--profile",
             profile,
-            "--mix-config",
-            str(mix_cfg),
-            "--render-only",
-            "--reuse-stems",
             "--model",
             model,
+            "--render-only",
             "--output",
             str(out_wav),
         ],
@@ -190,7 +195,7 @@ def run_step3_gen_timing(slug: str) -> float:
     t = run(
         [
             sys.executable,
-            str(SCRIPTS_DIR / "gen_timing.py"),
+            str(SCRIPTS_DIR / "3_timing.py"),
             "--txt",
             str(txt_path),
             "--audio",
@@ -206,7 +211,7 @@ def run_step3_gen_timing(slug: str) -> float:
 def run_step4_gen_mp4(slug: str, profile: str) -> float:
     cmd = [
         sys.executable,
-        str(SCRIPTS_DIR / "gen_mp4.py"),
+        str(SCRIPTS_DIR / "4_mp4.py"),
         "--slug",
         slug,
         "--profile",
@@ -334,7 +339,7 @@ def main(argv=None):
         slug, t1 = run_step1_gen_txt_mp3(args.query)
 
     if 2 in steps:
-        t2 = run_step2_gen_stems(slug, args.profile, args.model)
+        t2 = run_step2_stems(slug, args.profile, args.model)
 
     if 3 in steps:
         t3 = run_step3_gen_timing(slug)
@@ -358,4 +363,4 @@ def main(argv=None):
 if __name__ == "__main__":
     main()
 
-# end of gen_master.py
+# end of 0_master.py

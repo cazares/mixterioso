@@ -246,12 +246,12 @@ def timing_ui(
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)   # current line
-    curses.init_pair(2, curses.COLOR_CYAN, -1)                   # status bar
-    curses.init_pair(3, curses.COLOR_YELLOW, -1)                 # controls
-    curses.init_pair(4, curses.COLOR_GREEN, -1)                  # previous
-    curses.init_pair(5, curses.COLOR_MAGENTA, -1)                # next
-    curses.init_pair(6, curses.COLOR_YELLOW, -1)                 # time highlight
+    curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(2, curses.COLOR_CYAN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_GREEN, -1)
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(6, curses.COLOR_YELLOW, -1)
 
     num_lines = len(lyrics)
 
@@ -275,7 +275,6 @@ def timing_ui(
         h, w = stdscr.getmaxyx()
         pos = player.current_pos()
 
-        # Top bars
         controls1 = (
             "[SPACE/ENTER] tag  "
             "[<] rewind  [u] undo  [>] ff  [r] restart  [g] goto  "
@@ -291,7 +290,6 @@ def timing_ui(
             stdscr.addstr(1, 0, controls2[: w - 1])
         stdscr.attroff(curses.color_pair(3))
 
-        # Lyric lines
         mid = h // 2
         prev_line = lyrics[current_index - 1] if current_index > 0 else ""
         curr_line = lyrics[current_index] if current_index < num_lines else "<done>"
@@ -309,13 +307,11 @@ def timing_ui(
             stdscr.addstr(mid + 2, 0, next_line[: w - 1])
             stdscr.attroff(curses.color_pair(5))
 
-        # Message line
         if last_msg and h >= 3:
             stdscr.attron(curses.color_pair(3))
             stdscr.addstr(h - 2, 0, last_msg[: w - 1])
             stdscr.attroff(curses.color_pair(3))
 
-        # Bottom status bar
         status_left = f"[TIMING] {timing_path.name}  "
         pos_str = f"pos={fmt_time(pos)}/{fmt_time(player.duration)}"
         status_right = f"  line={current_index+1}/{num_lines}"
@@ -355,15 +351,13 @@ def timing_ui(
         if ch == -1:
             continue
 
-        # Quit / abort
-        if ch == 27:  # ESC
+        if ch == 27:
             aborted = True
             break
         if ch in (ord("q"), ord("Q")):
             saving = True
             break
 
-        # Tag current lyric line
         if ch in (ord(" "), 10, 13):
             if current_index < num_lines:
                 t = player.current_pos()
@@ -381,7 +375,6 @@ def timing_ui(
                     break
             continue
 
-        # Note events
         if ch in NOTE_KEYS:
             t = player.current_pos()
             glyph = NOTE_KEYS[ch]
@@ -395,7 +388,6 @@ def timing_ui(
             last_msg = f"Inserted {glyph} at {fmt_time(t)}"
             continue
 
-        # Rewind: < or LEFT
         if ch in (ord("<"), curses.KEY_LEFT):
             pos_before = player.current_pos()
             if pos_before <= 0.1:
@@ -410,7 +402,6 @@ def timing_ui(
             last_msg = f"Rewind to {fmt_time(new_pos)}, deleted timings in window"
             continue
 
-        # Undo last rewind
         if ch in (ord("u"), ord("U")):
             if history:
                 prev_pos, prev_timings, prev_idx = history.pop()
@@ -422,7 +413,6 @@ def timing_ui(
                 last_msg = "Nothing to undo"
             continue
 
-        # Fast-forward: > or RIGHT (no delete)
         if ch in (ord(">"), curses.KEY_RIGHT):
             pos_before = player.current_pos()
             new_pos = min(player.duration, pos_before + rewind_step)
@@ -431,7 +421,6 @@ def timing_ui(
             last_msg = f"Fast-forward to {fmt_time(new_pos)}"
             continue
 
-        # Pause / play
         if ch in (ord("p"), ord("P")):
             if player.paused:
                 player.pause_toggle()
@@ -441,7 +430,6 @@ def timing_ui(
                 last_msg = f"Paused at {fmt_time(player.current_pos())}"
             continue
 
-        # Restart with prompts
         if ch in (ord("r"), ord("R")):
             pos_here = player.current_pos()
             pos_here_str = fmt_time(pos_here)
@@ -466,7 +454,6 @@ def timing_ui(
             player.restart()
             continue
 
-        # Goto time
         if ch in (ord("g"), ord("G")):
             curses.echo()
             stdscr.timeout(-1)
@@ -587,4 +574,4 @@ def main(argv=None):
 if __name__ == "__main__":
     main()
 
-# end of gen_timing.py
+# end of 3_timing.py

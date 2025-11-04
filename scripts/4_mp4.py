@@ -67,7 +67,6 @@ def ask_font_size(default: int = 120) -> int:
 
 
 def secs_to_ass_time(t: float) -> str:
-    # Convert seconds to ASS time H:MM:SS.cc
     if t < 0:
         t = 0.0
     h = int(t // 3600)
@@ -213,7 +212,6 @@ def main(argv=None):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     MIXES_DIR.mkdir(parents=True, exist_ok=True)
 
-    # pick audio
     if args.profile == "lyrics":
         audio_path = MP3_DIR / f"{slug}.mp3"
     else:
@@ -222,33 +220,25 @@ def main(argv=None):
     if not audio_path.exists():
         raise SystemExit(f"Audio not found for profile={args.profile}: {audio_path}")
 
-    txt_path = TXT_DIR / f"{slug}.txt"
-    if not txt_path.exists():
-        log("WARN", f"Lyrics txt not found at {txt_path}; subtitles will still use timing text.", YELLOW)
-
     duration = ffprobe_duration(audio_path)
     rows, timing_csv_path = load_timings(slug)
     log("MP4", f"Using timings from {timing_csv_path}", GREEN)
 
-    # build ASS subtitles file
     ass_path = build_ass_from_timings(slug, rows, duration)
 
-    # title card text
     artist, title = load_meta(slug)
     if title and artist:
         lines = [title, "", "by", "", artist]
     elif title:
         lines = [title]
     else:
-        pretty_slug = slug.replace("_", " ")
-        lines = [pretty_slug]
+        lines = [slug.replace("_", " ")]
 
     META_DIR.mkdir(parents=True, exist_ok=True)
     title_txt = META_DIR / f"{slug}_title.txt"
     title_txt.write_text("\n".join(lines), encoding="utf-8")
     log("MP4", f"Wrote title text file to {title_txt}", GREEN)
 
-    # font size
     if args.font_size is not None:
         font_size = args.font_size
     else:
@@ -256,9 +246,13 @@ def main(argv=None):
 
     out_mp4 = OUTPUT_DIR / f"{slug}_{args.profile}.mp4"
 
+    # use POSIX-style paths to keep ffmpeg filter happy
+    ass_str = ass_path.as_posix()
+    title_str = title_txt.as_posix()
+
     filter_complex = (
-        f"[0:v]subtitles={ass_path.as_posix()}[sub];"
-        f"[sub]drawtext=textfile={title_txt.as_posix()}:"
+        f"[0:v]subtitles={ass_str}[sub];"
+        f"[sub]drawtext=textfile={title_str}:"
         f"fontcolor=white:fontsize={font_size}:"
         f"x=(w-text_w)/2:y=(h-text_h)/2:"
         f"enable='lte(t,3)'[v]"
@@ -297,7 +291,6 @@ def main(argv=None):
     log("MP4", f'Title card: "{" / ".join(lines)}" (first ~3 seconds)', GREEN)
     log("MP4", f"Subtitles from {timing_csv_path}", GREEN)
 
-    # post actions
     try:
         ans = input("Open output directory? [y/N]: ").strip().lower()
     except EOFError:
@@ -316,4 +309,4 @@ def main(argv=None):
 if __name__ == "__main__":
     main()
 
-# end of gen_mp4.py
+# end of 4_mp4.py
