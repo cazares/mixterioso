@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 karaoke_core.py – generic helpers, CSV, ASS, timing, YouTube, etc.
-This version includes small additive helpers for Chrome-rendered slides.
+Plain mode: every line is a lyric line. No special intro handling.
 """
 
 import argparse, csv, re, subprocess, sys, time
@@ -44,7 +44,6 @@ def ensure_bins(require_demucs=True):
         die("demucs not found. pip3 install demucs")
 
 def audio_duration_seconds(audio_path: Path) -> float:
-    """Return duration in seconds using ffprobe."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error",
@@ -67,6 +66,13 @@ def yes_no(q): return input(q).strip().lower() == "y"
 def read_text_lines(p: Path):
     return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
+# literal ASS newline
+ASS_NL = "\\N"
+
+def slash_to_ass_newlines(text: str) -> str:
+    # replace any run of / with ASS newline literal
+    return re.sub(r"/+", lambda _: ASS_NL, text)
+
 def build_arg_parser():
     ap = argparse.ArgumentParser(description="Karaoke Time by Miguel")
     ap.add_argument("--lyrics", required=True)
@@ -84,23 +90,24 @@ def build_arg_parser():
     ap.add_argument("--device", default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--skip-demucs", action="store_true")
-
-    # NEW FLAGS (optional usage)
     ap.add_argument("--chrome-static-slides", action="store_true",
-                    help="Render emoji-safe slides with Chromium (one slide per lyric line) and stitch to mp4.")
+                    help="Render emoji-safe slides with Chromium and stitch to mp4.")
     ap.add_argument("--chrome-font-size", type=int, default=100,
-                    help="Font size for chrome-static-slides (px). Default 100.")
+                    help="Font size for chrome-static-slides (px).")
     return ap
 
 def tap_to_time(lines: List[str]) -> List[float]:
     print("\n🎤 Manual timing. Press Enter on each line.")
-    input("▶ Start playback, then Enter to begin.")
-    t0 = time.perf_counter()
+    input("▶ Start playback, then press Enter to start timing.")
     out = []
+    t0 = None
     for i, line in enumerate(lines, 1):
         print(f"[{i}/{len(lines)}] {line}")
         input("")
-        out.append(time.perf_counter() - t0)
+        now = time.perf_counter()
+        if t0 is None:
+            t0 = now
+        out.append(now - t0)
     print(f"{GREEN}✅ Timing captured.{RESET}")
     return out
 
@@ -132,8 +139,11 @@ def srt_time(t: float) -> str:
 
 def write_ass(path: Path, w: int, h: int, size: int, lines, starts, offset, hold):
     """
-    Old ASS-based karaoke pipeline (kept intact).
-    We leave this logic untouched for timing mode.
+    Simple ASS writer:
+    - all lines treated equally
+    - vertically centered
+    - "/" → ASS newline
+    - pad timings if needed
     """
     import sys as _sys
     if _sys.platform == "darwin":
@@ -143,13 +153,22 @@ def write_ass(path: Path, w: int, h: int, size: int, lines, starts, offset, hold
     else:
         font = "Noto Color Emoji"
 
+    safe_starts = list(starts)
+    if len(safe_starts) == 0:
+        safe_starts = [0.0]
+    if len(safe_starts) < len(lines):
+        last = safe_starts[-1]
+        for _ in range(len(lines) - len(safe_starts)):
+            last += hold
+            safe_starts.append(last)
+
     hdr = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {w}
 PlayResY: {h}
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, BackColour, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font},{size},&H00FFFFFF,&H000000FF,1,3,0,2,10,10,10,1
+Style: Default,{font},{size},&H00FFFFFF,&H000000FF,1,3,0,5,10,10,20,1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
@@ -157,22 +176,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     with path.open("w", encoding="utf-8") as f:
         f.write(hdr)
         for i, line in enumerate(lines):
-            st = starts[i] + offset
+            st = safe_starts[i] + offset
             if i < len(lines) - 1:
-                en = starts[i + 1] + offset - 0.15
+                en = safe_starts[i + 1] + offset - 0.15
                 if en <= st:
                     en = st + 0.15
             else:
                 en = st + hold
+            line_txt = slash_to_ass_newlines(line)
             f.write(
-                f"Dialogue: 0,{srt_time(st)},{srt_time(en)},Default,,0,0,0,,{line}\n"
+                f"Dialogue: 0,{srt_time(st)},{srt_time(en)},Default,,0,0,0,,{line_txt}\n"
             )
     info(f"🖋️  Wrote ASS {path}")
 
 def handle_youtube_download(url: str, lyrics_path: Path):
-    """
-    Download from YouTube and name mp3 after lyrics basename.
-    """
     ensure_dir(Path("songs"))
     human_base = sanitize_basename(lyrics_path)
     out_mp3 = Path("songs") / f"{human_base}.mp3"
@@ -206,14 +223,7 @@ def print_plan_summary(lyrics, audio, out_dir, csv, ass, final, plan, target):
     print(f"Mix target: {target}")
     print("================\n")
 
-############################################
-# NEW HELPERS appended for Chrome pipeline #
-############################################
-
 def song_base_from_path(lyrics_path: Path) -> str:
-    """
-    Take lyrics path and return base like '20_rosas' (sanitized).
-    """
     return sanitize_basename(lyrics_path)
 
 def stitch_frames_to_mp4(frames_glob: str,
@@ -221,17 +231,7 @@ def stitch_frames_to_mp4(frames_glob: str,
                          out_mp4_path: Path,
                          fps_visual: int = 30,
                          seconds_per_frame: float = 1.5):
-    """
-    Use ffmpeg to stitch PNG frames into an mp4 with audio.
-    This is used for the chrome-static-slides mode.
-    - frames_glob: e.g. 'output/frames_chrome/*.png'
-    - audio_path: final mixed audio track to mux
-    - out_mp4_path: output/chrome_rendered_mp4s/<song>_chrome_static.mp4
-    """
     ensure_dir(out_mp4_path.parent)
-
-    # ffmpeg:
-    # -framerate 1/seconds_per_frame means each PNG lasts that many seconds
     cmd = [
         "ffmpeg", "-y",
         "-framerate", f"1/{seconds_per_frame}",
@@ -246,3 +246,4 @@ def stitch_frames_to_mp4(frames_glob: str,
     ]
     run(cmd, check=True)
     info(f"🎬 Chrome static video → {out_mp4_path}")
+# end of karaoke_core.py
