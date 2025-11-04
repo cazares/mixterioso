@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import subprocess
 import sys
 import time
@@ -28,6 +29,7 @@ MIXES_DIR = BASE_DIR / "mixes"
 TIMINGS_DIR = BASE_DIR / "timings"
 OUTPUT_DIR = BASE_DIR / "output"
 LOGS_DIR = BASE_DIR / "logs"
+META_DIR = BASE_DIR / "meta"
 
 
 def slugify(text: str) -> str:
@@ -66,8 +68,7 @@ def run_demucs_background(mp3_path: Path, model: str) -> tuple[subprocess.Popen,
 
     log_file = demucs_log_path.open("w")
     proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-    # keep handle alive so it isn't GC'd while Demucs runs
-    proc._demucs_log = log_file  # type: ignore[attr-defined]
+    proc._demucs_log = log_file  # keep handle around
 
     return proc, t0
 
@@ -138,18 +139,48 @@ def run_render(slug: str, mp3_path: Path, profile: str, model: str) -> tuple[Pat
     return output, t1 - t0
 
 
-def run_ffmpeg_mp4(slug: str, audio_path: Path, profile: str) -> tuple[Path, float]:
+def run_ffmpeg_mp4(slug: str, audio_path: Path, profile: str, title: str | None, artist: str | None) -> tuple[Path, float]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
+
+    if title and artist:
+        raw_text = f"{title}\n\nby\n\n{artist}"
+    elif title:
+        raw_text = title
+    else:
+        raw_text = slug.replace("_", " ")
+
+    # escape for drawtext
+    drawtext_text = (
+        raw_text
+        .replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("\n", r"\n")
+    )
+
+    filter_complex = (
+        f"[0:v]drawtext=text='{drawtext_text}':"
+        "fontcolor=white:fontsize=64:"
+        "x=(w-text_w)/2:y=(h-text_h)/2:"
+        "enable='lte(t,3)'[v]"
+    )
+
     cmd = [
         "ffmpeg",
         "-y",
         "-f",
         "lavfi",
         "-i",
-        "color=size=1920x1080:duration=5:rate=30:color=black",
+        "color=size=1920x1080:rate=30:color=black",
         "-i",
         str(audio_path),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[v]",
+        "-map",
+        "1:a",
         "-c:v",
         "libx264",
         "-c:a",
@@ -157,10 +188,12 @@ def run_ffmpeg_mp4(slug: str, audio_path: Path, profile: str) -> tuple[Path, flo
         "-shortest",
         str(out_mp4),
     ]
-    log("MP4", f"Rendering placeholder MP4: {' '.join(cmd)}", CYAN)
+    log("MP4", f"Rendering MP4 with title card: {' '.join(cmd)}", CYAN)
     t0 = time.perf_counter()
     subprocess.run(cmd, check=True)
     t1 = time.perf_counter()
+
+    log("MP4", f'Title card "{raw_text.replace(chr(10), " / ")}" inserted at 0:00 (first ~3s).', GREEN)
     return out_mp4, t1 - t0
 
 
@@ -174,6 +207,23 @@ def parse_args(argv):
                    choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"])
     p.add_argument("--model", type=str, default="htdemucs_6s")
     return p.parse_args(argv)
+
+
+def load_meta_for_slug(slug: str) -> tuple[str | None, str | None]:
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    meta_path = META_DIR / f"{slug}.json"
+    if not meta_path.exists():
+        log("META", f"No metadata for slug={slug}; title card will use slug only.", YELLOW)
+        return None, None
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        artist = data.get("artist")
+        title = data.get("title")
+        log("META", f'Loaded metadata: "{title}" by "{artist}"', GREEN)
+        return title, artist
+    except Exception as e:
+        log("META", f"Failed to load metadata from {meta_path}: {e}", YELLOW)
+        return None, None
 
 
 def main(argv=None):
@@ -209,6 +259,9 @@ def main(argv=None):
             txt_path = txt_candidate
         slug = infer_slug_from_mp3(mp3_path)
 
+    # read title/artist for title card if available
+    title, artist = load_meta_for_slug(slug)
+
     log("MP4GEN", f"Slug={slug}", GREEN)
 
     # 1) Start Demucs in background (silent into log file)
@@ -230,8 +283,8 @@ def main(argv=None):
     # 5) Render final mix from stems + mix config
     mix_audio, t_render = run_render(slug, mp3_path, args.profile, args.model)
 
-    # 6) Simple MP4 (placeholder, audio + black frame)
-    out_mp4, t_mp4 = run_ffmpeg_mp4(slug, mix_audio, args.profile)
+    # 6) MP4 with title card
+    out_mp4, t_mp4 = run_ffmpeg_mp4(slug, mix_audio, args.profile, title, artist)
 
     t_total_end = time.perf_counter()
     t_total = t_total_end - t_total_start
