@@ -86,8 +86,8 @@ def load_timings(timing_path: Path, num_lines: int) -> list[dict]:
                 t = float(row["time_secs"])
             except (KeyError, ValueError):
                 continue
-            if 0 <= idx < num_lines:
-                out.append({"line_index": idx, "time": t})
+            text = row.get("text", "")
+            out.append({"line_index": idx, "time": t, "text": text})
     out.sort(key=lambda r: r["time"])
     return out
 
@@ -167,6 +167,17 @@ def fmt_time(sec: float) -> str:
     return f"{m:02d}:{s:05.2f}"
 
 
+NOTE_KEYS = {
+    ord("!"): "♫",
+    ord("@"): "♪",
+    ord("#"): "♬",
+    ord("$"): "♩",
+    ord("%"): "♫♪♬♩",
+    ord("^"): "♫♪♫♪",
+    ord("*"): "♬♩♬♩",
+}
+
+
 def timing_ui(
     stdscr,
     lyrics,
@@ -192,7 +203,7 @@ def timing_ui(
     def recompute_current_index(pos: float) -> int:
         if not timings:
             return 0
-        past = [t for t in timings if t["time"] <= pos]
+        past = [t for t in timings if t["time"] <= pos and t["line_index"] >= 0]
         if not past:
             return 0
         return min(max(t["line_index"] for t in past) + 1, num_lines)
@@ -211,6 +222,7 @@ def timing_ui(
         # Top controls bar
         controls = (
             "[SPACE/ENTER] tag  "
+            "[!/@/#/$/%/^/*] notes  "
             "[1] rewind  "
             "[0] undo/ff  "
             "[p] pause/play  "
@@ -288,12 +300,31 @@ def timing_ui(
             saving = True
             break
 
+        # Tag current lyric line
         if ch in (ord(" "), 10, 13):
             if current_index < num_lines:
-                timings.append({"line_index": current_index, "time": player.current_pos()})
+                timings.append(
+                    {
+                        "line_index": current_index,
+                        "time": player.current_pos(),
+                        "text": lyrics[current_index],
+                    }
+                )
                 current_index = min(current_index + 1, num_lines)
             continue
 
+        # Musical note events
+        if ch in NOTE_KEYS:
+            timings.append(
+                {
+                    "line_index": -1,
+                    "time": player.current_pos(),
+                    "text": NOTE_KEYS[ch],
+                }
+            )
+            continue
+
+        # Rewind and trim
         if ch == ord("1"):
             pos = player.current_pos()
             if pos <= 0.1:
@@ -306,6 +337,7 @@ def timing_ui(
             player.start(new_pos)
             continue
 
+        # Undo rewind if possible; otherwise fast-forward
         if ch == ord("0"):
             if history:
                 prev_pos, prev_timings, prev_idx = history.pop()
@@ -319,10 +351,12 @@ def timing_ui(
                 player.start(new_pos)
             continue
 
+        # Pause / play
         if ch in (ord("p"), ord("P")):
             player.pause_toggle()
             continue
 
+        # Restart song and clear history+timings
         if ch in (ord("r"), ord("R")):
             history.clear()
             timings[:] = []
@@ -330,6 +364,7 @@ def timing_ui(
             player.restart()
             continue
 
+        # Goto time
         if ch in (ord("g"), ord("G")):
             curses.echo()
             stdscr.timeout(-1)
@@ -362,14 +397,17 @@ def timing_ui(
 
 def write_timings(timing_path: Path, lyrics, timings) -> None:
     timing_path.parent.mkdir(parents=True, exist_ok=True)
-    timings_sorted = sorted(timings, key=lambda t: t["line_index"])
+    timings_sorted = sorted(timings, key=lambda t: t["time"])
     with timing_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["line_index", "time_secs", "text"])
         for t in timings_sorted:
-            idx = t["line_index"]
+            idx = t.get("line_index", -1)
             sec = t["time"]
-            text = lyrics[idx] if 0 <= idx < len(lyrics) else ""
+            if "text" in t and t["text"]:
+                text = t["text"]
+            else:
+                text = lyrics[idx] if 0 <= idx < len(lyrics) else ""
             writer.writerow([idx, f"{sec:.3f}", text])
 
 
