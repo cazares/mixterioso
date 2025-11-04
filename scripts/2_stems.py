@@ -279,6 +279,7 @@ def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path)
         out_label = f"a{idx}"
         filter_parts.append(f"[{in_label}]volume={vol:.3f}[{out_label}]")
         labels.append(f"[{out_label}]")
+
     amix = "".join(labels) + f"amix=inputs={len(TRACKS)}:normalize=0[mix]"
     filter_complex = ";".join(filter_parts + [amix])
 
@@ -286,18 +287,16 @@ def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path)
     for p in inputs:
         cmd += ["-i", str(p)]
     cmd += [
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "[mix]",
-        "-c:a",
-        "wav",
+        "-filter_complex", filter_complex,
+        "-map", "[mix]",
+        "-c:a", "pcm_s16le",
         str(output),
     ]
 
     log("FFMPEG", " ".join(cmd), BLUE)
     subprocess.run(cmd, check=True)
     log("MIX", f"Wrote mixed WAV to {output}", GREEN)
+
 
 
 def parse_args(argv=None):

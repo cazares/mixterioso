@@ -135,7 +135,6 @@ def run_step1_txt_mp3(query: str) -> tuple[str, float]:
     log("STEP1", f"1_txt_mp3 slug detected: {slug}", GREEN)
     return slug, t
 
-
 def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> float:
     if profile == "lyrics":
         log("STEP2", "Profile 'lyrics' selected, skipping stems/mix.", YELLOW)
@@ -146,24 +145,63 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     if not mp3_path.exists() or not txt_path.exists():
         raise SystemExit(f"Missing assets for step 2: {mp3_path} or {txt_path}.")
 
-    separated_dir = BASE_DIR / "separated" / model / slug
+    separated_root = BASE_DIR / "separated"
+
+    # Always prefer 6-stem, then (if absolutely necessary) 4-stem.
+    preferred_models: list[str] = []
+    if model:
+        preferred_models.append(model)
+    if "htdemucs_6s" not in preferred_models:
+        preferred_models.insert(0, "htdemucs_6s")
+    if "htdemucs" not in preferred_models:
+        preferred_models.append("htdemucs")  # 4-stem fallback, never 2-stem
+
+    # Check for existing stems we can reuse.
+    existing_model = None
+    for m in preferred_models:
+        d = separated_root / m / slug
+        if d.exists():
+            existing_model = m
+            break
+
     reuse_stems = False
-    if separated_dir.exists():
+    actual_model = existing_model
+
+    if existing_model:
         if interactive:
             ans = input(
-                f"Stems already exist at {separated_dir}. "
-                "Reuse them and skip Demucs? [Y/n]: "
+                f"Stems already exist at {separated_root / existing_model / slug} "
+                f"for model '{existing_model}'. Reuse and skip Demucs? [Y/n]: "
             ).strip().lower()
             reuse_stems = ans in ("", "y", "yes")
         else:
             reuse_stems = True
 
     t_demucs = 0.0
-    if not reuse_stems:
-        t_demucs = run(["demucs", "-n", model, str(mp3_path)], "STEP2-DEMUX")
-    else:
-        log("STEP2", f"Reusing existing stems at {separated_dir}", YELLOW)
 
+    if not reuse_stems:
+        import subprocess as sp
+
+        log("STEP2", f"No reusable stems; trying models {preferred_models}", CYAN)
+        actual_model = None
+        for m in preferred_models:
+            try:
+                t_demucs += run(["demucs", "-n", m, str(mp3_path)], "STEP2-DEMUX")
+                actual_model = m
+                break
+            except sp.CalledProcessError:
+                log("STEP2", f"Demucs model '{m}' failed, trying next.", YELLOW)
+        if actual_model is None:
+            raise SystemExit(
+                "Demucs failed for 6-stem and 4-stem models; "
+                "no 2-stem fallback is allowed by policy."
+            )
+    elif actual_model is None:
+        raise SystemExit("Asked to reuse stems but none were found for any supported model.")
+
+    log("STEP2", f"Using Demucs model '{actual_model}' for mixing.", GREEN)
+
+    # Open mix UI (using remembered percentages) for this model/profile.
     t_mix_ui = run(
         [
             sys.executable,
@@ -173,7 +211,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
             "--profile",
             profile,
             "--model",
-            model,
+            actual_model,
             "--mix-ui-only",
         ],
         "STEP2-MIXUI",
@@ -189,7 +227,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
             "--profile",
             profile,
             "--model",
-            model,
+            actual_model,
             "--render-only",
             "--output",
             str(out_wav),
@@ -200,7 +238,6 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     total = t_demucs + t_mix_ui + t_render
     log("STEP2", f"Stems/mix completed in {fmt_secs_mmss(total)}", GREEN)
     return total
-
 
 def run_step3_timing(slug: str) -> float:
     mp3_path = MP3_DIR / f"{slug}.mp3"
@@ -236,7 +273,6 @@ def run_step4_mp4(slug: str, profile: str) -> float:
     t = run(cmd, "STEP4")
     return t
 
-
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Karaoke pipeline master (1=txt/mp3, 2=stems, 3=timing, 4=mp4)."
@@ -252,7 +288,19 @@ def parse_args(argv=None):
     )
     p.add_argument("--model", type=str, default="htdemucs_6s", help="Demucs model name")
     p.add_argument("--steps", type=str, help="Steps to run, e.g. 24 or 1234")
-    p.add_argument("--skip-ui", action="store_true", help="Non-interactive; use --steps as-is")
+    p.add_argument(
+        "--do",
+        type=str,
+        choices=["new", "remix", "retime", "mp4"],
+        help=(
+            "High-level action shortcut: "
+            "new=1+2+3+4 from query, "
+            "remix=2+4 from existing slug, "
+            "retime=3+4 from existing slug, "
+            "mp4=4 only."
+        ),
+    )
+    p.add_argument("--skip-ui", action="store_true", help="Non-interactive; use --steps / --do as-is")
     return p.parse_args(argv)
 
 
@@ -260,25 +308,48 @@ def interactive_slug_and_steps(args):
     slug = args.slug
     t1 = 0.0
 
+    # If query is given and no slug, run step 1 first
     if args.query and not slug:
         log("MASTER", f'Running step 1 (1_txt_mp3) for query "{args.query}"', CYAN)
         slug, t1 = run_step1_txt_mp3(args.query)
 
+    # If we still don't have a slug, try to infer last slug from latest mp3
+    last_slug = None
     if not slug:
         try:
-            q = input("Enter search query for step 1 (or leave blank to use existing slug): ").strip()
+            mp3s = sorted(MP3_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
+            if mp3s:
+                last_slug = slugify(mp3s[-1].stem)
+        except Exception:
+            last_slug = None
+
+    if not slug:
+        if last_slug:
+            prompt = (
+                f'Enter search query for step 1 '
+                f'(or ENTER to reuse last slug "{last_slug}"): '
+            )
+        else:
+            prompt = "Enter search query for step 1 (or leave blank to use existing slug): "
+
+        try:
+            q = input(prompt).strip()
         except EOFError:
             q = ""
+
         if q:
             log("MASTER", f'Running step 1 (1_txt_mp3) for query "{q}"', CYAN)
             slug, t1 = run_step1_txt_mp3(q)
         else:
-            try:
-                slug = input("Enter existing slug (e.g. californication): ").strip()
-            except EOFError:
-                slug = ""
-            if not slug:
-                raise SystemExit("Slug is required if no query is given.")
+            if last_slug:
+                slug = last_slug
+            else:
+                try:
+                    slug = input("Enter existing slug (e.g. californication): ").strip()
+                except EOFError:
+                    slug = ""
+                if not slug:
+                    raise SystemExit("Slug is required if no query is given.")
 
     slug = slugify(slug)
     status = detect_assets(slug, args.profile)
@@ -335,6 +406,28 @@ def noninteractive_slug_and_steps(args):
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
     total_start = time.perf_counter()
+
+    # High-level shortcuts: --do
+    if args.do:
+        if args.do == "new":
+            if not args.query:
+                raise SystemExit("--do new requires --query.")
+            args.steps = "1234"
+        elif args.do == "remix":
+            if not args.slug:
+                raise SystemExit("--do remix requires --slug.")
+            args.steps = "24"
+        elif args.do == "retime":
+            if not args.slug:
+                raise SystemExit("--do retime requires --slug.")
+            args.steps = "34"
+        elif args.do == "mp4":
+            if not args.slug:
+                raise SystemExit("--do mp4 requires --slug.")
+            args.steps = "4"
+
+        # When using --do, run non-interactively by default.
+        args.skip_ui = True
 
     if args.skip_ui:
         slug, steps = noninteractive_slug_and_steps(args)
