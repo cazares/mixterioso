@@ -347,7 +347,6 @@ def timing_ui(
 
         stdscr.refresh()
 
-        # Normal auto-exit if audio finishes and you didn't abort
         if player.finished():
             break
 
@@ -377,7 +376,6 @@ def timing_ui(
                 )
                 last_msg = f"Tagged line {current_index+1} at {fmt_time(t)}"
                 current_index = min(current_index + 1, num_lines)
-                # if we've tagged the last line, auto-finish timing
                 if current_index >= num_lines:
                     saving = True
                     break
@@ -589,4 +587,4 @@ def main(argv=None):
 if __name__ == "__main__":
     main()
 
-# end of timing_editor.py
+# end of gen_timing.py
