@@ -12,7 +12,6 @@ import requests
 GENIUS_BASE = "https://api.genius.com"
 MM_BASE = "https://api.musixmatch.com/ws/1.1"
 
-# scripts/ -> project root
 BASE_DIR = Path(__file__).resolve().parent.parent
 TXTS_DIR = BASE_DIR / "txts"
 MP3S_DIR = BASE_DIR / "mp3s"
@@ -107,10 +106,10 @@ def get_genius_artist_title(query: str):
     title = top["title"]
     t1 = time.perf_counter()
     log("GENIUS", f'Matched: "{artist} - {title}" in {t1 - t0:.2f}s', MAGENTA)
-    return artist, title
+    return artist, title, t1 - t0
 
 
-def get_musixmatch_lyrics(artist: str, title: str) -> str:
+def get_musixmatch_lyrics(artist: str, title: str) -> tuple[str, float]:
     api_key = get_required_env("MUSIXMATCH_API_KEY")
 
     log("MM", f'Searching Musixmatch for: "{artist} - {title}"', CYAN)
@@ -155,11 +154,12 @@ def get_musixmatch_lyrics(artist: str, title: str) -> str:
 
     t1 = time.perf_counter()
     log("MM", f"Lyrics fetched in {t1 - t0:.2f}s", CYAN)
-    return lyrics
+    return lyrics, t1 - t0
 
 
-def download_youtube_audio(artist: str, title: str, slug: str) -> Path:
+def download_youtube_audio(artist: str, title: str, slug: str) -> tuple[Path, float]:
     query = f"{artist} {title}"
+    MP3S_DIR.mkdir(parents=True, exist_ok=True)
     target = MP3S_DIR / f"{slug}.mp3"
     output_template = str(MP3S_DIR / f"{slug}.%(ext)s")
 
@@ -188,15 +188,14 @@ def download_youtube_audio(artist: str, title: str, slug: str) -> Path:
 
     t1 = time.perf_counter()
     log("YT", f"yt-dlp finished in {t1 - t0:.2f}s", YELLOW)
-    return target
+    return target, t1 - t0
 
 
 def suggest_tracking_command(slug: str) -> None:
     cmd = (
         f"python3 scripts/tracking.py "
-        f"--vocals [vocal%] --bass [bass%] --guitar [guitar%] "
-        f"--piano [piano%] --other [other%] "
-        f"--txt txts/{slug}.txt --mp3 mp3s/{slug}.mp3"
+        f"--txt txts/{slug}.txt "
+        f"--mp3 mp3s/{slug}.mp3"
     )
 
     print()
@@ -219,19 +218,20 @@ def suggest_tracking_command(slug: str) -> None:
             print(f"{RED}[NEXT] pbcopy failed with code {e.returncode}.{RESET}", file=sys.stderr)
 
 
-def main():
-    if len(sys.argv) < 2:
-        print(f"usage: {sys.argv[0]} <search query>", file=sys.stderr)
+def parse_args(argv):
+    if len(argv) < 1:
+        print(f"usage: pre_tracking.py <search query>", file=sys.stderr)
         sys.exit(1)
+    query = " ".join(argv)
+    return query
 
-    query = " ".join(sys.argv[1:])
+
+def main():
+    query = parse_args(sys.argv[1:])
     log("MODE", f'Pre-tracking (parallel) for "{query}"', BOLD)
 
     t0_total = time.perf_counter()
-    t0_genius = time.perf_counter()
-    artist, title = get_genius_artist_title(query)
-    t1_genius = time.perf_counter()
-
+    artist, title, t_genius = get_genius_artist_title(query)
     slug = slugify_title(title)
     log("SLUG", f'Title slug: "{slug}"', GREEN)
 
@@ -241,18 +241,14 @@ def main():
     lyrics_path = TXTS_DIR / f"{slug}.txt"
     audio_path = MP3S_DIR / f"{slug}.mp3"
 
-    # Decide what to do with existing files
     want_lyrics = True
     want_audio = True
 
     if lyrics_path.exists():
         want_lyrics = confirm_overwrite(lyrics_path, "Lyrics file")
-        # want_lyrics == False means keep existing file
     if audio_path.exists():
         want_audio = confirm_overwrite(audio_path, "Audio file")
-        # want_audio == False means keep existing file
 
-    # Parallel block: only network / disk, no prompts
     t_par_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=2) as ex:
         lyrics_start = time.perf_counter()
@@ -261,17 +257,19 @@ def main():
         fut_audio = ex.submit(download_youtube_audio, artist, title, slug) if want_audio else None
 
         if fut_lyrics is not None:
-            lyrics = fut_lyrics.result()
+            lyrics, t_lyrics = fut_lyrics.result()
         else:
             lyrics = lyrics_path.read_text(encoding="utf-8") if lyrics_path.exists() else ""
+            t_lyrics = 0.0
         lyrics_end = time.perf_counter()
 
         if fut_audio is not None:
-            audio_path = fut_audio.result()
+            audio_path, t_yt = fut_audio.result()
+        else:
+            t_yt = 0.0
         audio_end = time.perf_counter()
     t_par_end = time.perf_counter()
 
-    # Write lyrics file if needed
     if want_lyrics or not lyrics_path.exists():
         log("FILE", f"Writing lyrics to {lyrics_path}", GREEN)
         lyrics_path.write_text(lyrics, encoding="utf-8")
@@ -285,9 +283,9 @@ def main():
     print(f"{GREEN}Audio file:  {audio_path}{RESET}")
 
     print("\n[timings]")
-    print(f"Genius search:          {t1_genius - t0_genius:6.2f} s")
-    print(f"Musixmatch lyrics call: {lyrics_end - lyrics_start:6.2f} s")
-    print(f"yt-dlp download call:   {audio_end - audio_start:6.2f} s")
+    print(f"Genius search:          {t_genius:6.2f} s")
+    print(f"Musixmatch lyrics call: {t_lyrics:6.2f} s")
+    print(f"yt-dlp download call:   {t_yt:6.2f} s")
     print(f"Parallel block (wall):  {t_par_end - t_par_start:6.2f} s")
     print(f"Total:                  {t_end - t0_total:6.2f} s")
 
@@ -296,4 +294,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 # end of pre_tracking.py
