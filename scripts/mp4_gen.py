@@ -2,14 +2,18 @@
 import argparse
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+# ANSI colors
 RESET = "\033[0m"
 BOLD = "\033[1m"
 CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
 RED = "\033[31m"
+BLUE = "\033[34m"
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
@@ -38,24 +42,28 @@ def infer_slug_from_mp3(mp3_path: Path) -> str:
     return slugify(mp3_path.stem)
 
 
-def run_pre_tracking(query: str) -> str:
+def run_pre_tracking(query: str) -> tuple[str, float]:
     cmd = [sys.executable, str(SCRIPTS_DIR / "pre_tracking.py"), query]
-    log("PRE", f"Running pre_tracking: {' '.join(cmd)}", CYAN)
+    log("PRE", f"Running pre_tracking: {' '.join(cmd)}", MAGENTA)
+    t0 = time.perf_counter()
     subprocess.run(cmd, check=True)
+    t1 = time.perf_counter()
     mp3s = sorted(MP3_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
     if not mp3s:
-        raise SystemExit("pre_tracking.py did not produce any mp3s.")
+        raise SystemExit("pre_tracking.py did not produce any mp3 files")
     slug = infer_slug_from_mp3(mp3s[-1])
-    return slug
+    return slug, t1 - t0
 
 
-def run_demucs_background(mp3_path: Path, model: str) -> subprocess.Popen:
+def run_demucs_background(mp3_path: Path, model: str) -> tuple[subprocess.Popen, float]:
     cmd = ["demucs", "-n", model, str(mp3_path)]
     log("DEMUX", f"Starting Demucs in background: {' '.join(cmd)}", YELLOW)
-    return subprocess.Popen(cmd)
+    t0 = time.perf_counter()
+    proc = subprocess.Popen(cmd)
+    return proc, t0
 
 
-def run_mix_ui(slug: str, txt_path: Path, mp3_path: Path, profile: str) -> None:
+def run_mix_ui(slug: str, txt_path: Path, mp3_path: Path, profile: str) -> float:
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "tracking.py"),
@@ -68,10 +76,13 @@ def run_mix_ui(slug: str, txt_path: Path, mp3_path: Path, profile: str) -> None:
         "--mix-ui-only",
     ]
     log("MIX", f"Launching mix UI: {' '.join(cmd)}", CYAN)
+    t0 = time.perf_counter()
     subprocess.run(cmd, check=True)
+    t1 = time.perf_counter()
+    return t1 - t0
 
 
-def run_timing_editor(slug: str, txt_path: Path, audio_path: Path) -> None:
+def run_timing_editor(slug: str, txt_path: Path, audio_path: Path) -> float:
     TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
     timing_path = TIMINGS_DIR / f"{slug}.csv"
     cmd = [
@@ -84,11 +95,14 @@ def run_timing_editor(slug: str, txt_path: Path, audio_path: Path) -> None:
         "--timings",
         str(timing_path),
     ]
-    log("TIME", f"Launching timing editor: {' '.join(cmd)}", CYAN)
+    log("TIME", f"Launching timing editor: {' '.join(cmd)}", GREEN)
+    t0 = time.perf_counter()
     subprocess.run(cmd, check=True)
+    t1 = time.perf_counter()
+    return t1 - t0
 
 
-def run_render(slug: str, mp3_path: Path, profile: str, model: str) -> Path:
+def run_render(slug: str, mp3_path: Path, profile: str, model: str) -> tuple[Path, float]:
     MIXES_DIR.mkdir(parents=True, exist_ok=True)
     mix_cfg = MIXES_DIR / f"{slug}.json"
     output = MIXES_DIR / f"{slug}_{profile}.wav"
@@ -108,12 +122,14 @@ def run_render(slug: str, mp3_path: Path, profile: str, model: str) -> Path:
         "--output",
         str(output),
     ]
-    log("RENDER", f"Rendering mix: {' '.join(cmd)}", CYAN)
+    log("RENDER", f"Rendering mix: {' '.join(cmd)}", BLUE)
+    t0 = time.perf_counter()
     subprocess.run(cmd, check=True)
-    return output
+    t1 = time.perf_counter()
+    return output, t1 - t0
 
 
-def run_ffmpeg_mp4(slug: str, audio_path: Path, profile: str) -> Path:
+def run_ffmpeg_mp4(slug: str, audio_path: Path, profile: str) -> tuple[Path, float]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
     cmd = [
@@ -132,17 +148,19 @@ def run_ffmpeg_mp4(slug: str, audio_path: Path, profile: str) -> Path:
         "-shortest",
         str(out_mp4),
     ]
-    log("MP4", f"Rendering placeholder MP4 (no subs yet): {' '.join(cmd)}", CYAN)
+    log("MP4", f"Rendering placeholder MP4: {' '.join(cmd)}", CYAN)
+    t0 = time.perf_counter()
     subprocess.run(cmd, check=True)
-    return out_mp4
+    t1 = time.perf_counter()
+    return out_mp4, t1 - t0
 
 
 def parse_args(argv):
-    p = argparse.ArgumentParser(description="Orchestrate full pipeline to MP4.")
+    p = argparse.ArgumentParser(description="Orchestrate full pipeline to MP4")
     group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument("--query", type=str, help="Song search query for pre_tracking.")
-    group.add_argument("--mp3", type=str, help="Existing mp3 path.")
-    p.add_argument("--txt", type=str, help="Existing lyrics txt path.")
+    group.add_argument("--query", type=str, help="Song search query for pre_tracking")
+    group.add_argument("--mp3", type=str, help="Existing mp3 path")
+    p.add_argument("--txt", type=str, help="Existing lyrics txt path")
     p.add_argument("--profile", type=str, default="karaoke",
                    choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"])
     p.add_argument("--model", type=str, default="htdemucs_6s")
@@ -151,14 +169,22 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
+    t_total_start = time.perf_counter()
+
+    t_pre = 0.0
+    t_demux = 0.0
+    t_mix_ui = 0.0
+    t_timing = 0.0
+    t_render = 0.0
+    t_mp4 = 0.0
 
     if args.query:
-        slug = run_pre_tracking(args.query)
+        slug, t_pre = run_pre_tracking(args.query)
         mp3s = sorted(MP3_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
         mp3_path = mp3s[-1]
         txts = sorted(TXT_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime)
         if not txts:
-            raise SystemExit("No txts found after pre_tracking.")
+            raise SystemExit("No txts found after pre_tracking")
         txt_path = txts[-1]
         slug = infer_slug_from_mp3(mp3_path)
     else:
@@ -177,27 +203,50 @@ def main(argv=None):
     log("MP4GEN", f"Slug={slug}", GREEN)
 
     # 1) Start Demucs in background
-    demucs_proc = run_demucs_background(mp3_path, args.model)
+    demucs_proc, t_demux_start = run_demucs_background(mp3_path, args.model)
 
     # 2) Mix UI (foreground)
-    run_mix_ui(slug, txt_path, mp3_path, args.profile)
+    t_mix_ui = run_mix_ui(slug, txt_path, mp3_path, args.profile)
 
     # 3) Timing editor (foreground), against original mp3
-    run_timing_editor(slug, txt_path, mp3_path)
+    t_timing = run_timing_editor(slug, txt_path, mp3_path)
 
     # 4) Wait for Demucs
-    log("DEMUX", "Waiting for Demucs to finish...", YELLOW)
+    log("DEMUX", "Waiting for Demucs to finish", YELLOW)
     demucs_proc.wait()
-    log("DEMUX", "Demucs finished.", GREEN)
+    t_demux_end = time.perf_counter()
+    t_demux = t_demux_end - t_demux_start
+    log("DEMUX", "Demucs finished", GREEN)
 
     # 5) Render final mix from stems + mix config
-    mix_audio = run_render(slug, mp3_path, args.profile, args.model)
+    mix_audio, t_render = run_render(slug, mp3_path, args.profile, args.model)
 
     # 6) Simple MP4 (placeholder, audio + black frame)
-    out_mp4 = run_ffmpeg_mp4(slug, mix_audio, args.profile)
+    out_mp4, t_mp4 = run_ffmpeg_mp4(slug, mix_audio, args.profile)
 
-    log("DONE", f"MP4 written to {out_mp4}", GREEN)
+    t_total_end = time.perf_counter()
+    t_total = t_total_end - t_total_start
+
+    # Colored summary
+    print()
+    print(f"{BOLD}{BLUE}========== PIPELINE SUMMARY ({slug}, profile={args.profile}) =========={RESET}")
+    if args.query:
+        print(f"{MAGENTA}pre_tracking.py:   {t_pre:6.2f} s{RESET}")
+    else:
+        print(f"{MAGENTA}pre_tracking.py:   {t_pre:6.2f} s (skipped, using existing assets){RESET}")
+    print(f"{YELLOW}Demucs (bg):       {t_demux:6.2f} s{RESET}")
+    print(f"{CYAN}Mix UI:            {t_mix_ui:6.2f} s{RESET}")
+    print(f"{GREEN}Timing editor:     {t_timing:6.2f} s{RESET}")
+    print(f"{BLUE}Audio render:      {t_render:6.2f} s{RESET}")
+    print(f"{CYAN}MP4 render:        {t_mp4:6.2f} s{RESET}")
+    print(f"{BOLD}{GREEN}Total mp4_gen:     {t_total:6.2f} s{RESET}")
+    print(f"{BOLD}{GREEN}Output MP4:        {out_mp4}{RESET}")
+    print(f"{BOLD}{BLUE}========================================================={RESET}")
+
+    # end of main
 
 
 if __name__ == "__main__":
     main()
+
+# end of mp4_gen.py
