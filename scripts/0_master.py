@@ -19,7 +19,7 @@ def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__.resolve()).parent.parent
 SCRIPTS_DIR = BASE_DIR / "scripts"
 TXT_DIR = BASE_DIR / "txts"
 MP3_DIR = BASE_DIR / "mp3s"
@@ -102,7 +102,7 @@ def print_asset_status(slug: str, profile: str, status: dict) -> None:
     print(f"{BOLD}Pipeline status for slug={slug}, profile={profile}{RESET}")
     labels = {
         1: "txt+mp3 generation (1_txt_mp3)",
-        2: "stems/mix (demucs + 2_stems)",
+        2: "stems/mix (Demucs + mix UI)",
         3: "timings CSV (3_timing)",
         4: "mp4 generation (4_mp4)",
     }
@@ -134,6 +134,7 @@ def run_step1_txt_mp3(query: str) -> tuple[str, float]:
     slug = detect_slug_from_latest_mp3()
     log("STEP1", f"1_txt_mp3 slug detected: {slug}", GREEN)
     return slug, t
+
 
 def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> float:
     if profile == "lyrics":
@@ -239,6 +240,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     log("STEP2", f"Stems/mix completed in {fmt_secs_mmss(total)}", GREEN)
     return total
 
+
 def run_step3_timing(slug: str) -> float:
     mp3_path = MP3_DIR / f"{slug}.mp3"
     txt_path = TXT_DIR / f"{slug}.txt"
@@ -270,8 +272,22 @@ def run_step4_mp4(slug: str, profile: str) -> float:
         "--profile",
         profile,
     ]
-    t = run(cmd, "STEP4")
-    return t
+    try:
+        t = run(cmd, "STEP4")
+        return t
+    except subprocess.CalledProcessError as e:
+        # 4_mp4 already prints a clear message like:
+        # "Audio not found for profile=karaoke: /.../slug_profile.wav"
+        # Just add a clean summary here and keep the pipeline alive.
+        log(
+            "STEP4",
+            f"Step 4 failed (exit {e.returncode}). "
+            "Most likely the mixed WAV for this slug/profile is missing. "
+            "Run step 2 (stems/mix) first.",
+            RED,
+        )
+        return 0.0
+
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
