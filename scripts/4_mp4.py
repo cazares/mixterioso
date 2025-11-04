@@ -124,6 +124,7 @@ def build_ass_from_timings(slug: str, rows, duration: float, lyric_font_size: in
     META_DIR.mkdir(parents=True, exist_ok=True)
     ass_path = META_DIR / f"{slug}_lyrics.ass"
 
+    # Alignment=5 => centered vertically and horizontally (like title card)
     header = f"""[Script Info]
 ScriptType: v4.00+
 Collisions: Normal
@@ -133,7 +134,7 @@ Timer: 100.0000
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,{lyric_font_size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,3,0,2,80,80,40,0
+Style: Default,Arial,{lyric_font_size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,3,0,5,80,80,40,0
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -151,8 +152,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if end <= start:
             end = start + 0.5
 
-        text = row.get("text", "")
-        text = escape_ass_text(text)
+        text = escape_ass_text(row.get("text", ""))
 
         start_str = secs_to_ass_time(start)
         end_str = secs_to_ass_time(end)
@@ -196,7 +196,6 @@ def open_path(path: Path) -> None:
 
 
 def escape_drawtext_text(s: str) -> str:
-    # ffmpeg drawtext escaping
     return (
         s.replace("\\", "\\\\")
         .replace(":", "\\:")
@@ -243,7 +242,8 @@ def main(argv=None):
     else:
         font_size = ask_font_size(120)
 
-    lyric_font_size = max(32, int(font_size * 0.6))
+    # lyrics use the same size now so the change is obvious
+    lyric_font_size = font_size
     ass_path = build_ass_from_timings(slug, rows, duration, lyric_font_size)
 
     artist, title = load_meta(slug)
@@ -261,17 +261,15 @@ def main(argv=None):
         title_artist = ""
 
     META_DIR.mkdir(parents=True, exist_ok=True)
-
     out_mp4 = OUTPUT_DIR / f"{slug}_{args.profile}.mp4"
 
     ass_str = ass_path.as_posix()
 
+    # Title: same drawtext style as before, three lines if artist present
     draw_layers = []
     in_label = "sub"
 
-    # vertical positions tuned by font size; approximations but stable
     if title_main and title_artist:
-        # three-line layout
         y1 = f"h/2-{font_size*1.3:.1f}"
         y2 = "h/2"
         y3 = f"h/2+{font_size*1.3:.1f}"
@@ -281,7 +279,6 @@ def main(argv=None):
             (title_artist, y3),
         ]
     elif title_main and title_by:
-        # just in case; not typical
         y1 = f"h/2-{font_size*0.8:.1f}"
         y2 = f"h/2+{font_size*0.8:.1f}"
         triples = [
@@ -289,7 +286,6 @@ def main(argv=None):
             (title_by, y2),
         ]
     else:
-        # single centered line
         triples = [(title_main, "(h-text_h)/2")]
 
     for i, (text, yexpr) in enumerate(triples):
@@ -305,7 +301,6 @@ def main(argv=None):
         in_label = out_label
 
     if not draw_layers:
-        # no usable title text; just pass subtitles through
         filter_complex = f"[0:v]subtitles={ass_str}[v]"
     else:
         draw_chain = ";".join(draw_layers)
@@ -347,18 +342,23 @@ def main(argv=None):
     log("MP4", f"Subtitles from {timing_csv_path}", GREEN)
     log("MP4", f"Global font size {font_size} (lyrics {lyric_font_size}).", GREEN)
 
+    print()
+    print("What next?")
+    print("  1  open output directory")
+    print("  2  open MP4")
+    print("  3  open both (dir first, then MP4)")
+    print("  0  nothing")
     try:
-        ans = input("Open output directory? [y/N]: ").strip().lower()
+        choice = input("Choice [0-3, ENTER=0]: ").strip()
     except EOFError:
-        ans = "n"
-    if ans in ("y", "yes"):
-        open_path(out_mp4.parent)
+        choice = "0"
 
-    try:
-        ans2 = input("Play output MP4 now? [y/N]: ").strip().lower()
-    except EOFError:
-        ans2 = "n"
-    if ans2 in ("y", "yes"):
+    if choice == "1":
+        open_path(out_mp4.parent)
+    elif choice == "2":
+        open_path(out_mp4)
+    elif choice == "3":
+        open_path(out_mp4.parent)
         open_path(out_mp4)
 
 
