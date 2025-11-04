@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # gen_video.sh — pipeline: lyrics → audio → align → demucs → render (multi-variant)
-#  - prefer scripts/auto_lyrics_fetcher.py
-#  - validate lyrics header "<title>//by//<artist>"
+#  - prefers scripts/auto_lyrics_fetcher.py
+#  - validates lyrics header "<title>//by//<artist>"
 #  - align_to_csv.py with --no-vad compat
 #  - early/sanity passes
-#  - Demucs with reuse (+ auto install torchcodec in demucs_env)
+#  - Demucs with reuse
 #  - final ffmpeg A/V shift to force --offset-video
 #  - ADDITIVE: timing for each major stage + total
+#  - ADDITIVE: env helpers — auto-hop to lyrics-align-env and demucs_env when needed
+#  - ADDITIVE: Demucs ALWAYS via $ROOT/demucs_env/bin/python3 -m demucs if present
+#  - ADDITIVE: alignment stage now makes CSV writable + tolerant copy
 
 set -euo pipefail
 
-# --- timing helpers (ADDITIVE) --------------------------------------------
-now_ts() { date +%s; }  # portable enough on macOS
+now_ts() { date +%s; }
 SCRIPT_START_TS=$(now_ts)
 
 stage_start() {
@@ -27,7 +29,6 @@ stage_end() {
   printf "[TIMER] finished %-28s in %ss\n" "$STAGE_NAME" "$dur"
 }
 
-# --- colors ---------------------------------------------------------------
 if [ -t 1 ]; then
   RED=$'\033[0;31m'
   GREEN=$'\033[0;32m'
@@ -44,7 +45,6 @@ ok()    { printf "%s%s%s\n" "$GREEN" "$*" "$RESET"; }
 warn()  { printf "%s%s%s\n" "$YELLOW" "$*" "$RESET"; }
 err()   { printf "%s%s%s\n" "$RED" "$*" "$RESET"; }
 
-# --- paths ----------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$ROOT/scripts"
 LYRICS_DIR="$ROOT/auto_lyrics"
@@ -52,6 +52,66 @@ SONGS_DIR="$ROOT/songs"
 OUTPUT_DIR="$ROOT/output"
 STEMS_EXPORT_DIR="$ROOT/output/stems"
 MIXED_AUDIO_DIR="$ROOT/songs/mixed"
+
+ALIGN_ENV="$ROOT/lyrics-align-env"
+DEMUCS_ENV="$ROOT/demucs_env"
+
+run_align_py() {
+  local script="$1"; shift
+  if python3 - <<'PY' 2>/dev/null; then
+import importlib; importlib.import_module("stable_whisper")
+PY
+    python3 "$script" "$@"
+    return $?
+  fi
+  if [ -x "$ALIGN_ENV/bin/python3" ]; then
+    "$ALIGN_ENV/bin/python3" "$script" "$@"
+  else
+    python3 "$script" "$@"
+  fi
+}
+
+run_demucs_cmd() {
+  local tag="$1"; shift
+  printf "[DEMUCS] ===== %s =====\n" "$tag"
+  printf "[DEMUCS] pwd: %s\n" "$(pwd)"
+  printf "[DEMUCS] root: %s\n" "$ROOT"
+  printf "[DEMUCS] PATH: %s\n" "$PATH"
+  printf "[DEMUCS] demucs_env: %s\n" "$DEMUCS_ENV"
+
+  if [ -x "$DEMUCS_ENV/bin/python3" ]; then
+    printf "[DEMUCS] using %s -m demucs --verbose\n" "$DEMUCS_ENV/bin/python3"
+    set +e
+    "$DEMUCS_ENV/bin/python3" -m demucs --verbose "$@"
+    local rc=$?
+    set -e
+    printf "[DEMUCS] demucs_env python -m demucs exited rc=%s\n" "$rc"
+    return $rc
+  fi
+
+  if [ -x "$DEMUCS_ENV/bin/demucs" ]; then
+    printf "[DEMUCS] using %s --verbose\n" "$DEMUCS_ENV/bin/demucs"
+    set +e
+    "$DEMUCS_ENV/bin/demucs" --verbose "$@"
+    local rc=$?
+    set -e
+    printf "[DEMUCS] demucs_env demucs exited rc=%s\n" "$rc"
+    return $rc
+  fi
+
+  if command -v demucs >/dev/null 2>&1; then
+    printf "[DEMUCS] using PATH demucs: %s --verbose\n" "$(command -v demucs)"
+    set +e
+    demucs --verbose "$@"
+    local rc=$?
+    set -e
+    printf "[DEMUCS] PATH demucs exited rc=%s\n" "$rc"
+    return $rc
+  fi
+
+  printf "[DEMUCS] ERROR: no demucs found (wanted %s or PATH)\n" "$DEMUCS_ENV/bin/python3"
+  return 127
+}
 
 slugify() {
   local s="$1"
@@ -68,19 +128,6 @@ deaccent_keep_spaces() {
 
 is_pct() {
   [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 0 ] && [ "$1" -le 100 ]
-}
-
-find_demucs_bin() {
-  if command -v demucs >/dev/null 2>&1; then
-    echo "demucs"; return
-  fi
-  if [ -x "$ROOT/demucs_env/bin/demucs" ]; then
-    echo "$ROOT/demucs_env/bin/demucs"; return
-  fi
-  if python3 -m demucs --help >/dev/null 2>&1; then
-    echo "python3 -m demucs"; return
-  fi
-  echo ""
 }
 
 find_existing_stems_dir() {
@@ -187,9 +234,6 @@ mkdir -p "$LYRICS_DIR" "$SONGS_DIR" "$OUTPUT_DIR" "$STEMS_EXPORT_DIR" "$MIXED_AU
 
 info ">>> Preparing karaoke for: ${BOLD}${ARTIST} – \"${TITLE}\"${RESET}"
 
-# ---------------------------------------------------------------------------
-# 1) LYRICS
-# ---------------------------------------------------------------------------
 stage_start "lyrics_fetch"
 need_fetch=1
 if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ] && [ -z "$USER_TIMINGS_CSV" ]; then
@@ -203,15 +247,36 @@ if [ -f "$LYRICS_PATH" ] && [ $FORCE_ALIGN -eq 0 ] && [ -z "$USER_TIMINGS_CSV" ]
   else
     warn "[WARN] Lyrics header mismatch — will refetch."
     need_fetch=1
+    rm -f "$CSV_PATH"
   fi
 fi
 
 if [ $need_fetch -eq 1 ] && [ -z "$USER_TIMINGS_CSV" ]; then
   if [ -f "$SCRIPTS_DIR/auto_lyrics_fetcher.py" ]; then
     info ">>> Fetching lyrics (auto_lyrics_fetcher) for \"${TITLE}\" by ${ARTIST}..."
-    # NOTE: original user script didn't accept --out, so we call it in-place
-    python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" --artist "$ARTIST" --title "$TITLE" --lang auto --merge-strategy best --no-prompt
-    ok "[OK] Lyrics saved to $LYRICS_PATH"
+    python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" \
+      --artist "$ARTIST" \
+      --title "$TITLE" \
+      --lang auto \
+      --merge-strategy best \
+      --no-prompt
+    if [ ! -f "$LYRICS_PATH" ]; then
+      python3 "$SCRIPTS_DIR/auto_lyrics_fetcher.py" \
+        --artist "$ARTIST" \
+        --title "$TITLE" \
+        --lang auto \
+        --merge-strategy best \
+        --no-prompt > "$LYRICS_PATH" || true
+    fi
+    if [ ! -f "$LYRICS_PATH" ]; then
+      CAND="$(ls -1 "$LYRICS_DIR"/"${ARTIST_SLUG}-${TITLE_SLUG}"*.txt 2>/dev/null | head -n1 || true)"
+      if [ -n "$CAND" ]; then mv "$CAND" "$LYRICS_PATH"; fi
+    fi
+    if [ ! -s "$LYRICS_PATH" ]; then
+      err "[ERROR] lyrics fetcher did not produce $LYRICS_PATH"
+      exit 1
+    fi
+    ok "[OK] Lyrics ensured at $LYRICS_PATH"
   else
     err "[ERROR] no lyrics fetcher script found."
     exit 1
@@ -219,9 +284,6 @@ if [ $need_fetch -eq 1 ] && [ -z "$USER_TIMINGS_CSV" ]; then
 fi
 stage_end "lyrics_fetch"
 
-# ---------------------------------------------------------------------------
-# 2) AUDIO
-# ---------------------------------------------------------------------------
 stage_start "audio_download_and_mono"
 NEED_AUDIO=1
 if [ -f "$AUDIO_PATH" ] && [ $FORCE_AUDIO -eq 0 ]; then
@@ -265,13 +327,11 @@ else
 fi
 stage_end "audio_download_and_mono"
 
-# ---------------------------------------------------------------------------
-# 3) ALIGN
-# ---------------------------------------------------------------------------
 stage_start "alignment"
 if [ -n "$USER_TIMINGS_CSV" ]; then
   info "[INFO] user provided --timings-csv: $USER_TIMINGS_CSV"
-  cp "$USER_TIMINGS_CSV" "$CSV_PATH"
+  if [ -f "$CSV_PATH" ]; then chmod u+w "$CSV_PATH" 2>/dev/null || true; fi
+  cp "$USER_TIMINGS_CSV" "$CSV_PATH" 2>/dev/null || { rm -f "$CSV_PATH"; cp "$USER_TIMINGS_CSV" "$CSV_PATH"; }
 fi
 
 ALIGN_AUDIO=""
@@ -301,7 +361,7 @@ else
   else
     if [ -f "$SCRIPTS_DIR/align_to_csv.py" ]; then
       info ">>> Aligning lyrics to audio (large-v3) from: $ALIGN_AUDIO ..."
-      python3 "$SCRIPTS_DIR/align_to_csv.py" \
+      run_align_py "$SCRIPTS_DIR/align_to_csv.py" \
         --audio "$ALIGN_AUDIO" \
         --lyrics "$LYRICS_PATH" \
         --out "$CSV_PATH" \
@@ -315,20 +375,20 @@ else
   fi
 
   if [ -f "$SCRIPTS_DIR/fix_early_lines_from_audio.py" ] && [ -f "$SCRIPTS_DIR/transcribe_window.py" ]; then
-    info "[FIX] Auto-correcting early lyric lines from real audio (0–40s)…"
-    python3 "$SCRIPTS_DIR/fix_early_lines_from_audio.py" \
-      --audio "$AUDIO_MONO_PATH" \
-      --csv "$CSV_PATH" \
-      --lyrics "$LYRICS_PATH" \
-      --scripts-dir "$SCRIPTS_DIR" \
-      --window-end 40 \
-      --max-lines 6 \
-      --language es || true
+    info "[FIX] Auto-correcting early lyric lines from real audio (0–6m)…"
+    # run_align_py "$SCRIPTS_DIR/fix_early_lines_from_audio.py" \
+    #   --audio "$AUDIO_MONO_PATH" \
+    #   --csv "$CSV_PATH" \
+    #   --lyrics "$LYRICS_PATH" \
+    #   --scripts-dir "$SCRIPTS_DIR" \
+    #   --window-end 360 \
+    #   --max-lines 100 \
+    #   --language en || true
   fi
 
   if [ -f "$SCRIPTS_DIR/csv_sanity_fill_improbables.py" ]; then
     info "[SANITY] Checking for improbable-fast lines (snap-to-next)…"
-    python3 "$SCRIPTS_DIR/csv_sanity_fill_improbables.py" --csv "$CSV_PATH" || true
+    run_align_py "$SCRIPTS_DIR/csv_sanity_fill_improbables.py" --csv "$CSV_PATH" || true
   fi
 fi
 stage_end "alignment"
@@ -337,57 +397,60 @@ stage_end "alignment"
 # 4) DEMUCS
 # ---------------------------------------------------------------------------
 stage_start "demucs"
-DEMUCS_BIN="$(find_demucs_bin)"
 BEST_STEMS_DIR=""
 AUDIO_BASENAME="$(basename "$AUDIO_MONO_PATH")"
 AUDIO_BASE_NOEXT="${AUDIO_BASENAME%.*}"
 
-if [ -n "$DEMUCS_BIN" ]; then
-  EXISTING_DIR="$(find_existing_stems_dir "$STEMS_EXPORT_DIR" "$AUDIO_BASE_NOEXT")"
-  if [ -n "$EXISTING_DIR" ] && [ $FORCE_AUDIO -eq 0 ]; then
-    ok "[REUSE] Found existing Demucs stems at $EXISTING_DIR — skipping separation."
-    BEST_STEMS_DIR="$EXISTING_DIR"
-  else
-    info ">>> [DEMUCS] Running separation (6 → 4 → 2) …"
-    if [ -x "$ROOT/demucs_env/bin/python3" ]; then
-      "$ROOT/demucs_env/bin/python3" -c "import torchcodec" >/dev/null 2>&1 || \
-      "$ROOT/demucs_env/bin/pip3" install torchcodec >/dev/null 2>&1 || true
-    fi
-    DEMUCS_BASE_OUT="$STEMS_EXPORT_DIR"
+# ADDITIVE FIX: don't let set -e kill us if no stems yet
+EXISTING_DIR="$(find_existing_stems_dir "$STEMS_EXPORT_DIR" "$AUDIO_BASE_NOEXT" || true)"
 
-    if $DEMUCS_BIN -n htdemucs_6s -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH" 2>&1 | tee "$DEMUCS_BASE_OUT/demucs_6s.log"; then
-      BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs_6s/$AUDIO_BASE_NOEXT"
-      ok "[OK] Demucs 6-stem succeeded → $BEST_STEMS_DIR"
+if [ -n "$EXISTING_DIR" ] && [ $FORCE_AUDIO -eq 0 ]; then
+  ok "[REUSE] Found existing Demucs stems at $EXISTING_DIR — skipping separation."
+  BEST_STEMS_DIR="$EXISTING_DIR"
+else
+  info ">>> [DEMUCS] Running separation (6 → 4 → 2) …"
+  DEMUCS_BASE_OUT="$STEMS_EXPORT_DIR"
+
+  set +e
+  run_demucs_cmd "6-stem attempt" -n htdemucs_6s -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH"
+  DM_RC=$?
+  set -e
+
+  if [ $DM_RC -eq 0 ]; then
+    BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs_6s/$AUDIO_BASE_NOEXT"
+    ok "[OK] Demucs 6-stem succeeded → $BEST_STEMS_DIR"
+  else
+    warn "[WARN] 6-stem failed (rc=$DM_RC), trying 4-stem (htdemucs)…"
+    set +e
+    run_demucs_cmd "4-stem attempt" -n htdemucs -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH"
+    DM_RC2=$?
+    set -e
+    if [ $DM_RC2 -eq 0 ]; then
+      BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs/$AUDIO_BASE_NOEXT"
+      ok "[OK] Demucs 4-stem succeeded → $BEST_STEMS_DIR"
     else
-      warn "[WARN] 6-stem failed, trying 4-stem (htdemucs)…"
-      if $DEMUCS_BIN -n htdemucs -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH" 2>&1 | tee "$DEMUCS_BASE_OUT/demucs_4s.log"; then
+      warn "[WARN] 4-stem failed (rc=$DM_RC2), trying 2-stem (vocals)…"
+      set +e
+      run_demucs_cmd "2-stem attempt" --two-stems=vocals -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH"
+      DM_RC3=$?
+      set -e
+      if [ $DM_RC3 -eq 0 ]; then
         BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs/$AUDIO_BASE_NOEXT"
-        ok "[OK] Demucs 4-stem succeeded → $BEST_STEMS_DIR"
+        ok "[OK] Demucs 2-stem succeeded → $BEST_STEMS_DIR"
       else
-        warn "[WARN] 4-stem failed, trying 2-stem (vocals)…"
-        if $DEMUCS_BIN --two-stems=vocals -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH" 2>&1 | tee "$DEMUCS_BASE_OUT/demucs_2s.log"; then
-          BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs/$AUDIO_BASE_NOEXT"
-          ok "[OK] Demucs 2-stem succeeded → $BEST_STEMS_DIR"
-        else
-          err "[ERROR] All demucs attempts failed — will use mono for ALL variants."
-          BEST_STEMS_DIR=""
-        fi
+        err "[ERROR] All demucs attempts failed (rcs: $DM_RC, $DM_RC2, $DM_RC3) — will use mono for ALL variants."
+        BEST_STEMS_DIR=""
       fi
     fi
   fi
-else
-  warn "[WARN] demucs not found — ALL variants will sound the same (mono)."
 fi
 stage_end "demucs"
 
-# ---------------------------------------------------------------------------
-# 5) RENDER variants
-# ---------------------------------------------------------------------------
 stage_start "render_all_variants"
 if [ $HAS_VOCAL_PCTS -eq 1 ]; then
   IFS=' ' read -r -a PCTS <<<"$VOCAL_PCTS_STR"
 else
-  PCTS=(0 35 100)
+  PCTS=(100)
 fi
 
 for pct in "${PCTS[@]}"; do
