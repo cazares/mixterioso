@@ -163,19 +163,74 @@ class AudioPlayer:
 def fmt_time(sec: float) -> str:
     sec = max(0.0, sec)
     m = int(sec // 60)
-    s = sec - m * 60
-    return f"{m:02d}:{s:05.2f}"
+    rem = sec - m * 60
+    s = int(rem)
+    ms = int(round((rem - s) * 1000))
+    if ms == 1000:
+        s += 1
+        ms = 0
+    if s == 60:
+        m += 1
+        s = 0
+    return f"{m:02d}:{s:02d}.{ms:03d}"
 
 
 NOTE_KEYS = {
-    ord("!"): "♫",
-    ord("@"): "♪",
-    ord("#"): "♬",
-    ord("$"): "♩",
-    ord("%"): "♫♪♬♩",
-    ord("^"): "♫♪♫♪",
-    ord("*"): "♬♩♬♩",
+    ord("1"): "♫",
+    ord("2"): "♪",
+    ord("3"): "♬",
+    ord("4"): "♩",
+    ord("5"): "♫♪♬♩",
+    ord("6"): "♫♪♫♪",
+    ord("7"): "♬♩♬♩",
+    ord("8"): "♫♫♫♫",
+    ord("9"): "♪♪♪♪",
+    ord("0"): "𝄞 ♪ 𝄢 ♫",
+    ord("-"): "𝄞 𝄢 🤍 𝄢 𝄞",
+    ord("="): "𝄞 ♡ 𝄢",
 }
+
+
+def prompt_yes_no(stdscr, question: str) -> bool:
+    h, w = stdscr.getmaxyx()
+    stdscr.timeout(-1)
+    stdscr.move(h - 2, 0)
+    stdscr.clrtoeol()
+    stdscr.attron(curses.color_pair(3))
+    stdscr.addstr(h - 2, 0, question[: w - 1])
+    stdscr.attroff(curses.color_pair(3))
+    stdscr.refresh()
+    while True:
+        ch = stdscr.getch()
+        if ch in (ord("y"), ord("Y")):
+            stdscr.timeout(50)
+            return True
+        if ch in (ord("n"), ord("N"), 10, 13, 27):
+            stdscr.timeout(50)
+            return False
+
+
+def prompt_clear_mode(stdscr, pos_str: str) -> int:
+    h, w = stdscr.getmaxyx()
+    stdscr.timeout(-1)
+    msg = f"Clear timings? [1] all  [2] 0–{pos_str}  [3/N] keep: "
+    stdscr.move(h - 2, 0)
+    stdscr.clrtoeol()
+    stdscr.attron(curses.color_pair(3))
+    stdscr.addstr(h - 2, 0, msg[: w - 1])
+    stdscr.attroff(curses.color_pair(3))
+    stdscr.refresh()
+    while True:
+        ch = stdscr.getch()
+        if ch == ord("1"):
+            stdscr.timeout(50)
+            return 1
+        if ch == ord("2"):
+            stdscr.timeout(50)
+            return 2
+        if ch in (ord("3"), ord("n"), ord("N"), 10, 13, 27):
+            stdscr.timeout(50)
+            return 3
 
 
 def timing_ui(
@@ -213,47 +268,54 @@ def timing_ui(
 
     aborted = False
     saving = False
+    last_msg = ""
 
     while True:
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         pos = player.current_pos()
 
-        # Top controls bar
-        controls = (
+        # Top bars
+        controls1 = (
             "[SPACE/ENTER] tag  "
-            "[!/@/#/$/%/^/*] notes  "
-            "[1] rewind  "
-            "[0] undo/ff  "
-            "[p] pause/play  "
-            "[r] restart  "
-            "[g] goto time  "
-            "[q] save+quit  "
-            "[ESC] abort"
+            "[<] rewind  [u] undo  [>] ff  [r] restart  [g] goto  "
+            "[q] save+quit  [ESC] abort"
+        )
+        controls2 = (
+            "[1]♫ [2]♪ [3]♬ [4]♩ [5]♫♪♬♩ [6]♫♪♫♪ [7]♬♩♬♩ "
+            "[8]♫♫♫♫ [9]♪♪♪♪ [0]𝄞♪𝄢♫ [-]𝄞𝄢🤍𝄢𝄞 [=]𝄞♡𝄢"
         )
         stdscr.attron(curses.color_pair(3))
-        stdscr.addstr(0, 0, controls[: w - 1])
+        stdscr.addstr(0, 0, controls1[: w - 1])
+        if h > 2:
+            stdscr.addstr(1, 0, controls2[: w - 1])
         stdscr.attroff(curses.color_pair(3))
 
         # Lyric lines
+        mid = h // 2
         prev_line = lyrics[current_index - 1] if current_index > 0 else ""
         curr_line = lyrics[current_index] if current_index < num_lines else "<done>"
         next_line = lyrics[current_index + 1] if current_index + 1 < num_lines else ""
 
-        mid = h // 2
-        if prev_line and mid - 2 > 0:
+        if prev_line and mid - 2 > 1:
             stdscr.attron(curses.color_pair(4))
             stdscr.addstr(mid - 2, 0, prev_line[: w - 1])
             stdscr.attroff(curses.color_pair(4))
         stdscr.attron(curses.color_pair(1))
         stdscr.addstr(mid, 0, curr_line[: w - 1])
         stdscr.attroff(curses.color_pair(1))
-        if next_line and mid + 2 < h - 1:
+        if next_line and mid + 2 < h - 2:
             stdscr.attron(curses.color_pair(5))
             stdscr.addstr(mid + 2, 0, next_line[: w - 1])
             stdscr.attroff(curses.color_pair(5))
 
-        # Bottom status bar with highlighted time
+        # Message line
+        if last_msg and h >= 3:
+            stdscr.attron(curses.color_pair(3))
+            stdscr.addstr(h - 2, 0, last_msg[: w - 1])
+            stdscr.attroff(curses.color_pair(3))
+
+        # Bottom status bar
         status_left = f"[TIMING] {timing_path.name}  "
         pos_str = f"pos={fmt_time(pos)}/{fmt_time(player.duration)}"
         status_right = f"  line={current_index+1}/{num_lines}"
@@ -285,6 +347,7 @@ def timing_ui(
 
         stdscr.refresh()
 
+        # Normal auto-exit if audio finishes and you didn't abort
         if player.finished():
             break
 
@@ -293,6 +356,7 @@ def timing_ui(
         if ch == -1:
             continue
 
+        # Quit / abort
         if ch == 27:  # ESC
             aborted = True
             break
@@ -303,63 +367,103 @@ def timing_ui(
         # Tag current lyric line
         if ch in (ord(" "), 10, 13):
             if current_index < num_lines:
+                t = player.current_pos()
                 timings.append(
                     {
                         "line_index": current_index,
-                        "time": player.current_pos(),
+                        "time": t,
                         "text": lyrics[current_index],
                     }
                 )
+                last_msg = f"Tagged line {current_index+1} at {fmt_time(t)}"
                 current_index = min(current_index + 1, num_lines)
+                # if we've tagged the last line, auto-finish timing
+                if current_index >= num_lines:
+                    saving = True
+                    break
             continue
 
-        # Musical note events
+        # Note events
         if ch in NOTE_KEYS:
+            t = player.current_pos()
+            glyph = NOTE_KEYS[ch]
             timings.append(
                 {
                     "line_index": -1,
-                    "time": player.current_pos(),
-                    "text": NOTE_KEYS[ch],
+                    "time": t,
+                    "text": glyph,
                 }
             )
+            last_msg = f"Inserted {glyph} at {fmt_time(t)}"
             continue
 
-        # Rewind and trim
-        if ch == ord("1"):
-            pos = player.current_pos()
-            if pos <= 0.1:
+        # Rewind: < or LEFT
+        if ch in (ord("<"), curses.KEY_LEFT):
+            pos_before = player.current_pos()
+            if pos_before <= 0.1:
+                last_msg = "Already at song start"
                 continue
-            snapshot = (pos, deepcopy(timings), current_index)
+            snapshot = (pos_before, deepcopy(timings), current_index)
             history.append(snapshot)
-            new_pos = max(0.0, pos - rewind_step)
+            new_pos = max(0.0, pos_before - rewind_step)
             timings[:] = [t for t in timings if t["time"] <= new_pos]
             current_index = recompute_current_index(new_pos)
             player.start(new_pos)
+            last_msg = f"Rewind to {fmt_time(new_pos)}, deleted timings in window"
             continue
 
-        # Undo rewind if possible; otherwise fast-forward
-        if ch == ord("0"):
+        # Undo last rewind
+        if ch in (ord("u"), ord("U")):
             if history:
                 prev_pos, prev_timings, prev_idx = history.pop()
                 timings[:] = prev_timings
                 current_index = prev_idx
                 player.start(prev_pos)
+                last_msg = f"Undo to {fmt_time(prev_pos)}"
             else:
-                pos = player.current_pos()
-                new_pos = min(player.duration, pos + rewind_step)
-                current_index = recompute_current_index(new_pos)
-                player.start(new_pos)
+                last_msg = "Nothing to undo"
+            continue
+
+        # Fast-forward: > or RIGHT (no delete)
+        if ch in (ord(">"), curses.KEY_RIGHT):
+            pos_before = player.current_pos()
+            new_pos = min(player.duration, pos_before + rewind_step)
+            current_index = recompute_current_index(new_pos)
+            player.start(new_pos)
+            last_msg = f"Fast-forward to {fmt_time(new_pos)}"
             continue
 
         # Pause / play
         if ch in (ord("p"), ord("P")):
-            player.pause_toggle()
+            if player.paused:
+                player.pause_toggle()
+                last_msg = f"Resumed at {fmt_time(player.current_pos())}"
+            else:
+                player.pause_toggle()
+                last_msg = f"Paused at {fmt_time(player.current_pos())}"
             continue
 
-        # Restart song and clear history+timings
+        # Restart with prompts
         if ch in (ord("r"), ord("R")):
-            history.clear()
-            timings[:] = []
+            pos_here = player.current_pos()
+            pos_here_str = fmt_time(pos_here)
+            if not prompt_yes_no(stdscr, "Restart song from 00:00? y/N: "):
+                last_msg = "Restart cancelled"
+                continue
+            mode = prompt_clear_mode(stdscr, pos_here_str)
+            if mode == 1:
+                cleared = len(timings)
+                timings[:] = []
+                history.clear()
+                last_msg = f"Restarted, cleared all {cleared} timings"
+            elif mode == 2:
+                before = len(timings)
+                timings[:] = [t for t in timings if t["time"] > pos_here]
+                cleared = before - len(timings)
+                history.clear()
+                last_msg = f"Restarted, cleared {cleared} timings ≤ {pos_here_str}"
+            else:
+                last_msg = "Restarted, kept timings"
             current_index = 0
             player.restart()
             continue
@@ -382,14 +486,17 @@ def timing_ui(
             curses.noecho()
             stdscr.timeout(50)
             if not s.strip():
+                last_msg = "Goto cancelled"
                 continue
             try:
                 tgt = parse_time_string(s)
             except Exception:
+                last_msg = "Invalid time format"
                 continue
             tgt = max(0.0, min(player.duration, tgt))
             current_index = recompute_current_index(tgt)
             player.start(tgt)
+            last_msg = f"Goto {fmt_time(tgt)}"
             continue
 
     return aborted, saving
@@ -416,7 +523,7 @@ def parse_args(argv):
     p.add_argument("--txt", type=str, required=True, help="Lyrics txt path")
     p.add_argument("--audio", type=str, required=True, help="Audio file to play")
     p.add_argument("--timings", type=str, help="Timings CSV path")
-    p.add_argument("--rewind-step", type=float, default=5.0, help="Rewind seconds for key '1'")
+    p.add_argument("--rewind-step", type=float, default=5.0, help="Seconds for < and >")
     p.add_argument("--start", type=str, help="Start time (mm:ss or seconds)")
     return p.parse_args(argv)
 
