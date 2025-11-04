@@ -27,6 +27,7 @@ MP3_DIR = BASE_DIR / "mp3s"
 MIXES_DIR = BASE_DIR / "mixes"
 TIMINGS_DIR = BASE_DIR / "timings"
 OUTPUT_DIR = BASE_DIR / "output"
+LOGS_DIR = BASE_DIR / "logs"
 
 
 def slugify(text: str) -> str:
@@ -57,9 +58,17 @@ def run_pre_tracking(query: str) -> tuple[str, float]:
 
 def run_demucs_background(mp3_path: Path, model: str) -> tuple[subprocess.Popen, float]:
     cmd = ["demucs", "-n", model, str(mp3_path)]
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    demucs_log_path = LOGS_DIR / f"demucs_{mp3_path.stem}.log"
     log("DEMUX", f"Starting Demucs in background: {' '.join(cmd)}", YELLOW)
+    log("DEMUX", f"Demucs output → {demucs_log_path}", YELLOW)
     t0 = time.perf_counter()
-    proc = subprocess.Popen(cmd)
+
+    log_file = demucs_log_path.open("w")
+    proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+    # keep handle alive so it isn't GC'd while Demucs runs
+    proc._demucs_log = log_file  # type: ignore[attr-defined]
+
     return proc, t0
 
 
@@ -202,7 +211,7 @@ def main(argv=None):
 
     log("MP4GEN", f"Slug={slug}", GREEN)
 
-    # 1) Start Demucs in background
+    # 1) Start Demucs in background (silent into log file)
     demucs_proc, t_demux_start = run_demucs_background(mp3_path, args.model)
 
     # 2) Mix UI (foreground)
@@ -227,7 +236,6 @@ def main(argv=None):
     t_total_end = time.perf_counter()
     t_total = t_total_end - t_total_start
 
-    # Colored summary
     print()
     print(f"{BOLD}{BLUE}========== PIPELINE SUMMARY ({slug}, profile={args.profile}) =========={RESET}")
     if args.query:
