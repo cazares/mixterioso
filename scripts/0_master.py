@@ -19,7 +19,7 @@ def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
 
 
-BASE_DIR = Path(__file__.resolve()).parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = BASE_DIR / "scripts"
 TXT_DIR = BASE_DIR / "txts"
 MP3_DIR = BASE_DIR / "mp3s"
@@ -276,9 +276,6 @@ def run_step4_mp4(slug: str, profile: str) -> float:
         t = run(cmd, "STEP4")
         return t
     except subprocess.CalledProcessError as e:
-        # 4_mp4 already prints a clear message like:
-        # "Audio not found for profile=karaoke: /.../slug_profile.wav"
-        # Just add a clean summary here and keep the pipeline alive.
         log(
             "STEP4",
             f"Step 4 failed (exit {e.returncode}). "
