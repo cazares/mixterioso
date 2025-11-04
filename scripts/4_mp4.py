@@ -305,7 +305,6 @@ def parse_args(argv=None):
     p.add_argument(
         "--font-size",
         type=int,
-        default=140,
         help="Subtitle font size (20–200). Default 140.",
     )
     p.add_argument(
@@ -321,7 +320,32 @@ def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
     slug = slugify(args.slug)
     profile = args.profile
-    font_size = max(20, min(200, args.font_size))
+
+    # Determine font size, with interactive prompt when possible.
+    default_font_size = 140
+    font_size_value = args.font_size
+
+    if font_size_value is None:
+        if sys.stdin.isatty():
+            try:
+                resp = input(
+                    f"Subtitle font size [20–200, default {default_font_size}]: "
+                ).strip()
+            except EOFError:
+                resp = ""
+            if resp:
+                try:
+                    font_size_value = int(resp)
+                except ValueError:
+                    log("FONT", f"Invalid font size '{resp}', using default {default_font_size}", YELLOW)
+                    font_size_value = default_font_size
+            else:
+                font_size_value = default_font_size
+        else:
+            font_size_value = default_font_size
+
+    font_size = max(20, min(200, font_size_value))
+    log("FONT", f"Using font size {font_size}", CYAN)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
