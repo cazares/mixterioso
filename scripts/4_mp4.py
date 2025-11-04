@@ -49,7 +49,7 @@ def fmt_secs_mmss(sec: float) -> str:
 
 
 def ask_font_size(default: int = 120) -> int:
-    prompt = f"Title font size default {default}. ENTER to accept or type 20–200: "
+    prompt = f"Global font size default {default}. ENTER to accept or type 20–200: "
     try:
         s = input(prompt).strip()
     except EOFError:
@@ -84,6 +84,10 @@ def secs_to_ass_time(t: float) -> str:
     return f"{h:d}:{m:02d}:{sec:02d}.{cs:02d}"
 
 
+def escape_ass_text(s: str) -> str:
+    return s.replace("\n", r"\N").replace("{", r"\{").replace("}", r"\}")
+
+
 def load_meta(slug: str):
     meta_path = META_DIR / f"{slug}.json"
     if not meta_path.exists():
@@ -116,11 +120,11 @@ def load_timings(slug: str):
     return rows, path
 
 
-def build_ass_from_timings(slug: str, rows, duration: float) -> Path:
+def build_ass_from_timings(slug: str, rows, duration: float, lyric_font_size: int) -> Path:
     META_DIR.mkdir(parents=True, exist_ok=True)
     ass_path = META_DIR / f"{slug}_lyrics.ass"
 
-    header = """[Script Info]
+    header = f"""[Script Info]
 ScriptType: v4.00+
 Collisions: Normal
 PlayResX: 1920
@@ -129,7 +133,7 @@ Timer: 100.0000
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,64,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,3,0,2,80,80,40,0
+Style: Default,Arial,{lyric_font_size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,3,0,2,80,80,40,0
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -146,9 +150,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             end = min(duration, start + 3.0)
         if end <= start:
             end = start + 0.5
+
         text = row.get("text", "")
-        text = text.replace("\n", r"\N")
-        text = text.replace("{", r"\{").replace("}", r"\}")
+        text = escape_ass_text(text)
 
         start_str = secs_to_ass_time(start)
         end_str = secs_to_ass_time(end)
@@ -191,6 +195,16 @@ def open_path(path: Path) -> None:
         log("OPEN", f"Failed to open {path}", YELLOW)
 
 
+def escape_drawtext_text(s: str) -> str:
+    # ffmpeg drawtext escaping
+    return (
+        s.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace(",", "\\,")
+    )
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Generate MP4 with title card and lyrics/notes from timings.")
     p.add_argument("--slug", type=str, required=True, help="Song slug (e.g. californication)")
@@ -201,7 +215,7 @@ def parse_args(argv=None):
         choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
         help="Audio profile (lyrics=original mp3, others=use mixed WAV)",
     )
-    p.add_argument("--font-size", type=int, help="Title font size (20–200). If omitted, ask interactively.")
+    p.add_argument("--font-size", type=int, help="Global font size 20–200 (title + lyrics).")
     return p.parse_args(argv)
 
 
@@ -224,39 +238,78 @@ def main(argv=None):
     rows, timing_csv_path = load_timings(slug)
     log("MP4", f"Using timings from {timing_csv_path}", GREEN)
 
-    ass_path = build_ass_from_timings(slug, rows, duration)
-
-    artist, title = load_meta(slug)
-    if title and artist:
-        lines = [title, "", "by", "", artist]
-    elif title:
-        lines = [title]
-    else:
-        lines = [slug.replace("_", " ")]
-
-    META_DIR.mkdir(parents=True, exist_ok=True)
-    title_txt = META_DIR / f"{slug}_title.txt"
-    title_txt.write_text("\n".join(lines), encoding="utf-8")
-    log("MP4", f"Wrote title text file to {title_txt}", GREEN)
-
     if args.font_size is not None:
         font_size = args.font_size
     else:
         font_size = ask_font_size(120)
 
+    lyric_font_size = max(32, int(font_size * 0.6))
+    ass_path = build_ass_from_timings(slug, rows, duration, lyric_font_size)
+
+    artist, title = load_meta(slug)
+    if title and artist:
+        title_main = title
+        title_by = "by"
+        title_artist = artist
+    elif title:
+        title_main = title
+        title_by = ""
+        title_artist = ""
+    else:
+        title_main = slug.replace("_", " ")
+        title_by = ""
+        title_artist = ""
+
+    META_DIR.mkdir(parents=True, exist_ok=True)
+
     out_mp4 = OUTPUT_DIR / f"{slug}_{args.profile}.mp4"
 
-    # use POSIX-style paths to keep ffmpeg filter happy
     ass_str = ass_path.as_posix()
-    title_str = title_txt.as_posix()
 
-    filter_complex = (
-        f"[0:v]subtitles={ass_str}[sub];"
-        f"[sub]drawtext=textfile={title_str}:"
-        f"fontcolor=white:fontsize={font_size}:"
-        f"x=(w-text_w)/2:y=(h-text_h)/2:"
-        f"enable='lte(t,3)'[v]"
-    )
+    draw_layers = []
+    in_label = "sub"
+
+    # vertical positions tuned by font size; approximations but stable
+    if title_main and title_artist:
+        # three-line layout
+        y1 = f"h/2-{font_size*1.3:.1f}"
+        y2 = "h/2"
+        y3 = f"h/2+{font_size*1.3:.1f}"
+        triples = [
+            (title_main, y1),
+            (title_by, y2),
+            (title_artist, y3),
+        ]
+    elif title_main and title_by:
+        # just in case; not typical
+        y1 = f"h/2-{font_size*0.8:.1f}"
+        y2 = f"h/2+{font_size*0.8:.1f}"
+        triples = [
+            (title_main, y1),
+            (title_by, y2),
+        ]
+    else:
+        # single centered line
+        triples = [(title_main, "(h-text_h)/2")]
+
+    for i, (text, yexpr) in enumerate(triples):
+        if not text:
+            continue
+        out_label = "v" if i == len(triples) - 1 else f"t{i+1}"
+        draw = (
+            f"[{in_label}]drawtext=text='{escape_drawtext_text(text)}':"
+            f"fontcolor=white:fontsize={font_size}:"
+            f"x=(w-text_w)/2:y={yexpr}:enable='lte(t,3)'[{out_label}]"
+        )
+        draw_layers.append(draw)
+        in_label = out_label
+
+    if not draw_layers:
+        # no usable title text; just pass subtitles through
+        filter_complex = f"[0:v]subtitles={ass_str}[v]"
+    else:
+        draw_chain = ";".join(draw_layers)
+        filter_complex = f"[0:v]subtitles={ass_str}[sub];{draw_chain}"
 
     cmd = [
         "ffmpeg",
@@ -288,8 +341,11 @@ def main(argv=None):
 
     log("MP4", f"MP4 written to {out_mp4}", GREEN)
     log("MP4", f"Render time: {fmt_secs_mmss(t1 - t0)}", GREEN)
-    log("MP4", f'Title card: "{" / ".join(lines)}" (first ~3 seconds)', GREEN)
+    if title_main:
+        title_desc = " / ".join([p for p in [title_main, title_by, title_artist] if p])
+        log("MP4", f'Title card "{title_desc}" shown in first ~3s.', GREEN)
     log("MP4", f"Subtitles from {timing_csv_path}", GREEN)
+    log("MP4", f"Global font size {font_size} (lyrics {lyric_font_size}).", GREEN)
 
     try:
         ans = input("Open output directory? [y/N]: ").strip().lower()
