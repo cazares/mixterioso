@@ -34,6 +34,12 @@ VERTICAL_OFFSET_FRACTION = 0.12  # tweak this easily in code
 # This multiplier makes UI font sizes (20–200) visually larger on 1080p.
 ASS_FONT_MULTIPLIER = 1.5
 
+# Next-line preview tuning (relative to screen / main font).
+NEXT_LINE_X_OFFSET_FRACTION = 0.15   # shift right from center
+NEXT_LINE_Y_OFFSET_FRACTION = 0.10   # shift down from main line
+NEXT_LINE_FONT_SCALE = 0.5           # 50% of main font size
+NEXT_LINE_ALPHA_HEX = "80"           # &H00..& = opaque, &HFF..& = transparent
+
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
@@ -172,13 +178,19 @@ def build_ass(
     if audio_duration <= 0.0 and timings:
         audio_duration = max(t for t, _ in timings) + 5.0
 
-    # Playback resolution (ASS script resolution)
+    # Playback resolution
     playresx = VIDEO_WIDTH
     playresy = VIDEO_HEIGHT
 
-    # Vertical offset: center minus some fraction of height.
-    # ASS Alignment=5 is center-middle; MarginV pushes it up/down.
+    # Vertical offset for main line.
     margin_v = int(playresy * VERTICAL_OFFSET_FRACTION)
+
+    # Approximate main line anchor and next-line offset positions.
+    x_center = int(playresx / 2)
+    y_main = int(playresy / 2 - margin_v)
+    x_preview = int(x_center + playresx * NEXT_LINE_X_OFFSET_FRACTION)
+    y_preview = int(y_main + playresy * NEXT_LINE_Y_OFFSET_FRACTION)
+    preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
 
     # Basic ASS header
     header_lines = [
@@ -239,14 +251,35 @@ def build_ass(
                 end = audio_duration or (t + 5.0)
             if end <= start:
                 end = start + 0.5
-            ev_text = ass_escape(text)
+
+            # Main line (centered, full size)
+            main_text = ass_escape(text)
             events.append(
                 "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
                     start=seconds_to_ass_time(start),
                     end=seconds_to_ass_time(end),
-                    text=ev_text,
+                    text=main_text,
                 )
             )
+
+            # Next-line preview (below/right, smaller, semi-transparent)
+            if i < n - 1:
+                next_raw = timings[i + 1][1]
+                if next_raw:
+                    preview_text = ass_escape(next_raw)
+                    tag = "{{\\pos({x},{y})\\fs{fs}\\1a&H{alpha}&}}".format(
+                        x=x_preview,
+                        y=y_preview,
+                        fs=preview_font,
+                        alpha=NEXT_LINE_ALPHA_HEX,
+                    )
+                    events.append(
+                        "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
+                            start=seconds_to_ass_time(start),
+                            end=seconds_to_ass_time(end),
+                            text=tag + preview_text,
+                        )
+                    )
 
     ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
     log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
@@ -350,7 +383,11 @@ def main(argv=None):
 
     ui_font_size = max(20, min(200, font_size_value))
     ass_font_size = int(ui_font_size * ASS_FONT_MULTIPLIER)
-    log("FONT", f"Using UI font size {ui_font_size} (ASS Fontsize={ass_font_size})", CYAN)
+    log(
+        "FONT",
+        f"Using UI font size {ui_font_size} (ASS Fontsize={ass_font_size})",
+        CYAN,
+    )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
