@@ -27,12 +27,16 @@ VIDEO_WIDTH = 1920
 VIDEO_HEIGHT = 1080
 
 # Fraction of screen given to the main-lyric band (top) and next-lyric band (bottom).
-TOP_BAND_FRACTION = 0.8    # top 80% for main lyric
+TOP_BAND_FRACTION = 0.8     # top 80% for main lyric
 BOTTOM_BAND_FRACTION = 0.2  # bottom 20% for next lyric (informational)
 
-# How far to nudge the main line up within the top band (fraction of top-band height).
-# Positive moves the main line upward in its band.
+# How far to nudge the main line vertically within the top band (fraction of top-band height).
+# Positive moves DOWN within the top band.
 VERTICAL_OFFSET_FRACTION = 0.0
+
+# Extra offset (fraction of top-band height) applied only to the title card,
+# to bring it lower on the screen.
+TITLE_EXTRA_OFFSET_FRACTION = 0.15
 
 # Within the bottom band, how far down from the divider to place the next-lyric text,
 # as a fraction of the bottom band height.
@@ -45,6 +49,9 @@ ASS_FONT_MULTIPLIER = 1.5
 # Next-line preview tuning.
 NEXT_LINE_FONT_SCALE = 0.5           # 50% of main ASS font size
 NEXT_LINE_ALPHA_HEX = "80"           # ~50% transparency for preview text and divider
+
+# Small gap between lyric "screens" (seconds), so old text clears before new appears.
+SCREEN_GAP_SECONDS = 0.04
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
@@ -195,10 +202,13 @@ def build_ass(
     y_divider = top_band_height
     bottom_band_height = playresy - y_divider
 
-    # Main lyric: center of top band, optionally nudged upward.
+    # Main lyric: center of top band, nudged by VERTICAL_OFFSET_FRACTION.
     center_top = top_band_height // 2
     offset_px = int(top_band_height * VERTICAL_OFFSET_FRACTION)
-    y_main = center_top - offset_px
+    y_main = center_top + offset_px
+
+    # Title card a bit lower than main lyric.
+    y_title = y_main + int(top_band_height * TITLE_EXTRA_OFFSET_FRACTION)
 
     # Next lyric: top-center inside the bottom band with padding.
     x_center = playresx // 2
@@ -206,10 +216,9 @@ def build_ass(
 
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
 
-    # We keep MarginV for completeness, but positions are driven by \pos() overrides.
+    # MarginV kept for completeness, but positions are driven by \pos() overrides.
     margin_v = 0
 
-    # Basic ASS header
     header_lines = [
         "[Script Info]",
         "ScriptType: v4.00+",
@@ -237,9 +246,8 @@ def build_ass(
     ]
 
     def ass_escape(text: str) -> str:
-        # Basic escaping for ASS: replace { } and newlines
         text = text.replace("{", "(").replace("}", ")")
-        text = text.replace("\\N", "\\N")  # keep explicit \N
+        text = text.replace("\\N", "\\N")
         text = text.replace("\n", r"\N")
         return text
 
@@ -268,12 +276,10 @@ def build_ass(
             "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(start),
                 end=seconds_to_ass_time(end),
-                text=f"{{\\an5\\pos({x_center},{y_main})}}{main_text}",
+                text=f"{{\\an5\\pos({x_center},{y_title})}}{main_text}",
             )
         )
     else:
-        # Build events from timings; each entry lasts until next timestamp,
-        # last entry lasts until audio_duration.
         n = len(timings)
 
         # Title card at t=0: "[title]\n\nby\n\n[artist]"
@@ -281,7 +287,8 @@ def build_ass(
         if first_start <= 0:
             title_end = min(audio_duration, 0.5)
         else:
-            title_end = first_start
+            # Leave a tiny gap before the first line so title fully disappears.
+            title_end = max(0.0, first_start - SCREEN_GAP_SECONDS)
 
         if title_end > 0:
             if artist:
@@ -292,18 +299,23 @@ def build_ass(
                 "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                     start=seconds_to_ass_time(0.0),
                     end=seconds_to_ass_time(title_end),
-                    text=f"{{\\an5\\pos({x_center},{y_main})}}{ass_escape(title_lines)}",
+                    text=f"{{\\an5\\pos({x_center},{y_title})}}{ass_escape(title_lines)}",
                 )
             )
 
+        # Main + next-lyric screens
         for i, (t, raw_text) in enumerate(timings):
-            start = t
+            start = max(0.0, t)
+
             if i < n - 1:
-                end = timings[i + 1][0]
+                next_start = max(0.0, timings[i + 1][0])
+                # End a tiny bit before next start to "wipe" the screen.
+                end = max(start + 0.01, next_start - SCREEN_GAP_SECONDS)
             else:
                 end = audio_duration or (t + 5.0)
+
             if end <= start:
-                end = start + 0.5
+                end = start + 0.05
 
             # Main line in top band
             main_text = ass_escape(raw_text)
@@ -462,7 +474,6 @@ def main(argv=None):
     out_mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
 
     # ffmpeg pipeline: audio input + black background + ASS subtitles
-    # Input 0: audio, Input 1: black video
     color_filter = f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30:d={max(audio_duration, 5.0)}"
     cmd = [
         "ffmpeg",
@@ -497,7 +508,6 @@ def main(argv=None):
     t1 = time.perf_counter()
     log("MP4", f"Wrote MP4 to {out_mp4} in {t1 - t0:6.2f} s", GREEN)
 
-    # Offer to open dir/mp4
     print()
     print(f"{BOLD}{BLUE}MP4 generation complete:{RESET} {out_mp4}")
     print("What would you like to open?")
@@ -505,7 +515,6 @@ def main(argv=None):
     print("  2 = MP4 file")
     print("  3 = both (dir then MP4)")
     print("  0 = none")
-    choice = ""
     try:
         choice = input("Choice [0/1/2/3, default 0]: ").strip()
     except EOFError:
