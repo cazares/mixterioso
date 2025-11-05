@@ -34,11 +34,12 @@ VERTICAL_OFFSET_FRACTION = 0.12  # tweak this easily in code
 # This multiplier makes UI font sizes (20–200) visually larger on 1080p.
 ASS_FONT_MULTIPLIER = 1.5
 
-# Next-line preview tuning (relative to screen / main font).
-NEXT_LINE_X_OFFSET_FRACTION = 0.15   # shift right from center
-NEXT_LINE_Y_OFFSET_FRACTION = 0.10   # shift down from main line
+# Next-line preview tuning.
+# X offset is relative to center; keep 0.0 for directly centered.
+NEXT_LINE_X_OFFSET_FRACTION = 0.0    # 0 = same X as main lyric (centered)
+NEXT_LINE_Y_OFFSET_FRACTION = 0.13   # vertical gap below main lyric (fraction of height)
 NEXT_LINE_FONT_SCALE = 0.5           # 50% of main font size
-NEXT_LINE_ALPHA_HEX = "80"           # &H00..& = opaque, &HFF..& = transparent
+NEXT_LINE_ALPHA_HEX = "80"           # &H00..& = opaque, &HFF..& = transparent (~50%)
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
@@ -185,8 +186,8 @@ def build_ass(
     # Vertical offset for main line.
     margin_v = int(playresy * VERTICAL_OFFSET_FRACTION)
 
-    # Approximate main line anchor and next-line offset positions.
-    x_center = int(playresx / 2)
+    # Approximate main line center and next-line offset positions.
+    x_center = playresx // 2
     y_main = int(playresy / 2 - margin_v)
     x_preview = int(x_center + playresx * NEXT_LINE_X_OFFSET_FRACTION)
     y_preview = int(y_main + playresy * NEXT_LINE_Y_OFFSET_FRACTION)
@@ -252,7 +253,7 @@ def build_ass(
             if end <= start:
                 end = start + 0.5
 
-            # Main line (centered, full size)
+            # Main line (centered, full size via style)
             main_text = ass_escape(text)
             events.append(
                 "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
@@ -262,12 +263,12 @@ def build_ass(
                 )
             )
 
-            # Next-line preview (below/right, smaller, semi-transparent)
+            # Next-line preview (centered below, smaller, semi-transparent)
             if i < n - 1:
                 next_raw = timings[i + 1][1]
                 if next_raw:
                     preview_text = ass_escape(next_raw)
-                    tag = "{{\\pos({x},{y})\\fs{fs}\\1a&H{alpha}&}}".format(
+                    tag = "{{\\an5\\pos({x},{y})\\fs{fs}\\1a&H{alpha}&}}".format(
                         x=x_preview,
                         y=y_preview,
                         fs=preview_font,
