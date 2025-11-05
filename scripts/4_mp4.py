@@ -30,6 +30,10 @@ VIDEO_HEIGHT = 1080
 # Positive = move text up.
 VERTICAL_OFFSET_FRACTION = 0.12  # tweak this easily in code
 
+# ASS "Fontsize" is relative to PlayResY, not literal pixels.
+# This multiplier makes UI font sizes (20–200) visually larger on 1080p.
+ASS_FONT_MULTIPLIER = 1.5
+
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
@@ -160,7 +164,7 @@ def build_ass(
     timings: list[tuple[float, str]],
     audio_duration: float,
     font_name: str,
-    font_size: int,
+    font_size_script: int,
 ) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ass_path = OUTPUT_DIR / f"{slug}.ass"
@@ -168,13 +172,13 @@ def build_ass(
     if audio_duration <= 0.0 and timings:
         audio_duration = max(t for t, _ in timings) + 5.0
 
-    # Playback resolution
+    # Playback resolution (ASS script resolution)
     playresx = VIDEO_WIDTH
     playresy = VIDEO_HEIGHT
 
     # Vertical offset: center minus some fraction of height.
     # ASS Alignment=5 is center-middle; MarginV pushes it up/down.
-    margin_v = int(VIDEO_HEIGHT * VERTICAL_OFFSET_FRACTION)
+    margin_v = int(playresy * VERTICAL_OFFSET_FRACTION)
 
     # Basic ASS header
     header_lines = [
@@ -193,7 +197,7 @@ def build_ass(
             "Alignment, MarginL, MarginR, MarginV, Encoding"
         ),
         (
-            f"Style: Default,{font_name},{font_size},"
+            f"Style: Default,{font_name},{font_size_script},"
             "&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
             "0,0,0,0,100,100,0,0,1,4,0,5,50,50,"
             f"{margin_v},0"
@@ -344,8 +348,9 @@ def main(argv=None):
         else:
             font_size_value = default_font_size
 
-    font_size = max(20, min(200, font_size_value))
-    log("FONT", f"Using font size {font_size}", CYAN)
+    ui_font_size = max(20, min(200, font_size_value))
+    ass_font_size = int(ui_font_size * ASS_FONT_MULTIPLIER)
+    log("FONT", f"Using UI font size {ui_font_size} (ASS Fontsize={ass_font_size})", CYAN)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -362,8 +367,8 @@ def main(argv=None):
     timings = read_timings(slug)
     log("META", f'Artist="{artist}", Title="{title}", entries={len(timings)}', CYAN)
 
-    # Build ASS
-    ass_path = build_ass(slug, artist, title, timings, audio_duration, args.font_name, font_size)
+    # Build ASS (use scaled ASS font size)
+    ass_path = build_ass(slug, artist, title, timings, audio_duration, args.font_name, ass_font_size)
 
     # Output MP4 path
     out_mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
