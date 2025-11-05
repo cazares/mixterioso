@@ -34,7 +34,7 @@ BOTTOM_BAND_FRACTION = 0.2  # bottom 20% for next lyric (informational)
 # Positive moves the main line upward in its band.
 VERTICAL_OFFSET_FRACTION = 0.0
 
-# Within the bottom band, how far down from the divider to place the "Up next" text,
+# Within the bottom band, how far down from the divider to place the next-lyric text,
 # as a fraction of the bottom band height.
 BOTTOM_TEXT_TOP_PADDING_FRACTION = 0.25  # 0.0 = right at divider, 1.0 = at bottom of screen
 
@@ -45,7 +45,6 @@ ASS_FONT_MULTIPLIER = 1.5
 # Next-line preview tuning.
 NEXT_LINE_FONT_SCALE = 0.5           # 50% of main ASS font size
 NEXT_LINE_ALPHA_HEX = "80"           # ~50% transparency for preview text and divider
-NEXT_LINE_PREFIX = "Up next: "       # prefix added to all bottom lyrics
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
@@ -263,7 +262,7 @@ def build_ass(
         # Single event with placeholder in the main-lyric band.
         start = 0.0
         end = audio_duration or 5.0
-        ev_text = f"{title}\\Nby\\N{artist}" if artist else title
+        ev_text = f"{title}\\N\\Nby\\N\\N{artist}" if artist else title
         main_text = ass_escape(ev_text)
         events.append(
             "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
@@ -276,6 +275,27 @@ def build_ass(
         # Build events from timings; each entry lasts until next timestamp,
         # last entry lasts until audio_duration.
         n = len(timings)
+
+        # Title card at t=0: "[title]\n\nby\n\n[artist]"
+        first_start = timings[0][0]
+        if first_start <= 0:
+            title_end = min(audio_duration, 0.5)
+        else:
+            title_end = first_start
+
+        if title_end > 0:
+            if artist:
+                title_lines = f"{title}\\N\\Nby\\N\\N{artist}"
+            else:
+                title_lines = title
+            events.append(
+                "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
+                    start=seconds_to_ass_time(0.0),
+                    end=seconds_to_ass_time(title_end),
+                    text=f"{{\\an5\\pos({x_center},{y_main})}}{ass_escape(title_lines)}",
+                )
+            )
+
         for i, (t, raw_text) in enumerate(timings):
             start = t
             if i < n - 1:
@@ -299,8 +319,7 @@ def build_ass(
             if i < n - 1:
                 next_raw = timings[i + 1][1]
                 if next_raw:
-                    prefixed = NEXT_LINE_PREFIX + next_raw
-                    preview_text = ass_escape(prefixed)
+                    preview_text = ass_escape(next_raw)
                     tag = (
                         f"{{\\an5\\pos({x_center},{y_next})"
                         f"\\fs{preview_font}\\1a&H{NEXT_LINE_ALPHA_HEX}&}}"
