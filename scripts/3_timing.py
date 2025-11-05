@@ -541,7 +541,15 @@ def main(argv=None):
     if not lyrics:
         raise SystemExit("No lyrics lines found.")
 
-    timings = load_timings(timing_path, len(lyrics))
+    # Step 3 policy: if timings CSV already exists, delete it and start fresh.
+    if timing_path.exists():
+        try:
+            timing_path.unlink()
+            log("TIMING", f"Existing timings file deleted: {timing_path}", YELLOW)
+        except Exception as e:
+            log("TIMING", f"Failed to delete existing timings file {timing_path}: {e}", YELLOW)
+
+    timings = load_timings(timing_path, len(lyrics))  # will be [] if we just deleted it
     history: list[tuple[float, list[dict], int]] = []
 
     player = AudioPlayer(audio_path)
@@ -583,3 +591,4 @@ if __name__ == "__main__":
     main()
 
 # end of 3_timing.py
+    
