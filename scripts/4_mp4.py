@@ -46,13 +46,6 @@ ASS_FONT_MULTIPLIER = 1.5
 NEXT_LINE_FONT_SCALE = 0.5
 NEXT_LINE_ALPHA_HEX = "80"  # 50% transparent
 
-# Note overlay tuning.
-NOTE_DURATION_SECONDS = 0.7
-NOTE_ALPHA_HEX = "40"       # lighter than main lyrics
-
-# Tiny gap we may use for title → first line if needed.
-SCREEN_GAP_SECONDS = 0.04
-
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
@@ -137,7 +130,6 @@ def read_timings(slug: str) -> list[tuple[float, str, int]]:
         header = next(reader, None)
 
         if header and "time_secs" in header:
-            # line_index,time_secs,text
             try:
                 idx_time = header.index("time_secs")
             except ValueError:
@@ -173,7 +165,6 @@ def read_timings(slug: str) -> list[tuple[float, str, int]]:
 
                 rows.append((t, text, line_index))
         else:
-            # Fallback: first column time, second text.
             for row in reader:
                 if len(row) < 2:
                     continue
@@ -275,12 +266,8 @@ def build_ass(
         )
     )
 
-    # Split timings into lyrics and notes.
-    lyric_rows = [(t, txt) for (t, txt, li) in timings if li >= 0]
-    note_rows = [(t, txt) for (t, txt, li) in timings if li < 0]
-
-    if not timings or not lyric_rows:
-        # No lyric timings: one big title card in the main band.
+    # No timings → just a big title card.
+    if not timings:
         start = 0.0
         end = audio_duration or 5.0
         ev_text = f"{title}\\N\\Nby\\N\\N{artist}" if artist else title
@@ -291,80 +278,91 @@ def build_ass(
                 text=f"{{\\an5\\pos({x_center},{y_title})}}{ass_escape(ev_text)}",
             )
         )
-    else:
-        # Title card from t=0 up to first lyric (no fancy gaps).
-        first_start = max(0.0, lyric_rows[0][0])
-        title_end = max(0.0, min(audio_duration, first_start))
-        if title_end > 0:
-            if artist:
-                title_lines = f"{title}\\N\\Nby\\N\\N{artist}"
-            else:
-                title_lines = title
-            events.append(
-                "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
-                    start=seconds_to_ass_time(0.0),
-                    end=seconds_to_ass_time(title_end),
-                    text=f"{{\\an5\\pos({x_center},{y_title})}}{ass_escape(title_lines)}",
-                )
-            )
+        ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
+        log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
+        return ass_path
 
-        # Main lyric + next-lyric preview, driven only by lyric rows.
-        n_lyr = len(lyric_rows)
-        for i, (t, raw_text) in enumerate(lyric_rows):
-            start = max(0.0, t)
-            if i < n_lyr - 1:
-                next_start = max(0.0, lyric_rows[i + 1][0])
-            else:
-                next_start = audio_duration or (t + 5.0)
-
-            end = max(start + 0.05, next_start)
-            if end > audio_duration:
-                end = audio_duration
-
-            main_text = ass_escape(raw_text)
-            events.append(
-                "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
-                    start=seconds_to_ass_time(start),
-                    end=seconds_to_ass_time(end),
-                    text=f"{{\\an5\\pos({x_center},{y_main})}}{main_text}",
-                )
-            )
-
-            # Next-line preview in bottom band (if there *is* a next lyric).
-            if i < n_lyr - 1:
-                _, next_raw = lyric_rows[i + 1]
-                if next_raw:
-                    preview_text = ass_escape(next_raw)
-                    tag = (
-                        f"{{\\an5\\pos({x_center},{y_next})"
-                        f"\\fs{preview_font}\\1a&H{NEXT_LINE_ALPHA_HEX}&}}"
-                    )
-                    events.append(
-                        "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
-                            start=seconds_to_ass_time(start),
-                            end=seconds_to_ass_time(end),
-                            text=tag + preview_text,
-                        )
-                    )
-
-    # Note overlays: independent of lyric segmentation.
-    for t, raw_text in note_rows:
-        start = max(0.0, t)
-        end = min(audio_duration, start + NOTE_DURATION_SECONDS)
-        if end <= start or not raw_text:
+    # Unified event list: lyrics and notes together, strictly increasing times.
+    unified: list[tuple[float, str, int]] = []
+    last_t = -1.0
+    for t, text, li in timings:
+        if not text:
             continue
-        note_text = ass_escape(raw_text)
-        tag = (
-            f"{{\\an5\\pos({x_center},{y_main})"
-            f"\\1a&H{NOTE_ALPHA_HEX}&}}"
-        )
+        t = max(0.0, t)
+        if unified and t <= last_t:
+            t = last_t + 0.001  # enforce monotonic times, tiny epsilon
+        unified.append((t, text, li))
+        last_t = t
+
+    if not unified:
+        start = 0.0
+        end = audio_duration or 5.0
+        ev_text = f"{title}\\N\\Nby\\N\\N{artist}" if artist else title
         events.append(
-            "Dialogue: 3,{start},{end},Default,,0,0,0,,{text}".format(
+            "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(start),
                 end=seconds_to_ass_time(end),
-                text=tag + note_text,
+                text=f"{{\\an5\\pos({x_center},{y_title})}}{ass_escape(ev_text)}",
             )
         )
+        ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
+        log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
+        return ass_path
+
+    # Title card from t=0 up to the first event (lyric or note).
+    first_start = unified[0][0]
+    title_end = max(0.0, min(audio_duration, first_start))
+    if title_end > 0:
+        if artist:
+            title_lines = f"{title}\\N\\Nby\\N\\N{artist}"
+        else:
+            title_lines = title
+        events.append(
+            "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(0.0),
+                end=seconds_to_ass_time(title_end),
+                text=f"{{\\an5\\pos({x_center},{y_title})}}{ass_escape(title_lines)}",
+            )
+        )
+
+    # One main line per event, one up-next line, no overlaps.
+    n = len(unified)
+    for i, (t, raw_text, _line_index) in enumerate(unified):
+        start = max(0.0, t)
+        if i < n - 1:
+            end = max(start, unified[i + 1][0])
+        else:
+            end = audio_duration or (start + 5.0)
+
+        if end > audio_duration:
+            end = audio_duration
+
+        # Main line (lyric or note) in the top band.
+        main_text = ass_escape(raw_text)
+        events.append(
+            "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(start),
+                end=seconds_to_ass_time(end),
+                text=f"{{\\an5\\pos({x_center},{y_main})}}{main_text}",
+            )
+        )
+
+        # Up-next preview: next event's text, bottom band, semi-transparent.
+        if i < n - 1:
+            _, next_raw, _ = unified[i + 1]
+            if next_raw:
+                preview_text = ass_escape(next_raw)
+                tag = (
+                    f"{{\\an5\\pos({x_center},{y_next})"
+                    f"\\fs{preview_font}\\1a&H{NEXT_LINE_ALPHA_HEX}&}}"
+                )
+                events.append(
+                    "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
+                        start=seconds_to_ass_time(start),
+                        end=seconds_to_ass_time(end),
+                        text=tag + preview_text,
+                    )
+                )
 
     ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
     log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
