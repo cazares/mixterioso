@@ -50,7 +50,7 @@ ASS_FONT_MULTIPLIER = 1.5
 NEXT_LINE_FONT_SCALE = 0.5           # 50% of main ASS font size
 NEXT_LINE_ALPHA_HEX = "80"           # ~50% transparency for preview text and divider
 
-# Small gap between lyric "screens" (seconds), so old text clears before new appears.
+# Small gap between lyric "screens" (seconds), used only when a note line is involved.
 SCREEN_GAP_SECONDS = 0.04
 
 
@@ -117,19 +117,20 @@ def read_meta(slug: str) -> tuple[str, str]:
     return artist, title
 
 
-def read_timings(slug: str) -> list[tuple[float, str]]:
+def read_timings(slug: str) -> list[tuple[float, str, int]]:
     """
-    Read timings CSV for slug and return a list of (time_secs, text).
+    Read timings CSV for slug and return a list of (time_secs, text, line_index).
 
     Supports the format written by 3_timing.py:
         line_index,time_secs,text
-    and falls back to a 2-column (time,text) format if present.
+    and falls back to a 2-column (time,text) format if present
+    (in that case line_index is set to 0 = "normal lyric").
     """
     timing_path = TIMINGS_DIR / f"{slug}.csv"
     if not timing_path.exists():
         raise SystemExit(f"Timings CSV not found: {timing_path}")
 
-    rows: list[tuple[float, str]] = []
+    rows: list[tuple[float, str, int]] = []
     with timing_path.open(newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
         header = next(reader, None)
@@ -140,6 +141,10 @@ def read_timings(slug: str) -> list[tuple[float, str]]:
                 idx_time = header.index("time_secs")
             except ValueError:
                 idx_time = 1
+            try:
+                idx_li = header.index("line_index")
+            except ValueError:
+                idx_li = None
             idx_text = header.index("text") if "text" in header else None
 
             for row in reader:
@@ -152,12 +157,22 @@ def read_timings(slug: str) -> list[tuple[float, str]]:
                     t = float(t_str)
                 except ValueError:
                     continue
+
+                if idx_li is not None and len(row) > idx_li:
+                    try:
+                        line_index = int(row[idx_li])
+                    except ValueError:
+                        line_index = 0
+                else:
+                    line_index = 0
+
                 text = ""
                 if idx_text is not None and len(row) > idx_text:
                     text = row[idx_text]
-                rows.append((t, text))
+
+                rows.append((t, text, line_index))
         else:
-            # Fallback: treat first column as time, second as text
+            # Fallback: treat first column as time, second as text; no note info, so line_index=0
             for row in reader:
                 if len(row) < 2:
                     continue
@@ -169,7 +184,7 @@ def read_timings(slug: str) -> list[tuple[float, str]]:
                 except ValueError:
                     continue
                 text = row[1]
-                rows.append((t, text))
+                rows.append((t, text, 0))
 
     rows.sort(key=lambda x: x[0])
     log("TIMINGS", f"Loaded {len(rows)} timing rows from {timing_path}", CYAN)
@@ -180,7 +195,7 @@ def build_ass(
     slug: str,
     artist: str,
     title: str,
-    timings: list[tuple[float, str]],
+    timings: list[tuple[float, str, int]],
     audio_duration: float,
     font_name: str,
     font_size_script: int,
@@ -189,7 +204,7 @@ def build_ass(
     ass_path = OUTPUT_DIR / f"{slug}.ass"
 
     if audio_duration <= 0.0 and timings:
-        audio_duration = max(t for t, _ in timings) + 5.0
+        audio_duration = max(t for t, _, _ in timings) + 5.0
     if audio_duration <= 0.0:
         audio_duration = 5.0
 
@@ -216,7 +231,6 @@ def build_ass(
 
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
 
-    # MarginV kept for completeness, but positions are driven by \pos() overrides.
     margin_v = 0
 
     header_lines = [
@@ -287,7 +301,7 @@ def build_ass(
         if first_start <= 0:
             title_end = min(audio_duration, 0.5)
         else:
-            # Leave a tiny gap before the first line so title fully disappears.
+            # Small gap before first line so title fully disappears.
             title_end = max(0.0, first_start - SCREEN_GAP_SECONDS)
 
         if title_end > 0:
@@ -304,13 +318,20 @@ def build_ass(
             )
 
         # Main + next-lyric screens
-        for i, (t, raw_text) in enumerate(timings):
+        for i, (t, raw_text, line_index) in enumerate(timings):
             start = max(0.0, t)
 
             if i < n - 1:
-                next_start = max(0.0, timings[i + 1][0])
-                # End a tiny bit before next start to "wipe" the screen.
-                end = max(start + 0.01, next_start - SCREEN_GAP_SECONDS)
+                next_time, _, next_line_index = timings[i + 1]
+                next_start = max(0.0, next_time)
+
+                is_note = line_index < 0 or next_line_index < 0
+                if is_note:
+                    # Only here we apply the "screen refresh" gap.
+                    end = max(start + 0.01, next_start - SCREEN_GAP_SECONDS)
+                else:
+                    # Lyric -> lyric: continuous, no gap.
+                    end = next_start
             else:
                 end = audio_duration or (t + 5.0)
 
@@ -329,7 +350,7 @@ def build_ass(
 
             # Next-line preview in bottom band, top-centered with padding
             if i < n - 1:
-                next_raw = timings[i + 1][1]
+                _, next_raw, _ = timings[i + 1]
                 if next_raw:
                     preview_text = ass_escape(next_raw)
                     tag = (
