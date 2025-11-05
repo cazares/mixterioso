@@ -56,10 +56,24 @@ def run(cmd: list[str], section: str) -> float:
 
 
 def detect_slug_from_latest_mp3() -> str:
+    """
+    Infer the most recent slug produced by step 1.
+
+    Prefer the newest meta/*.json (always rewritten by 1_txt_mp3),
+    and fall back to the newest mp3 if no meta files exist.
+    """
+    metas = sorted(META_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    if metas:
+        slug = slugify(metas[-1].stem)
+        log("MASTER", f"Latest slug inferred from meta/: {slug}", CYAN)
+        return slug
+
     mp3s = sorted(MP3_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
     if not mp3s:
         raise SystemExit("No mp3s found in mp3s/ after 1_txt_mp3.")
-    return slugify(mp3s[-1].stem)
+    slug = slugify(mp3s[-1].stem)
+    log("MASTER", f"Latest slug inferred from mp3s/: {slug}", CYAN)
+    return slug
 
 
 def load_meta(slug: str):
@@ -326,13 +340,11 @@ def interactive_slug_and_steps(args):
         log("MASTER", f'Running step 1 (1_txt_mp3) for query "{args.query}"', CYAN)
         slug, t1 = run_step1_txt_mp3(args.query)
 
-    # If we still don't have a slug, try to infer last slug from latest mp3
+    # If we still don't have a slug, try to infer last slug from latest meta/mp3
     last_slug = None
     if not slug:
         try:
-            mp3s = sorted(MP3_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
-            if mp3s:
-                last_slug = slugify(mp3s[-1].stem)
+            last_slug = detect_slug_from_latest_mp3()
         except Exception:
             last_slug = None
 
