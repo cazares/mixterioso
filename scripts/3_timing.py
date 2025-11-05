@@ -488,6 +488,12 @@ def timing_ui(
 
 
 def write_timings(timing_path: Path, lyrics, timings) -> None:
+    """
+    Always sync main lyric text from lyrics[line_index] on save.
+
+    - For line_index >= 0: ignore any stored 'text', use lyrics[line_index].
+    - For line_index < 0 (note events): keep stored 'text' (glyphs).
+    """
     timing_path.parent.mkdir(parents=True, exist_ok=True)
     timings_sorted = sorted(timings, key=lambda t: t["time"])
     with timing_path.open("w", encoding="utf-8", newline="") as f:
@@ -496,10 +502,12 @@ def write_timings(timing_path: Path, lyrics, timings) -> None:
         for t in timings_sorted:
             idx = t.get("line_index", -1)
             sec = t["time"]
-            if "text" in t and t["text"]:
-                text = t["text"]
-            else:
+            if idx >= 0:
+                # Real lyric line: always pull fresh text from lyrics
                 text = lyrics[idx] if 0 <= idx < len(lyrics) else ""
+            else:
+                # Note / special events: keep stored text
+                text = t.get("text", "")
             writer.writerow([idx, f"{sec:.3f}", text])
 
 
