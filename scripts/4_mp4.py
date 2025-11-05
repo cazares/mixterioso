@@ -27,12 +27,16 @@ VIDEO_WIDTH = 1920
 VIDEO_HEIGHT = 1080
 
 # Fraction of screen given to the main-lyric band (top) and next-lyric band (bottom).
-TOP_BAND_FRACTION = 0.8  # top 80% for main lyric
-BOTTOM_BAND_FRACTION = 0.2  # bottom 20% for next lyric
+TOP_BAND_FRACTION = 0.8    # top 80% for main lyric
+BOTTOM_BAND_FRACTION = 0.2  # bottom 20% for next lyric (informational)
 
 # How far to nudge the main line up within the top band (fraction of top-band height).
 # Positive moves the main line upward in its band.
 VERTICAL_OFFSET_FRACTION = 0.0
+
+# Within the bottom band, how far down from the divider to place the "Up next" text,
+# as a fraction of the bottom band height.
+BOTTOM_TEXT_TOP_PADDING_FRACTION = 0.25  # 0.0 = right at divider, 1.0 = at bottom of screen
 
 # ASS "Fontsize" is relative to PlayResY, not literal pixels.
 # This multiplier makes UI font sizes (20–200) visually larger on 1080p.
@@ -41,6 +45,7 @@ ASS_FONT_MULTIPLIER = 1.5
 # Next-line preview tuning.
 NEXT_LINE_FONT_SCALE = 0.5           # 50% of main ASS font size
 NEXT_LINE_ALPHA_HEX = "80"           # ~50% transparency for preview text and divider
+NEXT_LINE_PREFIX = "Up next: "       # prefix added to all bottom lyrics
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
@@ -196,11 +201,10 @@ def build_ass(
     offset_px = int(top_band_height * VERTICAL_OFFSET_FRACTION)
     y_main = center_top - offset_px
 
-    # Next lyric: center of bottom band.
-    center_bottom = y_divider + bottom_band_height // 2
-    y_next = center_bottom
-
+    # Next lyric: top-center inside the bottom band with padding.
     x_center = playresx // 2
+    y_next = y_divider + int(bottom_band_height * BOTTOM_TEXT_TOP_PADDING_FRACTION)
+
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
 
     # We keep MarginV for completeness, but positions are driven by \pos() overrides.
@@ -291,11 +295,12 @@ def build_ass(
                 )
             )
 
-            # Next-line preview in bottom 20% band
+            # Next-line preview in bottom band, top-centered with padding
             if i < n - 1:
                 next_raw = timings[i + 1][1]
                 if next_raw:
-                    preview_text = ass_escape(next_raw)
+                    prefixed = NEXT_LINE_PREFIX + next_raw
+                    preview_text = ass_escape(prefixed)
                     tag = (
                         f"{{\\an5\\pos({x_center},{y_next})"
                         f"\\fs{preview_font}\\1a&H{NEXT_LINE_ALPHA_HEX}&}}"
@@ -369,7 +374,7 @@ def parse_args(argv=None):
     p.add_argument(
         "--font-size",
         type=int,
-        help="Subtitle font size (20–200). Default 100.",
+        help="Subtitle font size (20–200). Default 120.",
     )
     p.add_argument(
         "--font-name",
@@ -386,7 +391,7 @@ def main(argv=None):
     profile = args.profile
 
     # Determine font size, with interactive prompt when possible.
-    default_font_size = 100
+    default_font_size = 120
     font_size_value = args.font_size
 
     if font_size_value is None:
