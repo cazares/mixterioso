@@ -26,20 +26,21 @@ META_DIR = BASE_DIR / "meta"
 VIDEO_WIDTH = 1920
 VIDEO_HEIGHT = 1080
 
-# How far above vertical center to place text, as a fraction of screen height.
-# Positive = move text up.
-VERTICAL_OFFSET_FRACTION = 0.12  # tweak this easily in code
+# Fraction of screen given to the main-lyric band (top) and next-lyric band (bottom).
+TOP_BAND_FRACTION = 0.8  # top 80% for main lyric
+BOTTOM_BAND_FRACTION = 0.2  # bottom 20% for next lyric
+
+# How far to nudge the main line up within the top band (fraction of top-band height).
+# Positive moves the main line upward in its band.
+VERTICAL_OFFSET_FRACTION = 0.0
 
 # ASS "Fontsize" is relative to PlayResY, not literal pixels.
 # This multiplier makes UI font sizes (20–200) visually larger on 1080p.
 ASS_FONT_MULTIPLIER = 1.5
 
 # Next-line preview tuning.
-# X offset is relative to center; keep 0.0 for directly centered.
-NEXT_LINE_X_OFFSET_FRACTION = 0.0    # 0 = same X as main lyric (centered)
-NEXT_LINE_Y_OFFSET_FRACTION = 0.13   # vertical gap below main lyric (fraction of height)
-NEXT_LINE_FONT_SCALE = 0.5           # 50% of main font size
-NEXT_LINE_ALPHA_HEX = "80"           # &H00..& = opaque, &HFF..& = transparent (~50%)
+NEXT_LINE_FONT_SCALE = 0.5           # 50% of main ASS font size
+NEXT_LINE_ALPHA_HEX = "80"           # ~50% transparency for preview text and divider
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
@@ -178,20 +179,32 @@ def build_ass(
 
     if audio_duration <= 0.0 and timings:
         audio_duration = max(t for t, _ in timings) + 5.0
+    if audio_duration <= 0.0:
+        audio_duration = 5.0
 
     # Playback resolution
     playresx = VIDEO_WIDTH
     playresy = VIDEO_HEIGHT
 
-    # Vertical offset for main line.
-    margin_v = int(playresy * VERTICAL_OFFSET_FRACTION)
+    # Geometry for bands
+    top_band_height = int(playresy * TOP_BAND_FRACTION)
+    y_divider = top_band_height
+    bottom_band_height = playresy - y_divider
 
-    # Approximate main line center and next-line offset positions.
+    # Main lyric: center of top band, optionally nudged upward.
+    center_top = top_band_height // 2
+    offset_px = int(top_band_height * VERTICAL_OFFSET_FRACTION)
+    y_main = center_top - offset_px
+
+    # Next lyric: center of bottom band.
+    center_bottom = y_divider + bottom_band_height // 2
+    y_next = center_bottom
+
     x_center = playresx // 2
-    y_main = int(playresy / 2 - margin_v)
-    x_preview = int(x_center + playresx * NEXT_LINE_X_OFFSET_FRACTION)
-    y_preview = int(y_main + playresy * NEXT_LINE_Y_OFFSET_FRACTION)
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
+
+    # We keep MarginV for completeness, but positions are driven by \pos() overrides.
+    margin_v = 0
 
     # Basic ASS header
     header_lines = [
@@ -228,23 +241,38 @@ def build_ass(
         return text
 
     events: list[str] = []
+
+    # Divider line across the screen at y_divider, visible for full duration.
+    divider_text = (
+        f"{{\\an7\\pos(0,{y_divider})\\p1\\1a&H{NEXT_LINE_ALPHA_HEX}&\\bord1}}"
+        f"m 0 0 l {playresx} 0{{\\p0}}"
+    )
+    events.append(
+        "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+            start=seconds_to_ass_time(0.0),
+            end=seconds_to_ass_time(audio_duration),
+            text=divider_text,
+        )
+    )
+
     if not timings:
-        # Single event with placeholder
+        # Single event with placeholder in the main-lyric band.
         start = 0.0
         end = audio_duration or 5.0
         ev_text = f"{title}\\Nby\\N{artist}" if artist else title
+        main_text = ass_escape(ev_text)
         events.append(
-            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+            "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(start),
                 end=seconds_to_ass_time(end),
-                text=ass_escape(ev_text),
+                text=f"{{\\an5\\pos({x_center},{y_main})}}{main_text}",
             )
         )
     else:
         # Build events from timings; each entry lasts until next timestamp,
         # last entry lasts until audio_duration.
         n = len(timings)
-        for i, (t, text) in enumerate(timings):
+        for i, (t, raw_text) in enumerate(timings):
             start = t
             if i < n - 1:
                 end = timings[i + 1][0]
@@ -253,29 +281,27 @@ def build_ass(
             if end <= start:
                 end = start + 0.5
 
-            # Main line (centered, full size via style)
-            main_text = ass_escape(text)
+            # Main line in top band
+            main_text = ass_escape(raw_text)
             events.append(
-                "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+                "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                     start=seconds_to_ass_time(start),
                     end=seconds_to_ass_time(end),
-                    text=main_text,
+                    text=f"{{\\an5\\pos({x_center},{y_main})}}{main_text}",
                 )
             )
 
-            # Next-line preview (centered below, smaller, semi-transparent)
+            # Next-line preview in bottom 20% band
             if i < n - 1:
                 next_raw = timings[i + 1][1]
                 if next_raw:
                     preview_text = ass_escape(next_raw)
-                    tag = "{{\\an5\\pos({x},{y})\\fs{fs}\\1a&H{alpha}&}}".format(
-                        x=x_preview,
-                        y=y_preview,
-                        fs=preview_font,
-                        alpha=NEXT_LINE_ALPHA_HEX,
+                    tag = (
+                        f"{{\\an5\\pos({x_center},{y_next})"
+                        f"\\fs{preview_font}\\1a&H{NEXT_LINE_ALPHA_HEX}&}}"
                     )
                     events.append(
-                        "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
+                        "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
                             start=seconds_to_ass_time(start),
                             end=seconds_to_ass_time(end),
                             text=tag + preview_text,
@@ -343,7 +369,7 @@ def parse_args(argv=None):
     p.add_argument(
         "--font-size",
         type=int,
-        help="Subtitle font size (20–200). Default 140.",
+        help="Subtitle font size (20–200). Default 100.",
     )
     p.add_argument(
         "--font-name",
@@ -360,7 +386,7 @@ def main(argv=None):
     profile = args.profile
 
     # Determine font size, with interactive prompt when possible.
-    default_font_size = 140
+    default_font_size = 100
     font_size_value = args.font_size
 
     if font_size_value is None:
