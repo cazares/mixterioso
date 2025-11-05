@@ -26,31 +26,31 @@ META_DIR = BASE_DIR / "meta"
 VIDEO_WIDTH = 1920
 VIDEO_HEIGHT = 1080
 
-# Fraction of screen given to the main-lyric band (top) and next-lyric band (bottom).
-TOP_BAND_FRACTION = 0.8     # top 80% for main lyric
-BOTTOM_BAND_FRACTION = 0.2  # bottom 20% for next lyric (informational)
+# Layout: top band for main lyric, bottom band for "up next".
+TOP_BAND_FRACTION = 0.8
+BOTTOM_BAND_FRACTION = 0.2
 
-# How far to nudge the main line vertically within the top band (fraction of top-band height).
-# Positive moves DOWN within the top band.
+# Nudge main line within the top band (fraction of top-band height; + = down).
 VERTICAL_OFFSET_FRACTION = 0.0
 
-# Extra offset (fraction of top-band height) applied only to the title card,
-# to bring it lower on the screen.
+# Extra vertical push just for the title card so it sits lower.
 TITLE_EXTRA_OFFSET_FRACTION = 0.15
 
-# Within the bottom band, how far down from the divider to place the next-lyric text,
-# as a fraction of the bottom band height.
-BOTTOM_TEXT_TOP_PADDING_FRACTION = 0.25  # 0.0 = right at divider, 1.0 = at bottom of screen
+# Within the bottom band, how far down from the divider the next-line text sits.
+BOTTOM_TEXT_TOP_PADDING_FRACTION = 0.25
 
-# ASS "Fontsize" is relative to PlayResY, not literal pixels.
-# This multiplier makes UI font sizes (20–200) visually larger on 1080p.
+# ASS fontsize multiplier so UI 20–200 range looks right at 1080p.
 ASS_FONT_MULTIPLIER = 1.5
 
 # Next-line preview tuning.
-NEXT_LINE_FONT_SCALE = 0.5           # 50% of main ASS font size
-NEXT_LINE_ALPHA_HEX = "80"           # ~50% transparency for preview text and divider
+NEXT_LINE_FONT_SCALE = 0.5
+NEXT_LINE_ALPHA_HEX = "80"  # 50% transparent
 
-# Small gap between lyric "screens" (seconds), used only when a note line is involved.
+# Note overlay tuning.
+NOTE_DURATION_SECONDS = 0.7
+NOTE_ALPHA_HEX = "40"       # lighter than main lyrics
+
+# Tiny gap we may use for title → first line if needed.
 SCREEN_GAP_SECONDS = 0.04
 
 
@@ -119,12 +119,13 @@ def read_meta(slug: str) -> tuple[str, str]:
 
 def read_timings(slug: str) -> list[tuple[float, str, int]]:
     """
-    Read timings CSV for slug and return a list of (time_secs, text, line_index).
+    Return list of (time_secs, text, line_index).
 
-    Supports the format written by 3_timing.py:
+    Preferred CSV format from 3_timing.py:
         line_index,time_secs,text
-    and falls back to a 2-column (time,text) format if present
-    (in that case line_index is set to 0 = "normal lyric").
+
+    Fallback 2-column format:
+        time_secs,text   (line_index is treated as 0 = normal lyric)
     """
     timing_path = TIMINGS_DIR / f"{slug}.csv"
     if not timing_path.exists():
@@ -136,7 +137,7 @@ def read_timings(slug: str) -> list[tuple[float, str, int]]:
         header = next(reader, None)
 
         if header and "time_secs" in header:
-            # Preferred format: line_index,time_secs,text
+            # line_index,time_secs,text
             try:
                 idx_time = header.index("time_secs")
             except ValueError:
@@ -172,7 +173,7 @@ def read_timings(slug: str) -> list[tuple[float, str, int]]:
 
                 rows.append((t, text, line_index))
         else:
-            # Fallback: treat first column as time, second as text; no note info, so line_index=0
+            # Fallback: first column time, second text.
             for row in reader:
                 if len(row) < 2:
                     continue
@@ -208,29 +209,23 @@ def build_ass(
     if audio_duration <= 0.0:
         audio_duration = 5.0
 
-    # Playback resolution
     playresx = VIDEO_WIDTH
     playresy = VIDEO_HEIGHT
 
-    # Geometry for bands
+    # Geometry
     top_band_height = int(playresy * TOP_BAND_FRACTION)
     y_divider = top_band_height
     bottom_band_height = playresy - y_divider
 
-    # Main lyric: center of top band, nudged by VERTICAL_OFFSET_FRACTION.
     center_top = top_band_height // 2
     offset_px = int(top_band_height * VERTICAL_OFFSET_FRACTION)
     y_main = center_top + offset_px
-
-    # Title card a bit lower than main lyric.
     y_title = y_main + int(top_band_height * TITLE_EXTRA_OFFSET_FRACTION)
 
-    # Next lyric: top-center inside the bottom band with padding.
     x_center = playresx // 2
     y_next = y_divider + int(bottom_band_height * BOTTOM_TEXT_TOP_PADDING_FRACTION)
 
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
-
     margin_v = 0
 
     header_lines = [
@@ -267,7 +262,7 @@ def build_ass(
 
     events: list[str] = []
 
-    # Divider line across the screen at y_divider, visible for full duration.
+    # Divider line across the screen at y_divider, visible all the time.
     divider_text = (
         f"{{\\an7\\pos(0,{y_divider})\\p1\\1a&H{NEXT_LINE_ALPHA_HEX}&\\bord1}}"
         f"m 0 0 l {playresx} 0{{\\p0}}"
@@ -280,30 +275,26 @@ def build_ass(
         )
     )
 
-    if not timings:
-        # Single event with placeholder in the main-lyric band.
+    # Split timings into lyrics and notes.
+    lyric_rows = [(t, txt) for (t, txt, li) in timings if li >= 0]
+    note_rows = [(t, txt) for (t, txt, li) in timings if li < 0]
+
+    if not timings or not lyric_rows:
+        # No lyric timings: one big title card in the main band.
         start = 0.0
         end = audio_duration or 5.0
         ev_text = f"{title}\\N\\Nby\\N\\N{artist}" if artist else title
-        main_text = ass_escape(ev_text)
         events.append(
             "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(start),
                 end=seconds_to_ass_time(end),
-                text=f"{{\\an5\\pos({x_center},{y_title})}}{main_text}",
+                text=f"{{\\an5\\pos({x_center},{y_title})}}{ass_escape(ev_text)}",
             )
         )
     else:
-        n = len(timings)
-
-        # Title card at t=0: "[title]\n\nby\n\n[artist]"
-        first_start = timings[0][0]
-        if first_start <= 0:
-            title_end = min(audio_duration, 0.5)
-        else:
-            # Small gap before first line so title fully disappears.
-            title_end = max(0.0, first_start - SCREEN_GAP_SECONDS)
-
+        # Title card from t=0 up to first lyric (no fancy gaps).
+        first_start = max(0.0, lyric_rows[0][0])
+        title_end = max(0.0, min(audio_duration, first_start))
         if title_end > 0:
             if artist:
                 title_lines = f"{title}\\N\\Nby\\N\\N{artist}"
@@ -317,28 +308,19 @@ def build_ass(
                 )
             )
 
-        # Main + next-lyric screens
-        for i, (t, raw_text, line_index) in enumerate(timings):
+        # Main lyric + next-lyric preview, driven only by lyric rows.
+        n_lyr = len(lyric_rows)
+        for i, (t, raw_text) in enumerate(lyric_rows):
             start = max(0.0, t)
-
-            if i < n - 1:
-                next_time, _, next_line_index = timings[i + 1]
-                next_start = max(0.0, next_time)
-
-                is_note = line_index < 0 or next_line_index < 0
-                if is_note:
-                    # Only here we apply the "screen refresh" gap.
-                    end = max(start + 0.01, next_start - SCREEN_GAP_SECONDS)
-                else:
-                    # Lyric -> lyric: continuous, no gap.
-                    end = next_start
+            if i < n_lyr - 1:
+                next_start = max(0.0, lyric_rows[i + 1][0])
             else:
-                end = audio_duration or (t + 5.0)
+                next_start = audio_duration or (t + 5.0)
 
-            if end <= start:
-                end = start + 0.05
+            end = max(start + 0.05, next_start)
+            if end > audio_duration:
+                end = audio_duration
 
-            # Main line in top band
             main_text = ass_escape(raw_text)
             events.append(
                 "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
@@ -348,9 +330,9 @@ def build_ass(
                 )
             )
 
-            # Next-line preview in bottom band, top-centered with padding
-            if i < n - 1:
-                _, next_raw, _ = timings[i + 1]
+            # Next-line preview in bottom band (if there *is* a next lyric).
+            if i < n_lyr - 1:
+                _, next_raw = lyric_rows[i + 1]
                 if next_raw:
                     preview_text = ass_escape(next_raw)
                     tag = (
@@ -364,6 +346,25 @@ def build_ass(
                             text=tag + preview_text,
                         )
                     )
+
+    # Note overlays: independent of lyric segmentation.
+    for t, raw_text in note_rows:
+        start = max(0.0, t)
+        end = min(audio_duration, start + NOTE_DURATION_SECONDS)
+        if end <= start or not raw_text:
+            continue
+        note_text = ass_escape(raw_text)
+        tag = (
+            f"{{\\an5\\pos({x_center},{y_main})"
+            f"\\1a&H{NOTE_ALPHA_HEX}&}}"
+        )
+        events.append(
+            "Dialogue: 3,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(start),
+                end=seconds_to_ass_time(end),
+                text=tag + note_text,
+            )
+        )
 
     ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
     log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
@@ -458,7 +459,11 @@ def main(argv=None):
                 try:
                     font_size_value = int(resp)
                 except ValueError:
-                    log("FONT", f"Invalid font size '{resp}', using default {default_font_size}", YELLOW)
+                    log(
+                        "FONT",
+                        f"Invalid font size '{resp}', using default {default_font_size}",
+                        YELLOW,
+                    )
                     font_size_value = default_font_size
             else:
                 font_size_value = default_font_size
@@ -477,25 +482,24 @@ def main(argv=None):
 
     log("MP4GEN", f"Slug={slug}, profile={profile}", CYAN)
 
-    # Choose audio path (with fallback logic)
     audio_path = choose_audio(slug, profile)
     audio_duration = probe_audio_duration(audio_path)
     if audio_duration <= 0:
         log("DUR", f"Audio duration unknown or zero for {audio_path}", YELLOW)
 
-    # Load meta + timings
     artist, title = read_meta(slug)
     timings = read_timings(slug)
     log("META", f'Artist="{artist}", Title="{title}", entries={len(timings)}', CYAN)
 
-    # Build ASS (use scaled ASS font size)
-    ass_path = build_ass(slug, artist, title, timings, audio_duration, args.font_name, ass_font_size)
+    ass_path = build_ass(
+        slug, artist, title, timings, audio_duration, args.font_name, ass_font_size
+    )
 
-    # Output MP4 path
     out_mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
 
-    # ffmpeg pipeline: audio input + black background + ASS subtitles
-    color_filter = f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30:d={max(audio_duration, 5.0)}"
+    color_filter = (
+        f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30:d={max(audio_duration, 5.0)}"
+    )
     cmd = [
         "ffmpeg",
         "-y",
