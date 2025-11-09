@@ -28,3 +28,15 @@ lyrics/
 *.pkg
 *ffconcat*
 *.txt
+**/align_env/**
+**meta/**
+**whisper**
+**OLD_scripts**
+**2.py
+**mixes**
+**poc_out**
+*.srt
+*.tsv
+*.vtt
+**2.sh
+*.json

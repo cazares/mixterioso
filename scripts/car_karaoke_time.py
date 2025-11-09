@@ -333,7 +333,11 @@ def main():
     # Demucs for non-100, with reuse of cached stems
     vocals_wav = drums_wav = bass_wav = other_wav = guitar_wav = piano_wav = None
     instrumental_wav = None
-    stems_dir = sep_root / args.demucs_model / base
+
+    # NOTE: stems dir is based on AUDIO stem (matches Demucs output), not lyrics base.
+    stems_base = derive_base(audio_path) if audio_path else base
+    stems_dir = sep_root / args.demucs_model / stems_base
+
     def have_stems(d: Path) -> bool:
         return (d / "vocals.wav").exists() and (d / "drums.wav").exists() and (d / "bass.wav").exists() and (d / "other.wav").exists()
 
@@ -384,7 +388,8 @@ def main():
         out_path = outdir / f"{base}_vocals_{pct_int}.mp4"
 
         if abs(p - 100.0) <= 1e-6:
-            if out_path.exists(): continue
+            if out_path.exists(): 
+                continue
             if args.mux_only and not args.render_only:
                 run([
                     "ffmpeg", "-y",
