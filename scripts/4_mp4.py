@@ -33,22 +33,26 @@ BOTTOM_BAND_FRACTION = 0.2
 # Nudge main line within the top band (fraction of top-band height; + = down).
 VERTICAL_OFFSET_FRACTION = 0.0
 
-# Extra vertical push just for the title card so it sits lower.
-TITLE_EXTRA_OFFSET_FRACTION = 0.15
+# Extra nudge for the title line relative to the main line (fraction of top band).
+TITLE_EXTRA_OFFSET_FRACTION = -0.20
 
-# Within the bottom band, how far down from the divider the next-line text sits.
-BOTTOM_TEXT_TOP_PADDING_FRACTION = 0.25
+# Fraction from top of bottom band to "up next" line.
+BOTTOM_TEXT_TOP_PADDING_FRACTION = 0.20
 
-# ASS fontsize multiplier so UI 20–200 range looks right at 1080p.
-ASS_FONT_MULTIPLIER = 1.5
+# Size of up-next font relative to main lyrics.
+NEXT_LINE_FONT_SCALE = 0.60
 
-# Next-line preview tuning.
-NEXT_LINE_FONT_SCALE = 0.5
-NEXT_LINE_ALPHA_HEX = "80"  # 50% transparent
+# Alpha for up-next text (00 = opaque, FF = fully transparent). Keep it partially transparent.
+NEXT_LINE_ALPHA_HEX = "8080"
+
+# Base UI font size in "points" (converted to ASS by a multiplier).
+DEFAULT_UI_FONT_SIZE = 120
+ASS_FONT_MULTIPLIER = 1.5  # multiple of UI font size to get ASS fontsize
 
 
-def log(section: str, msg: str, color: str = CYAN) -> None:
-    print(f"{color}[{section}]{RESET} {msg}")
+def log(prefix: str, msg: str, color: str = RESET) -> None:
+    ts = time.strftime("%H:%M:%S")
+    print(f"{color}[{ts}] [{prefix}] {msg}{RESET}")
 
 
 def slugify(text: str) -> str:
@@ -60,39 +64,20 @@ def slugify(text: str) -> str:
     return base or "song"
 
 
-def probe_audio_duration(path: Path) -> float:
-    """Return audio duration in seconds using ffprobe."""
-    try:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=nw=1:nk=1",
-            str(path),
-        ]
-        out = subprocess.check_output(cmd, text=True).strip()
-        return float(out)
-    except Exception as e:
-        log("FFPROBE", f"Failed to probe duration for {path}: {e}", YELLOW)
-        return 0.0
-
-
 def seconds_to_ass_time(sec: float) -> str:
     # ASS time format: H:MM:SS.cs (centiseconds)
     if sec < 0:
         sec = 0.0
-    h = int(sec // 3600)
-    rem = sec - h * 3600
-    m = int(rem // 60)
-    s = rem - m * 60
-    cs = int(round(s * 100))  # centiseconds
-    if cs == 100:
-        s = int(s) + 1
-        cs = 0
-    s = int(sec) % 60
+
+    # Work entirely in integer centiseconds to avoid rounding issues.
+    total_cs = int(round(sec * 100))
+    if total_cs < 0:
+        total_cs = 0
+
+    total_seconds, cs = divmod(total_cs, 100)
+    h, rem = divmod(total_seconds, 3600)
+    m, s = divmod(rem, 60)
+
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
@@ -114,7 +99,7 @@ def read_timings(slug: str) -> list[tuple[float, str, int]]:
     """
     Return list of (time_secs, text, line_index).
 
-    Preferred CSV format from 3_timing.py:
+    Preferred CSV format:
         line_index,time_secs,text
 
     Fallback 2-column format:
@@ -122,7 +107,8 @@ def read_timings(slug: str) -> list[tuple[float, str, int]]:
     """
     timing_path = TIMINGS_DIR / f"{slug}.csv"
     if not timing_path.exists():
-        raise SystemExit(f"Timings CSV not found: {timing_path}")
+        print(f"Timing CSV not found for slug={slug}: {timing_path}")
+        sys.exit(1)
 
     rows: list[tuple[float, str, int]] = []
     with timing_path.open(newline="", encoding="utf-8") as f:
@@ -181,6 +167,29 @@ def read_timings(slug: str) -> list[tuple[float, str, int]]:
     rows.sort(key=lambda x: x[0])
     log("TIMINGS", f"Loaded {len(rows)} timing rows from {timing_path}", CYAN)
     return rows
+
+
+def probe_audio_duration(path: Path) -> float:
+    if not path.exists():
+        return 0.0
+
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    log("FFPROBE", f"Probing duration of {path}", BLUE)
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        return float(out.strip())
+    except Exception as e:
+        log("FFPROBE", f"Failed to probe duration: {e}", YELLOW)
+        return 0.0
 
 
 def build_ass(
@@ -266,64 +275,51 @@ def build_ass(
         )
     )
 
-    # No timings → just a big title card.
-    if not timings:
-        start = 0.0
-        end = audio_duration or 5.0
-        ev_text = f"{title}\\N\\Nby\\N\\N{artist}" if artist else title
+    # Title / artist block.
+    title_lines = []
+    if title:
+        title_lines.append(title)
+    if artist:
+        title_lines.append(f"by {artist}")
+
+    title_start = 0.0
+    title_end = min(5.0, max(3.0, audio_duration * 0.1))
+
+    if title_lines:
+        ev_text = "\\N".join(title_lines)
         events.append(
-            "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(start),
-                end=seconds_to_ass_time(end),
+            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(title_start),
+                end=seconds_to_ass_time(title_end),
                 text=f"{{\\an5\\pos({x_center},{y_title})}}{ass_escape(ev_text)}",
             )
         )
-        ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
-        log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
-        return ass_path
 
-    # Unified event list: lyrics and notes together, strictly increasing times.
+    # Normalize timings and filter out-of-range / empty lines.
     unified: list[tuple[float, str, int]] = []
-    last_t = -1.0
-    for t, text, li in timings:
+    for t, text, line_index in timings:
+        if t < 0 or (audio_duration and t > audio_duration):
+            continue
+        text = (text or "").strip()
         if not text:
             continue
-        t = max(0.0, t)
-        if unified and t <= last_t:
-            t = last_t + 0.001  # enforce monotonic times, tiny epsilon
-        unified.append((t, text, li))
-        last_t = t
+        unified.append((t, text, line_index))
+
+    unified.sort(key=lambda x: x[0])
 
     if not unified:
-        start = 0.0
-        end = audio_duration or 5.0
-        ev_text = f"{title}\\N\\Nby\\N\\N{artist}" if artist else title
-        events.append(
-            "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(start),
-                end=seconds_to_ass_time(end),
-                text=f"{{\\an5\\pos({x_center},{y_title})}}{ass_escape(ev_text)}",
-            )
-        )
-        ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
-        log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
-        return ass_path
-
-    # Title card from t=0 up to the first event (lyric or note).
-    first_start = unified[0][0]
-    title_end = max(0.0, min(audio_duration, first_start))
-    if title_end > 0:
-        if artist:
-            title_lines = f"{title}\\N\\Nby\\N\\N{artist}"
-        else:
-            title_lines = title
+        # No timings; just show the title.
+        fallback = "\\N".join(title_lines) if title_lines else "No lyrics"
         events.append(
             "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(0.0),
-                end=seconds_to_ass_time(title_end),
-                text=f"{{\\an5\\pos({x_center},{y_title})}}{ass_escape(title_lines)}",
+                end=seconds_to_ass_time(audio_duration),
+                text=f"{{\\an5\\pos({x_center},{y_main})}}{ass_escape(fallback)}",
             )
         )
+        ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
+        log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
+        return ass_path
 
     # One main line per event, one up-next line, no overlaps.
     n = len(unified)
@@ -336,6 +332,8 @@ def build_ass(
 
         if end > audio_duration:
             end = audio_duration
+        if end <= start:
+            continue
 
         # Main line (lyric or note) in the top band.
         main_text = ass_escape(raw_text)
@@ -371,6 +369,7 @@ def build_ass(
 
 def choose_audio(slug: str, profile: str) -> Path:
     mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
+    mix_mp3 = MIXES_DIR / f"{slug}_{profile}.mp3"
     mp3_path = MP3_DIR / f"{slug}.mp3"
 
     if profile == "lyrics":
@@ -385,9 +384,13 @@ def choose_audio(slug: str, profile: str) -> Path:
         print(f"[AUDIO] Using mixed WAV for profile={profile}: {mix_wav}")
         return mix_wav
 
+    if mix_mp3.exists():
+        print(f"[AUDIO] Using mixed MP3 for profile={profile}: {mix_mp3}")
+        return mix_mp3
+
     if mp3_path.exists():
         print(
-            f"[AUDIO] Mixed WAV for profile={profile} not found.\n"
+            f"[AUDIO] Mixed WAV/MP3 for profile={profile} not found.\n"
             f"        Falling back to original mp3: {mp3_path}"
         )
         return mp3_path
@@ -395,7 +398,8 @@ def choose_audio(slug: str, profile: str) -> Path:
     print(
         f"Audio not found for slug={slug}, profile={profile}.\n"
         f"Tried:\n"
-        f"  mix: {mix_wav}\n"
+        f"  mix wav: {mix_wav}\n"
+        f"  mix mp3: {mix_mp3}\n"
         f"  mp3: {mp3_path}"
     )
     sys.exit(1)
@@ -420,7 +424,7 @@ def parse_args(argv=None):
         "--profile",
         required=True,
         choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
-        help="Mix profile name (matches WAV name in mixes/).",
+        help="Mix profile name (matches WAV/MP3 name in mixes/).",
     )
     p.add_argument(
         "--font-size",
@@ -442,7 +446,7 @@ def main(argv=None):
     profile = args.profile
 
     # Determine font size, with interactive prompt when possible.
-    default_font_size = 120
+    default_font_size = DEFAULT_UI_FONT_SIZE
     font_size_value = args.font_size
 
     if font_size_value is None:
@@ -453,18 +457,23 @@ def main(argv=None):
                 ).strip()
             except EOFError:
                 resp = ""
-            if resp:
+            if not resp:
+                font_size_value = default_font_size
+            else:
                 try:
-                    font_size_value = int(resp)
+                    v = int(resp)
+                    if 20 <= v <= 200:
+                        font_size_value = v
+                    else:
+                        print(
+                            f"Value {v} out of range; using default {default_font_size}"
+                        )
+                        font_size_value = default_font_size
                 except ValueError:
-                    log(
-                        "FONT",
-                        f"Invalid font size '{resp}', using default {default_font_size}",
-                        YELLOW,
+                    print(
+                        f"Invalid integer; using default font size {default_font_size}"
                     )
                     font_size_value = default_font_size
-            else:
-                font_size_value = default_font_size
         else:
             font_size_value = default_font_size
 
@@ -495,28 +504,25 @@ def main(argv=None):
 
     out_mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
 
-    color_filter = (
-        f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30:d={max(audio_duration, 5.0)}"
-    )
+    # ffmpeg command:
+    # - Generate black background at the right resolution and overlay subtitles.
     cmd = [
         "ffmpeg",
         "-y",
-        "-i",
-        str(audio_path),
         "-f",
         "lavfi",
         "-i",
-        color_filter,
+        f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30:d={max(audio_duration, 1.0)}",
+        "-i",
+        str(audio_path),
         "-vf",
         f"subtitles={ass_path}",
-        "-map",
-        "1:v",
-        "-map",
-        "0:a",
         "-c:v",
         "libx264",
-        "-pix_fmt",
-        "yuv420p",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
         "-c:a",
         "aac",
         "-b:a",
@@ -538,10 +544,11 @@ def main(argv=None):
     print("  2 = MP4 file")
     print("  3 = both (dir then MP4)")
     print("  0 = none")
+
     try:
-        choice = input("Choice [0/1/2/3, default 0]: ").strip()
+        choice = input("Choice [0–3]: ").strip()
     except EOFError:
-        choice = ""
+        choice = "0"
 
     if choice == "1":
         open_path(OUTPUT_DIR)
@@ -556,5 +563,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-
-# end of 4_mp4.py
