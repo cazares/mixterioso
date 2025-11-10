@@ -278,7 +278,7 @@ def timing_ui(
         controls1 = (
             "[SPACE/ENTER] tag  "
             "[<] rewind  [u] undo  [>] ff  [r] restart  [g] goto  "
-            "[q] save+quit  [ESC] abort"
+            "[p] pause/resume  [q] save+quit  [ESC] abort"
         )
         controls2 = (
             "[1]♫ [2]♪ [3]♬ [4]♩ [5]♫♪♬♩ [6]♫♪♫♪ [7]♬♩♬♩ "
@@ -503,10 +503,8 @@ def write_timings(timing_path: Path, lyrics, timings) -> None:
             idx = t.get("line_index", -1)
             sec = t["time"]
             if idx >= 0:
-                # Real lyric line: always pull fresh text from lyrics
                 text = lyrics[idx] if 0 <= idx < len(lyrics) else ""
             else:
-                # Note / special events: keep stored text
                 text = t.get("text", "")
             writer.writerow([idx, f"{sec:.3f}", text])
 
@@ -549,7 +547,7 @@ def main(argv=None):
         except Exception as e:
             log("TIMING", f"Failed to delete existing timings file {timing_path}: {e}", YELLOW)
 
-    timings = load_timings(timing_path, len(lyrics))  # will be [] if we just deleted it
+    timings = load_timings(timing_path, len(lyrics))  # normally []
     history: list[tuple[float, list[dict], int]] = []
 
     player = AudioPlayer(audio_path)
@@ -591,4 +589,3 @@ if __name__ == "__main__":
     main()
 
 # end of 3_timing.py
-    

@@ -80,10 +80,10 @@ NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.45
 NEXT_LABEL_TOP_MARGIN_PX = 10
 NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX + NEXT_LABEL_TOP_MARGIN_PX
 
-# Fade timing (milliseconds) applied to each lyric change.
-# Only used for the main lyric line and the preview ("next line") text.
-FADE_IN_MS = 125
-FADE_OUT_MS = 125
+# Fade timing (milliseconds) applied to each lyric change for both the main
+# lyric and the preview lyric. Divider and "Next:" label do NOT fade.
+FADE_IN_MS = 50
+FADE_OUT_MS = 50
 
 # =============================================================================
 # COLOR AND OPACITY CONSTANTS
@@ -96,10 +96,10 @@ FADE_OUT_MS = 125
 # This does NOT affect the top current-lyric text color; that has its own constant.
 GLOBAL_NEXT_COLOR_RGB = "FFFFFF"   # white
 
-# Global alpha for the next-lyric text and the divider line.
+# Global alpha for the next-lyric text.
 #  - "00" = fully opaque
 #  - "FF" = fully transparent
-GLOBAL_NEXT_ALPHA_HEX = "4D"  # semi-transparent
+GLOBAL_NEXT_ALPHA_HEX = "4D"       # semi-transparent
 
 # Divider line color and alpha. Defaults to reuse the same color as the
 # next-lyric text but with an independently tweakable opacity.
@@ -118,7 +118,7 @@ BOTTOM_BOX_BG_ALPHA_HEX = "00"        # fully transparent (no visible bar)
 # Background color for the top "current lyric" rectangle and its alpha.
 # This drives the style's BackColour.
 TOP_BOX_BG_COLOR_RGB = "000000"       # black
-TOP_BOX_BG_ALPHA_HEX = "00"           # 50% opaque back color for top band
+TOP_BOX_BG_ALPHA_HEX = "00"           # fully transparent back color for top band
 
 # "Next:" label color and alpha. Separate from GLOBAL_NEXT_* so you can
 # tweak the label independently if desired.
@@ -228,10 +228,8 @@ def read_meta(slug: str) -> tuple[str, str]:
 def read_timings(slug: str):
     """
     Return list of (time_secs, text, line_index).
-    Preferred CSV format:
+    Expected CSV format:
         line_index,time_secs,text
-    Fallback 2-column format:
-        time_secs,text   (line_index is treated as 0).
     """
     timing_path = TIMINGS_DIR / f"{slug}.csv"
     if not timing_path.exists():
@@ -240,57 +238,15 @@ def read_timings(slug: str):
 
     rows = []
     with timing_path.open(newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-
-        if header and "time_secs" in header:
+        reader = csv.DictReader(f)
+        for row in reader:
             try:
-                idx_time = header.index("time_secs")
-            except ValueError:
-                idx_time = 1
-            try:
-                idx_li = header.index("line_index")
-            except ValueError:
-                idx_li = None
-            idx_text = header.index("text") if "text" in header else None
-
-            for row in reader:
-                if not row or len(row) <= idx_time:
-                    continue
-                t_str = row[idx_time].strip()
-                if not t_str:
-                    continue
-                try:
-                    t = float(t_str)
-                except ValueError:
-                    continue
-
-                if idx_li is not None and len(row) > idx_li:
-                    try:
-                        line_index = int(row[idx_li])
-                    except ValueError:
-                        line_index = 0
-                else:
-                    line_index = 0
-
-                text = ""
-                if idx_text is not None and len(row) > idx_text:
-                    text = row[idx_text]
-
-                rows.append((t, text, line_index))
-        else:
-            for row in reader:
-                if len(row) < 2:
-                    continue
-                t_str = row[0].strip()
-                if not t_str:
-                    continue
-                try:
-                    t = float(t_str)
-                except ValueError:
-                    continue
-                text = row[1]
-                rows.append((t, text, 0))
+                idx = int(row["line_index"])
+                t = float(row["time_secs"])
+            except (KeyError, ValueError):
+                continue
+            text = row.get("text", "")
+            rows.append((t, text, idx))
 
     rows.sort(key=lambda x: x[0])
     log("TIMINGS", f"Loaded {len(rows)} timing rows from {timing_path}", CYAN)
@@ -312,8 +268,8 @@ def probe_audio_duration(path: Path) -> float:
     ]
     log("FFPROBE", f"Probing duration of {path}", BLUE)
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-        return float(out.strip())
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
+        return float(out)
     except Exception as e:
         log("FFPROBE", f"Failed to probe duration: {e}", YELLOW)
         return 0.0
@@ -427,7 +383,7 @@ def build_ass(
 
     offset = LYRICS_OFFSET_SECS
 
-    # If no timings, just show centered title card.
+    # If no timings, just show centered title card for whole song.
     if not unified:
         title_lines = []
         if title:
@@ -450,9 +406,11 @@ def build_ass(
         log("ASS", f"Wrote ASS subtitles (title only) to {ass_path}", GREEN)
         return ass_path
 
-    first_lyric_time = max(0.0, unified[0][0] + offset)
+    # First event (note or lyric), used both for intro end and first line.
+    first_event_time = max(0.0, unified[0][0] + offset)
 
-    # Intro title / artist card.
+    # Intro title / artist card: keep it on screen until first timing entry,
+    # regardless of whether that entry is a note or a lyric.
     title_lines = []
     if title:
         title_lines.append(title)
@@ -460,23 +418,19 @@ def build_ass(
         title_lines.append(f"by {artist}")
 
     if title_lines:
-        if first_lyric_time > 0.1:
-            title_end = min(first_lyric_time, 5.0)
-        else:
-            title_end = first_lyric_time
         intro_block = "\\N".join(title_lines)
         events.append(
             "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(0.0),
-                end=seconds_to_ass_time(title_end),
+                end=seconds_to_ass_time(first_event_time),
                 text=f"{{\\an5\\pos({x_center},{y_center_full})}}{ass_escape(intro_block)}",
             )
         )
 
-    # Fade tag for lyrics only (main and next-line text).
-    fade_tag_main = ""
+    # Fade tag used only for per-line lyric and preview events.
+    fade_tag = ""
     if FADE_IN_MS > 0 or FADE_OUT_MS > 0:
-        fade_tag_main = f"\\fad({int(FADE_IN_MS)},{int(FADE_OUT_MS)})"
+        fade_tag = f"\\fad({int(FADE_IN_MS)},{int(FADE_OUT_MS)})"
 
     n = len(unified)
     next_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
@@ -514,7 +468,7 @@ def build_ass(
         # Main lyric line (with fade).
         main_text = ass_escape(text_stripped)
         y_for_line = y_center_full if music_only else y_main_top
-        main_tag = f"{{\\an5\\pos({x_center},{y_for_line}){fade_tag_main}}}"
+        main_tag = f"{{\\an5\\pos({x_center},{y_for_line}){fade_tag}}}"
         events.append(
             "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(start),
@@ -576,7 +530,7 @@ def build_ass(
             f"\\fs{preview_font}"
             f"\\1c&H{next_color_bgr}&"
             f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
-            f"{fade_tag_main}}}"
+            f"{fade_tag}}}"
         )
         events.append(
             "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(

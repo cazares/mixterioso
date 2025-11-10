@@ -127,6 +127,23 @@ def run_step(step: int, arg: str | None) -> int:
         console.print(f"[red]Script not found:[/] {script_path}")
         return 1
 
+    # Special handling: for step 5, always force regeneration by deleting existing MP4.
+    if step == 5 and arg:
+        slug = arg.strip()
+        if slug:
+            mp4_path = MP4_DIR / f"{slug}.mp4"
+            if mp4_path.exists():
+                try:
+                    console.print(
+                        f"[yellow][MP4] Removing existing file to regenerate:[/] {mp4_path}"
+                    )
+                    mp4_path.unlink()
+                except OSError as e:
+                    console.print(
+                        f"[red][MP4] Failed to delete existing MP4 ({mp4_path}): {e}[/red]"
+                    )
+                    # Still continue; 5gen_mp4.py may choose to overwrite.
+
     if step == 3:
         slug = (arg or "").strip()
         if not slug:
@@ -380,8 +397,7 @@ def main() -> None:
             if last_slug:
                 console.print(
                     "[bold white]"
-                    f"Audio+lyrics: YouTube url / search "
-                    f"(ENTER = reuse previous slug '{last_slug}'):[/] ",
+                    f"Audio+lyrics: YouTube search (ENTER = reuse slug '{last_slug}'):[/] ",
                     end="",
                 )
                 entered = sys.stdin.readline().strip()
@@ -394,10 +410,7 @@ def main() -> None:
                     "[bold white]Audio+lyrics: YouTube url / search:[/] ",
                     end="...",
                 )
-                # small correction: no ellipsis in actual prompt
-                # but keep behavior consistent
                 sys.stdout.flush()
-                # re-prompt cleanly
                 console.print("\r[bold white]Audio+lyrics: YouTube url / search:[/] ", end="")
                 url_or_slug = sys.stdin.readline().strip()
                 if not url_or_slug:

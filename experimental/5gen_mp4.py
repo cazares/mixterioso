@@ -13,151 +13,210 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-MP3_DIR = BASE_DIR / "mp3s"
-TIMINGS_DIR = BASE_DIR / "timings"
-OFFSETS_DIR = BASE_DIR / "offsets"
-MP4_DIR = BASE_DIR / "mp4s"
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
 
-WIDTH = 1280
-HEIGHT = 720
-FPS = 30
-FONT_PATH = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"  # adjust if needed
-MAIN_FONT_SIZE = 64
+MP3_DIR = PROJECT_ROOT / "mp3s"
+TIMING_DIR = PROJECT_ROOT / "timings"
+OFFSET_DIR = PROJECT_ROOT / "offsets"
+MP4_DIR = PROJECT_ROOT / "mp4s"
+
+VIDEO_SIZE = "1280x720"
+VIDEO_RATE = 30
+BG_COLOR = "black"
+
+# macOS font path you used before
+DEFAULT_FONT = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
+
+LYRIC_FONT_SIZE = 64
 NOTE_FONT_SIZE = 48
-LINE_DURATION_DEFAULT = 2.5  # seconds
-SAFE_REGEN = True  # skip ffmpeg if final mp4 exists
+
+LYRIC_Y = "h-160"
+NOTE_Y = "h-220"
+
+LYRIC_DURATION = 2.5
+NOTE_DURATION = 1.5
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
 
 
-def slugify(text: str) -> str:
-    import re
+def fmt_time(sec: float) -> str:
+    sec = max(0.0, sec)
+    m = int(sec // 60)
+    rem = sec - m * 60
+    s = int(rem)
+    ms = int(round((rem - s) * 1000))
+    if ms == 1000:
+        s += 1
+        ms = 0
+    if s == 60:
+        m += 1
+        s = 0
+    return f"{m:02d}:{s:02d}.{ms:03d}"
 
-    base = text.strip().lower()
-    base = re.sub(r"\s+", "_", base)
-    base = re.sub(r"[^\w\-]+", "", base)
-    return base or "song"
+
+def ffprobe_duration(audio_path: Path) -> float:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+    out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
+    try:
+        return float(out)
+    except ValueError:
+        raise SystemExit(f"Could not parse duration from ffprobe output: {out!r}")
 
 
-def load_timings(slug: str) -> list[dict]:
-    path = TIMINGS_DIR / f"{slug}.csv"
-    if not path.exists():
-        raise SystemExit(f"Timings CSV not found: {path}")
+def escape_drawtext_text(text: str) -> str:
+    """
+    Escape text for ffmpeg drawtext:
+    - backslash
+    - colon
+    - comma
+    - single quote
+    """
+    s = text
+    s = s.replace("\\", r"\\")
+    s = s.replace(":", r"\:")
+    s = s.replace(",", r"\,")
+    s = s.replace("'", r"\'")
+    return s
+
+
+def load_timings(slug: str) -> tuple[list[dict], Path]:
+    timing_path = TIMING_DIR / f"{slug}.csv"
+    if not timing_path.exists():
+        return [], timing_path
+
     events: list[dict] = []
-    with path.open("r", encoding="utf-8") as f:
+    with timing_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
-                idx = int(row["line_index"])
                 t = float(row["time_secs"])
             except (KeyError, ValueError):
                 continue
-            text = row.get("text", "") or ""
-            events.append({"line_index": idx, "time": t, "text": text})
+            text = row.get("text", "")
+            if not text:
+                continue
+            idx = int(row.get("line_index", -1) or -1)
+            events.append({"time": t, "text": text, "line_index": idx})
     events.sort(key=lambda e: e["time"])
-    return events
+    return events, timing_path
 
 
-def load_offset(slug: str) -> float:
-    path = OFFSETS_DIR / f"{slug}.json"
-    if not path.exists():
-        return 0.0
+def load_offset(slug: str) -> tuple[float, Path]:
+    OFFSET_DIR.mkdir(parents=True, exist_ok=True)
+    offset_path = OFFSET_DIR / f"{slug}.json"
+    if not offset_path.exists():
+        return 0.0, offset_path
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return float(data.get("offset", 0.0))
+        data = json.loads(offset_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            if "offset_secs" in data:
+                return float(data["offset_secs"]), offset_path
+            if "offset" in data:
+                return float(data["offset"]), offset_path
+        if isinstance(data, (int, float)):
+            return float(data), offset_path
     except Exception:
-        log("MP4", f"Failed to parse offset file {path}, using 0.0", YELLOW)
-        return 0.0
+        pass
+    return 0.0, offset_path
 
 
-def build_drawtext_filters(events: list[dict], offset: float) -> str:
-    """
-    Build drawtext chain from timing events and a global offset.
-    CSV remains intact; we only shift times here.
-    """
-    if not events:
-        return "null"
+def build_filter_complex(events: list[dict], offset: float, fontfile: str) -> str:
+    pieces: list[str] = []
 
-    main_indices = [i for i, e in enumerate(events) if e["line_index"] >= 0]
-    filters: list[str] = []
+    for ev in events:
+        t_base = ev["time"] + offset
+        if t_base < 0:
+            # If shifted before t=0, clamp to 0 so it at least appears
+            t_base = 0.0
 
-    for i, ev in enumerate(events):
-        t = float(ev["time"])
-        text = ev["text"]
-        line_index = ev["line_index"]
-
-        start = t + offset
-
-        if line_index >= 0:
-            next_time = None
-            for j in main_indices:
-                if events[j]["time"] > t:
-                    next_time = events[j]["time"]
-                    break
-            if next_time is not None:
-                end = min(start + LINE_DURATION_DEFAULT, next_time + offset - 0.1)
-            else:
-                end = start + LINE_DURATION_DEFAULT
-            fontsize = MAIN_FONT_SIZE
-            y_expr = "h-160"
-        else:
-            end = start + 1.5
+        text = escape_drawtext_text(ev["text"])
+        if ev["line_index"] < 0:
+            # note / glyph event
             fontsize = NOTE_FONT_SIZE
-            y_expr = "h-220"
+            y_expr = NOTE_Y
+            duration = NOTE_DURATION
+        else:
+            fontsize = LYRIC_FONT_SIZE
+            y_expr = LYRIC_Y
+            duration = LYRIC_DURATION
 
-        if end <= 0:
-            continue
-        start_clamped = max(start, 0.0)
+        start = t_base
+        end = t_base + duration
 
-        safe_text = (
-            text.replace("\\", "\\\\")
-            .replace(":", r"\:")
-            .replace("'", r"\'")
-        )
-
-        draw = (
-            f"drawtext=fontfile='{FONT_PATH}':"
-            f"text='{safe_text}':"
+        piece = (
+            f"drawtext=fontfile='{fontfile}':"
+            f"text='{text}':"
             f"fontsize={fontsize}:fontcolor=white:bordercolor=black:borderw=2:"
             f"x=(w-text_w)/2:y={y_expr}:"
-            f"enable='between(t,{start_clamped:.3f},{end:.3f})'"
+            f"enable='between(t,{start:.3f},{end:.3f})'"
         )
-        filters.append(draw)
+        pieces.append(piece)
 
-    if not filters:
-        return "null"
-    return ",".join(filters)
+    return ",".join(pieces)
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Generate final karaoke MP4.")
-    p.add_argument("slug", help="Song slug (e.g. 'californication')")
-    return p.parse_args(argv or sys.argv[1:])
+    p = argparse.ArgumentParser(description="Generate MP4 with lyrics (step 5).")
+    p.add_argument(
+        "slug",
+        help="Song slug, e.g. cant_stop",
+    )
+    p.add_argument(
+        "--font",
+        default=DEFAULT_FONT,
+        help=f"Font file for drawtext (default: {DEFAULT_FONT})",
+    )
+    return p.parse_args(argv)
 
 
 def main(argv=None):
-    args = parse_args(argv)
-    slug = slugify(args.slug)
+    args = parse_args(argv or sys.argv[1:])
+    slug = args.slug.strip()
+    if not slug:
+        raise SystemExit("Slug is required.")
 
-    audio_path = MP3_DIR / f"{slug}.mp3"
-    if not audio_path.exists():
-        raise SystemExit(f"Audio not found: {audio_path}")
+    mp3_path = MP3_DIR / f"{slug}.mp3"
+    if not mp3_path.exists():
+        log("MP4", f"Audio not found: {mp3_path}", RED)
+        sys.exit(1)
+
+    events, timing_path = load_timings(slug)
+    if not timing_path.exists():
+        log("MP4", f"Timings CSV not found: {timing_path}", RED)
+        sys.exit(1)
+    if not events:
+        log("MP4", f"No timing events in {timing_path}, nothing to render.", YELLOW)
+        sys.exit(1)
+
+    offset, offset_path = load_offset(slug)
+    log("MP4", f"Using offset {offset:+.3f}s for slug {slug}", CYAN)
+    if not offset_path.exists():
+        log("MP4", "No offset file found, using 0.000s.", YELLOW)
+
+    duration = ffprobe_duration(mp3_path)
+    log("MP4", f"Audio duration: {fmt_time(duration)}", GREEN)
+
+    filter_complex = build_filter_complex(events, offset, args.font)
+
+    if not filter_complex:
+        log("MP4", "Filter graph is empty; no text will be drawn.", YELLOW)
 
     MP4_DIR.mkdir(parents=True, exist_ok=True)
     out_path = MP4_DIR / f"{slug}.mp4"
 
-    if SAFE_REGEN and out_path.exists():
-        log("MP4", f"Output already exists, skipping: {out_path}", YELLOW)
-        return
-
-    events = load_timings(slug)
-    offset = load_offset(slug)
-    log("MP4", f"Using offset {offset:+.3f}s for slug {slug}", GREEN)
-
-    filter_complex = build_drawtext_filters(events, offset)
+    color_src = f"color=size={VIDEO_SIZE}:rate={VIDEO_RATE}:color={BG_COLOR}"
 
     cmd = [
         "ffmpeg",
@@ -165,33 +224,38 @@ def main(argv=None):
         "-f",
         "lavfi",
         "-i",
-        f"color=size={WIDTH}x{HEIGHT}:rate={FPS}:color=black",
+        color_src,
         "-i",
-        str(audio_path),
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-shortest",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-c:a",
-        "aac",
-        str(out_path),
+        str(mp3_path),
     ]
 
-    log("MP4", " ".join(cmd), CYAN)
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        log("MP4", f"ffmpeg failed with code {e.returncode}", RED)
-        sys.exit(e.returncode)
+    if filter_complex:
+        cmd.extend(["-filter_complex", filter_complex])
 
-    log("MP4", f"Final video saved to {out_path}", GREEN)
+    cmd.extend(
+        [
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-c:a",
+            "aac",
+            str(out_path),
+        ]
+    )
+
+    log("MP4", " ".join(cmd), CYAN)
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0:
+        log("MP4", f"ffmpeg failed with code {proc.returncode}", RED)
+        sys.exit(proc.returncode)
+
+    log("MP4", f"MP4 written to {out_path}", GREEN)
 
 
 if __name__ == "__main__":
