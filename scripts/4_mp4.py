@@ -27,30 +27,78 @@ META_DIR = BASE_DIR / "meta"
 VIDEO_WIDTH = 1920
 VIDEO_HEIGHT = 1080
 
-# Layout: top band for main lyric, bottom band for "up next".
-TOP_BAND_FRACTION = 0.8
-BOTTOM_BAND_FRACTION = 0.2
+# =============================================================================
+# LAYOUT CONSTANTS
+# =============================================================================
+# Fraction of the total video height that is reserved for the *bottom* box
+# where the "next lyric" preview text lives. Increase this to make the bottom
+# preview box taller, decrease it to give more space to the main (top) lyrics.
+BOTTOM_BOX_HEIGHT_FRACTION = 0.20  # 0.20 = 20% of the screen height
 
-# Nudge main line within the top band (fraction of top-band height; + = down).
+# The remaining height is automatically used by the top "current lyric" box.
+TOP_BAND_FRACTION = 1.0 - BOTTOM_BOX_HEIGHT_FRACTION
+
+# Vertical padding (in pixels) inside the bottom box around the NEXT lyric text.
+# These control how far the preview text sits away from the top and bottom
+# edges of the bottom box. The preview baseline is centered between these
+# margins.
+NEXT_LYRIC_TOP_MARGIN_PX = 50
+NEXT_LYRIC_BOTTOM_MARGIN_PX = 50
+
+# Vertical offset (in pixels) by which the thin divider line between the
+# current-lyric region and the next-lyric region is moved upward from the
+# top edge of the bottom box. Positive values move the line up, negative
+# values move it down.
+DIVIDER_LINE_OFFSET_UP_PX = 50
+
+# Within the top band, you can nudge the main line up or down by changing
+# this fraction of the top-band height. Positive values move text DOWN.
 VERTICAL_OFFSET_FRACTION = 0.0
 
 # Extra nudge for the title line relative to the main line (fraction of top band).
 TITLE_EXTRA_OFFSET_FRACTION = -0.20
 
-# Fraction from top of bottom band to "up next" line (no longer used for y_next).
-BOTTOM_TEXT_TOP_PADDING_FRACTION = 0.20
-
-# Size of up-next font relative to main lyrics.
+# How big the next-lyric text is relative to the main lyric text.
+#  0.60 = 60% of the main font size.
 NEXT_LINE_FONT_SCALE = 0.60
 
-# Alpha for up-next text (00 = opaque, FF = fully transparent). Keep it partially transparent.
-NEXT_LINE_ALPHA_HEX = "8080"
+# =============================================================================
+# COLOR AND OPACITY CONSTANTS
+# =============================================================================
+# All ASS colors are encoded as AABBGGRR (alpha, blue, green, red) under the hood.
+# To make configuration less painful, we keep everything as simple hex RRGGBB here
+# and build the AABBGGRR/BGGRR codes where needed.
+
+# Global base text + line color for the *bottom* "next lyric" area and divider line.
+# This does NOT affect the top current-lyric text color; that has its own constant.
+GLOBAL_NEXT_COLOR_RGB = "FFFFFF"  # white
+
+# Global alpha for both the divider line and the next-lyric text.
+#  - "00" = fully opaque
+#  - "FF" = fully transparent
+GLOBAL_NEXT_ALPHA_HEX = "70"  # semi-transparent
+
+# Top (current lyric) font color.
+TOP_LYRIC_TEXT_COLOR_RGB = "FFFFFF"  # white
+
+# Background color for the bottom "next lyric" rectangle.
+# Right now this is only wired as a configuration hook; if you want a solid
+# bottom bar behind the preview text, we can use this to draw a p1 rectangle.
+BOTTOM_BOX_BG_COLOR_RGB = "000000"  # black (currently unused as a solid bar)
+
+# Background color for the top "current lyric" rectangle.
+# This currently drives the style's BackColour, which gives a subtle
+# background when BorderStyle=3. With the current style (BorderStyle=1),
+# this mostly matters for karaoke highlight or if we later turn on boxes.
+TOP_BOX_BG_COLOR_RGB = "000000"  # black
 
 # Base UI font size in "points" (converted to ASS by a multiplier).
 DEFAULT_UI_FONT_SIZE = 120
 ASS_FONT_MULTIPLIER = 1.5  # multiple of UI font size to get ASS fontsize
 
-# Global lyrics offset in seconds. Positive = delay, negative = earlier.
+# Global lyrics timing offset in seconds. Positive = delay, negative = earlier.
+# This is applied uniformly to all lyric timestamps at render time so you can
+# nudge the whole subtitle track without re-running timing.
 LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0") or "0")
 # If you prefer hardcoded only, comment the line above and do e.g.:
 # LYRICS_OFFSET_SECS = -0.35  # shift lyrics 350 ms earlier
@@ -85,6 +133,22 @@ def seconds_to_ass_time(sec: float) -> str:
     m, s = divmod(rem, 60)
 
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def rgb_to_bgr(rrggbb: str) -> str:
+    """
+    Convert an RRGGBB hex string into BGR order as required by ASS (&HAABBGGRR).
+
+    Example:
+        "FFFFFF" -> "FFFFFF"
+        "FF0000" -> "0000FF"
+    """
+    s = (rrggbb or "").strip().lstrip("#")
+    s = s.zfill(6)[-6:]
+    rr = s[0:2]
+    gg = s[2:4]
+    bb = s[4:6]
+    return f"{bb}{gg}{rr}"
 
 
 def read_meta(slug: str) -> tuple[str, str]:
@@ -218,11 +282,12 @@ def build_ass(
     playresx = VIDEO_WIDTH
     playresy = VIDEO_HEIGHT
 
-    # Geometry
+    # Geometry for top/bottom regions.
     top_band_height = int(playresy * TOP_BAND_FRACTION)
-    y_divider = top_band_height
-    bottom_band_height = playresy - y_divider
+    y_divider_nominal = top_band_height  # theoretical border between top and bottom boxes
+    bottom_band_height = playresy - y_divider_nominal
 
+    # Vertical positions for the top region.
     center_top = top_band_height // 2
     offset_px = int(top_band_height * VERTICAL_OFFSET_FRACTION)
     y_main = center_top + offset_px
@@ -231,11 +296,33 @@ def build_ass(
     x_center = playresx // 2
     y_center_full = playresy // 2
 
-    # Center next-lyric baseline within bottom band so spacing to divider and bottom is equal.
-    y_next = y_divider + bottom_band_height // 2
+    # Divider line: we start from the nominal divider (top of bottom box)
+    # and move it upward by DIVIDER_LINE_OFFSET_UP_PX.
+    line_y = max(0, y_divider_nominal - DIVIDER_LINE_OFFSET_UP_PX)
+
+    # Next-lyric box is the region below the nominal divider.
+    # We use NEXT_LYRIC_TOP_MARGIN_PX / NEXT_LYRIC_BOTTOM_MARGIN_PX to keep
+    # some breathing room above/below the preview text, and center its baseline
+    # inside that inner region.
+    inner_bottom_box_height = max(
+        1, bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX
+    )
+    y_next = (
+        y_divider_nominal
+        + NEXT_LYRIC_TOP_MARGIN_PX
+        + inner_bottom_box_height // 2
+    )
 
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
     margin_v = 0
+
+    # Precomputed ASS color strings.
+    top_primary_ass = f"&H00{rgb_to_bgr(TOP_LYRIC_TEXT_COLOR_RGB)}"
+    top_back_ass = f"&H80{rgb_to_bgr(TOP_BOX_BG_COLOR_RGB)}"
+    # Secondary, outline, etc. remain close to the original defaults.
+    secondary_ass = "&H000000FF"  # red (used for karaoke highlighting if ever needed)
+    outline_ass = "&H00000000"    # black
+    back_ass = top_back_ass
 
     header_lines = [
         "[Script Info]",
@@ -254,7 +341,7 @@ def build_ass(
         ),
         (
             f"Style: Default,{font_name},{font_size_script},"
-            "&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+            f"{top_primary_ass},{secondary_ass},{outline_ass},{back_ass},"
             "0,0,0,0,100,100,0,0,1,4,0,5,50,50,"
             f"{margin_v},0"
         ),
@@ -333,11 +420,18 @@ def build_ass(
             )
         )
 
-    # Thin horizontal divider between current lyric region and next-lyric region,
-    # same white and opacity as next-lyric text, 10px tall, only while lyrics are active.
+    # Thin horizontal divider between current lyric region and next-lyric region.
+    # Uses the GLOBAL_NEXT_COLOR_RGB and GLOBAL_NEXT_ALPHA_HEX so the line and
+    # the preview text always share the same "UI" look. \bord0\shad0 keeps it
+    # visually 1px tall even though the style has Outline=4.
+    divider_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
     divider_text = (
-        f"{{\\an7\\pos(0,{y_divider})\\p1\\1a&H{NEXT_LINE_ALPHA_HEX}&}}"
-        f"m 0 0 l {playresx} 0 l {playresx} 10 l 0 10{{\\p0}}"
+        f"{{\\an7\\pos(0,{line_y})"
+        f"\\1c&H{divider_color_bgr}&"
+        f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
+        f"\\bord0\\shad0"
+        f"\\p1}}"
+        f"m 0 0 l {playresx} 0 l {playresx} 1 l 0 1{{\\p0}}"
     )
     events.append(
         "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
@@ -349,6 +443,7 @@ def build_ass(
 
     # One main line per event, one up-next line, no overlaps.
     n = len(unified)
+    next_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
     for i, (t, raw_text, _line_index) in enumerate(unified):
         start = max(0.0, t + offset)
         if i < n - 1:
@@ -361,7 +456,7 @@ def build_ass(
         if end <= start:
             continue
 
-        # Main line (lyric or note) in the top band.
+        # Main line (lyric or note) in the top band (uses the top style color).
         main_text = ass_escape(raw_text)
         events.append(
             "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
@@ -371,14 +466,17 @@ def build_ass(
             )
         )
 
-        # Up-next preview: next event's text, bottom band, semi-transparent.
+        # Up-next preview: next event's text, bottom band, semi-transparent,
+        # sharing the GLOBAL_NEXT_COLOR_RGB / GLOBAL_NEXT_ALPHA_HEX.
         if i < n - 1:
             _, next_raw, _ = unified[i + 1]
             if next_raw:
                 preview_text = ass_escape(next_raw)
                 tag = (
                     f"{{\\an5\\pos({x_center},{y_next})"
-                    f"\\fs{preview_font}\\1a&H{NEXT_LINE_ALPHA_HEX}&}}"
+                    f"\\fs{preview_font}"
+                    f"\\1c&H{next_color_bgr}&"
+                    f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&}}"
                 )
                 events.append(
                     "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 import argparse
-import csv
 import json
 import subprocess
 import sys
 import time
 from pathlib import Path
-import os
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -16,93 +14,19 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 BLUE = "\033[34m"
 
+
+def log(section: str, msg: str, color: str = CYAN) -> None:
+    print(f"{color}[{section}]{RESET} {msg}")
+
+
 BASE_DIR = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = BASE_DIR / "scripts"
 TXT_DIR = BASE_DIR / "txts"
 MP3_DIR = BASE_DIR / "mp3s"
 MIXES_DIR = BASE_DIR / "mixes"
 TIMINGS_DIR = BASE_DIR / "timings"
 OUTPUT_DIR = BASE_DIR / "output"
 META_DIR = BASE_DIR / "meta"
-
-VIDEO_WIDTH = 1920
-VIDEO_HEIGHT = 1080
-
-# =============================================================================
-# LAYOUT CONSTANTS
-# =============================================================================
-# Fraction of the total video height that is reserved for the *bottom* box
-# where the "next lyric" preview text lives. Increase this to make the bottom
-# preview box taller, decrease it to give more space to the main (top) lyrics.
-BOTTOM_BOX_HEIGHT_FRACTION = 0.20  # 0.20 = 20% of the screen height
-
-# The remaining height is automatically used by the top "current lyric" box.
-TOP_BAND_FRACTION = 1.0 - BOTTOM_BOX_HEIGHT_FRACTION
-
-# Vertical padding (in pixels) inside the bottom box around the NEXT lyric text.
-# These control how far the preview text sits away from the top and bottom
-# edges of the bottom box. The preview baseline is centered between these
-# margins.
-NEXT_LYRIC_TOP_MARGIN_PX = 50
-NEXT_LYRIC_BOTTOM_MARGIN_PX = 50
-
-# Vertical offset (in pixels) by which the thin divider line between the
-# current-lyric region and the next-lyric region is moved upward from the
-# top edge of the bottom box. Positive values move the line up, negative
-# values move it down.
-DIVIDER_LINE_OFFSET_UP_PX = 50
-
-# Within the top band, you can nudge the main line up or down by changing
-# this fraction of the top-band height. Positive values move text DOWN.
-VERTICAL_OFFSET_FRACTION = 0.0
-
-# Extra nudge for the title line relative to the main line (fraction of top band).
-TITLE_EXTRA_OFFSET_FRACTION = -0.20
-
-# =============================================================================
-# COLOR AND OPACITY CONSTANTS
-# =============================================================================
-# All ASS colors are encoded as AABBGGRR (alpha, blue, green, red) under the hood.
-# To make configuration less painful, we keep everything as simple hex RRGGBB here
-# and build the AABBGGRR/BGGRR codes where needed.
-
-# Global base text + line color for the *bottom* "next lyric" area and divider line.
-# This does NOT affect the top current-lyric text color; that has its own constant.
-GLOBAL_NEXT_COLOR_RGB = "FFFFFF"  # white
-
-# Global alpha for both the divider line and the next-lyric text.
-#  - "00" = fully opaque
-#  - "FF" = fully transparent
-GLOBAL_NEXT_ALPHA_HEX = "80"  # semi-transparent
-
-# Top (current lyric) font color.
-TOP_LYRIC_TEXT_COLOR_RGB = "FFFFFF"  # white
-
-# Background color for the bottom "next lyric" rectangle.
-# Right now this is only wired as a configuration hook; if you want a solid
-# bottom bar behind the preview text, we can use this to draw a p1 rectangle.
-BOTTOM_BOX_BG_COLOR_RGB = "000000"  # black (currently unused as a solid bar)
-
-# Background color for the top "current lyric" rectangle.
-# This currently drives the style's BackColour, which gives a subtle
-# background when BorderStyle=3. With the current style (BorderStyle=1),
-# this mostly matters for karaoke highlight or if we later turn on boxes.
-TOP_BOX_BG_COLOR_RGB = "000000"  # black
-
-# Base UI font size in "points" (converted to ASS by a multiplier).
-DEFAULT_UI_FONT_SIZE = 120
-ASS_FONT_MULTIPLIER = 1.5  # multiple of UI font size to get ASS fontsize
-
-# Global lyrics timing offset in seconds. Positive = delay, negative = earlier.
-# This is applied uniformly to all lyric timestamps at render time so you can
-# nudge the whole subtitle track without re-running timing.
-LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0") or "0")
-# If you prefer hardcoded only, comment the line above and do e.g.:
-# LYRICS_OFFSET_SECS = -0.35  # shift lyrics 350 ms earlier
-
-
-def log(prefix: str, msg: str, color: str = RESET) -> None:
-    ts = time.strftime("%H:%M:%S")
-    print(f"{color}[{ts}] [{prefix}] {msg}{RESET}")
 
 
 def slugify(text: str) -> str:
@@ -114,569 +38,462 @@ def slugify(text: str) -> str:
     return base or "song"
 
 
-def seconds_to_ass_time(sec: float) -> str:
-    # ASS time format: H:MM:SS.cs (centiseconds)
-    if sec < 0:
-        sec = 0.0
-
-    # Work entirely in integer centiseconds to avoid rounding issues.
-    total_cs = int(round(sec * 100))
-    if total_cs < 0:
-        total_cs = 0
-
-    total_seconds, cs = divmod(total_cs, 100)
-    h, rem = divmod(total_seconds, 3600)
-    m, s = divmod(rem, 60)
-
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+def fmt_secs_mmss(sec: float) -> str:
+    m = int(sec // 60)
+    s = int(round(sec - m * 60))
+    if s == 60:
+        m += 1
+        s = 0
+    return f"{sec:6.2f} s  ({m:02d}:{s:02d})"
 
 
-def rgb_to_bgr(rrggbb: str) -> str:
+def run(cmd: list[str], section: str) -> float:
+    log(section, " ".join(cmd), BLUE)
+    t0 = time.perf_counter()
+    subprocess.run(cmd, check=True)
+    t1 = time.perf_counter()
+    return t1 - t0
+
+def detect_slug_from_latest_mp3() -> str:
     """
-    Convert an RRGGBB hex string into BGR order as required by ASS (&HAABBGGRR).
+    Infer the most recent slug produced by step 1.
 
-    Example:
-        "FFFFFF" -> "FFFFFF"
-        "FF0000" -> "0000FF"
+    Prefer the newest meta/*.json (always rewritten by 1_txt_mp3),
+    and fall back to the newest mp3 if no meta files exist.
     """
-    s = (rrggbb or "").strip().lstrip("#")
-    s = s.zfill(6)[-6:]
-    rr = s[0:2]
-    gg = s[2:4]
-    bb = s[4:6]
-    return f"{bb}{gg}{rr}"
+    metas = sorted(META_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    if metas:
+        slug = slugify(metas[-1].stem)
+        log("MASTER", f"Latest slug inferred from meta/: {slug}", CYAN)
+        return slug
+
+    mp3s = sorted(MP3_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
+    if not mp3s:
+        raise SystemExit("No mp3s found in mp3s/ after 1_txt_mp3.")
+    slug = slugify(mp3s[-1].stem)
+    log("MASTER", f"Latest slug inferred from mp3s/: {slug}", CYAN)
+    return slug
 
 
-def read_meta(slug: str) -> tuple[str, str]:
+def load_meta(slug: str):
     meta_path = META_DIR / f"{slug}.json"
-    artist = ""
-    title = slug
-    if meta_path.exists():
-        try:
-            data = json.loads(meta_path.read_text(encoding="utf-8"))
-            artist = data.get("artist") or ""
-            title = data.get("title") or title
-        except Exception as e:
-            log("META", f"Failed to read meta {meta_path}: {e}", YELLOW)
-    return artist, title
-
-
-def read_timings(slug: str) -> list[tuple[float, str, int]]:
-    """
-    Return list of (time_secs, text, line_index).
-
-    Preferred CSV format:
-        line_index,time_secs,text
-
-    Fallback 2-column format:
-        time_secs,text   (line_index is treated as 0 = normal lyric)
-    """
-    timing_path = TIMINGS_DIR / f"{slug}.csv"
-    if not timing_path.exists():
-        print(f"Timing CSV not found for slug={slug}: {timing_path}")
-        sys.exit(1)
-
-    rows: list[tuple[float, str, int]] = []
-    with timing_path.open(newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-
-        if header and "time_secs" in header:
-            try:
-                idx_time = header.index("time_secs")
-            except ValueError:
-                idx_time = 1
-            try:
-                idx_li = header.index("line_index")
-            except ValueError:
-                idx_li = None
-            idx_text = header.index("text") if "text" in header else None
-
-            for row in reader:
-                if not row or len(row) <= idx_time:
-                    continue
-                t_str = row[idx_time].strip()
-                if not t_str:
-                    continue
-                try:
-                    t = float(t_str)
-                except ValueError:
-                    continue
-
-                if idx_li is not None and len(row) > idx_li:
-                    try:
-                        line_index = int(row[idx_li])
-                    except ValueError:
-                        line_index = 0
-                else:
-                    line_index = 0
-
-                text = ""
-                if idx_text is not None and len(row) > idx_text:
-                    text = row[idx_text]
-
-                rows.append((t, text, line_index))
-        else:
-            for row in reader:
-                if len(row) < 2:
-                    continue
-                t_str = row[0].strip()
-                if not t_str:
-                    continue
-                try:
-                    t = float(t_str)
-                except ValueError:
-                    continue
-                text = row[1]
-                rows.append((t, text, 0))
-
-    rows.sort(key=lambda x: x[0])
-    log("TIMINGS", f"Loaded {len(rows)} timing rows from {timing_path}", CYAN)
-    return rows
-
-
-def probe_audio_duration(path: Path) -> float:
-    if not path.exists():
-        return 0.0
-
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ]
-    log("FFPROBE", f"Probing duration of {path}", BLUE)
+    if not meta_path.exists():
+        return None, None
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-        return float(out.strip())
-    except Exception as e:
-        log("FFPROBE", f"Failed to probe duration: {e}", YELLOW)
-        return 0.0
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        return data.get("artist"), data.get("title")
+    except Exception:
+        return None, None
 
 
-def build_ass(
-    slug: str,
-    artist: str,
-    title: str,
-    timings: list[tuple[float, str, int]],
-    audio_duration: float,
-    font_name: str,
-    font_size_script: int,
-) -> Path:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    ass_path = OUTPUT_DIR / f"{slug}.ass"
-
-    if audio_duration <= 0.0 and timings:
-        audio_duration = max(t for t, _, _ in timings) + 5.0
-    if audio_duration <= 0.0:
-        audio_duration = 5.0
-
-    playresx = VIDEO_WIDTH
-    playresy = VIDEO_HEIGHT
-
-    # Geometry for top/bottom regions.
-    top_band_height = int(playresy * TOP_BAND_FRACTION)
-    y_divider_nominal = top_band_height  # theoretical border between top and bottom boxes
-    bottom_band_height = playresy - y_divider_nominal
-
-    # Vertical positions for the top region.
-    center_top = top_band_height // 2
-    offset_px = int(top_band_height * VERTICAL_OFFSET_FRACTION)
-    y_main = center_top + offset_px
-    y_title = y_main + int(top_band_height * TITLE_EXTRA_OFFSET_FRACTION)
-
-    x_center = playresx // 2
-    y_center_full = playresy // 2
-
-    # Divider line: we start from the nominal divider (top of bottom box)
-    # and move it upward by DIVIDER_LINE_OFFSET_UP_PX.
-    line_y = max(0, y_divider_nominal - DIVIDER_LINE_OFFSET_UP_PX)
-
-    # Next-lyric box is the region below the nominal divider.
-    # We use NEXT_LYRIC_TOP_MARGIN_PX / NEXT_LYRIC_BOTTOM_MARGIN_PX to keep
-    # some breathing room above/below the preview text, and center its baseline
-    # inside that inner region.
-    inner_bottom_box_height = max(
-        1, bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX
-    )
-    y_next = (
-        y_divider_nominal
-        + NEXT_LYRIC_TOP_MARGIN_PX
-        + inner_bottom_box_height // 2
-    )
-
-    preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
-    margin_v = 0
-
-    # Precomputed ASS color strings.
-    top_primary_ass = f"&H00{rgb_to_bgr(TOP_LYRIC_TEXT_COLOR_RGB)}"
-    top_back_ass = f"&H80{rgb_to_bgr(TOP_BOX_BG_COLOR_RGB)}"
-    # Secondary, outline, etc. remain close to the original defaults.
-    secondary_ass = "&H000000FF"  # red (used for karaoke highlighting if ever needed)
-    outline_ass = "&H00000000"    # black
-    back_ass = top_back_ass
-
-    header_lines = [
-        "[Script Info]",
-        "ScriptType: v4.00+",
-        "Collisions: Normal",
-        f"PlayResX: {playresx}",
-        f"PlayResY: {playresy}",
-        "ScaledBorderAndShadow: yes",
-        "",
-        "[V4+ Styles]",
-        (
-            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
-            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
-            "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-            "Alignment, MarginL, MarginR, MarginV, Encoding"
-        ),
-        (
-            f"Style: Default,{font_name},{font_size_script},"
-            f"{top_primary_ass},{secondary_ass},{outline_ass},{back_ass},"
-            "0,0,0,0,100,100,0,0,1,4,0,5,50,50,"
-            f"{margin_v},0"
-        ),
-        "",
-        "[Events]",
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-    ]
-
-    def ass_escape(text: str) -> str:
-        text = text.replace("{", "(").replace("}", ")")
-        text = text.replace("\\N", "\\N")
-        text = text.replace("\n", r"\N")
-        return text
-
-    events: list[str] = []
-
-    # Normalize timings and filter out-of-range / empty lines.
-    unified: list[tuple[float, str, int]] = []
-    for t, text, line_index in timings:
-        if t < 0 or (audio_duration and t > audio_duration):
-            continue
-        text = (text or "").strip()
-        if not text:
-            continue
-        unified.append((t, text, line_index))
-
-    unified.sort(key=lambda x: x[0])
-
-    offset = LYRICS_OFFSET_SECS
-
-    # If no timings, just show a centered title card for the whole song.
-    if not unified:
-        title_lines = []
-        if title:
-            title_lines.append(title)
-        if artist:
-            title_lines.append(f"by {artist}")
-        if not title_lines:
-            title_lines = ["No lyrics"]
-
-        intro_block = "\\N".join(title_lines)
-        events.append(
-            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(0.0),
-                end=seconds_to_ass_time(audio_duration),
-                text=f"{{\\an5\\pos({x_center},{y_center_full})}}{ass_escape(intro_block)}",
-            )
-        )
-
-        ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
-        log("ASS", f"Wrote ASS subtitles (title only) to {ass_path}", GREEN)
-        return ass_path
-
-    first_lyric_time = max(0.0, unified[0][0] + offset)
-
-    # Intro title / artist card, centered, with no lyrics / previews / divider.
-    title_lines = []
-    if title:
-        title_lines.append(title)
-    if artist:
-        title_lines.append(f"by {artist}")
-
-    if title_lines:
-        # End the intro at or before the first lyric so they never overlap.
-        if first_lyric_time > 0.1:
-            title_end = min(first_lyric_time, 5.0)
-        else:
-            title_end = first_lyric_time  # very short intro if lyrics start immediately
-
-        intro_block = "\\N".join(title_lines)
-        events.append(
-            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(0.0),
-                end=seconds_to_ass_time(title_end),
-                text=f"{{\\an5\\pos({x_center},{y_center_full})}}{ass_escape(intro_block)}",
-            )
-        )
-
-    # Thin horizontal divider between current lyric region and next-lyric region.
-    # Uses the GLOBAL_NEXT_COLOR_RGB and GLOBAL_NEXT_ALPHA_HEX so the line and
-    # the preview text always share the same "UI" look.
-    divider_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
-    divider_text = (
-        f"{{\\an7\\pos(0,{line_y})"
-        f"\\1c&H{divider_color_bgr}&"
-        f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
-        f"\\p1}}"
-        f"m 0 0 l {playresx} 0 l {playresx} 1 l 0 1{{\\p0}}"
-    )
-    events.append(
-        "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
-            start=seconds_to_ass_time(first_lyric_time),
-            end=seconds_to_ass_time(audio_duration),
-            text=divider_text,
-        )
-    )
-
-    # One main line per event, one up-next line, no overlaps.
-    n = len(unified)
-    next_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
-    for i, (t, raw_text, _line_index) in enumerate(unified):
-        start = max(0.0, t + offset)
-        if i < n - 1:
-            end = max(start, unified[i + 1][0] + offset)
-        else:
-            end = audio_duration or (start + 5.0)
-
-        if end > audio_duration:
-            end = audio_duration
-        if end <= start:
-            continue
-
-        # Main line (lyric or note) in the top band (uses the top style color).
-        main_text = ass_escape(raw_text)
-        events.append(
-            "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(start),
-                end=seconds_to_ass_time(end),
-                text=f"{{\\an5\\pos({x_center},{y_main})}}{main_text}",
-            )
-        )
-
-        # Up-next preview: next event's text, bottom band, semi-transparent,
-        # sharing the GLOBAL_NEXT_COLOR_RGB / GLOBAL_NEXT_ALPHA_HEX.
-        if i < n - 1:
-            _, next_raw, _ = unified[i + 1]
-            if next_raw:
-                preview_text = ass_escape(next_raw)
-                tag = (
-                    f"{{\\an5\\pos({x_center},{y_next})"
-                    f"\\fs{preview_font}"
-                    f"\\1c&H{next_color_bgr}&"
-                    f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&}}"
-                )
-                events.append(
-                    "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
-                        start=seconds_to_ass_time(start),
-                        end=seconds_to_ass_time(end),
-                        text=tag + preview_text,
-                    )
-                )
-
-    ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
-    log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
-    return ass_path
-
-
-def choose_audio(slug: str, profile: str) -> Path:
+def detect_assets(slug: str, profile: str) -> dict:
+    txt = TXT_DIR / f"{slug}.txt"
+    mp3 = MP3_DIR / f"{slug}.mp3"
+    meta = META_DIR / f"{slug}.json"
     mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
-    mix_mp3 = MIXES_DIR / f"{slug}_{profile}.mp3"
-    mp3_path = MP3_DIR / f"{slug}.mp3"
+    timing_csv = TIMINGS_DIR / f"{slug}.csv"
+    mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
 
+    step1_done = txt.exists() and mp3.exists() and meta.exists()
     if profile == "lyrics":
-        audio_path = mp3_path
-        if not audio_path.exists():
-            print(f"Audio mp3 not found for slug={slug}: {audio_path}")
-            sys.exit(1)
-        print(f"[AUDIO] Using original mp3 for profile=lyrics: {audio_path}")
-        return audio_path
+        step2_done = True
+    else:
+        step2_done = mix_wav.exists()
+    step3_done = timing_csv.exists()
+    step4_done = mp4.exists()
 
-    if mix_wav.exists():
-        print(f"[AUDIO] Using mixed WAV for profile={profile}: {mix_wav}")
-        return mix_wav
-
-    if mix_mp3.exists():
-        print(f"[AUDIO] Using mixed MP3 for profile={profile}: {mix_mp3}")
-        return mix_mp3
-
-    if mp3_path.exists():
-        print(
-            f"[AUDIO] Mixed WAV/MP3 for profile={profile} not found.\n"
-            f"        Falling back to original mp3: {mp3_path}"
-        )
-        return mp3_path
-
-    print(
-        f"Audio not found for slug={slug}, profile={profile}.\n"
-        f"Tried:\n"
-        f"  mix wav: {mix_wav}\n"
-        f"  mix mp3: {mix_mp3}\n"
-        f"  mp3: {mp3_path}"
-    )
-    sys.exit(1)
+    return {
+        1: step1_done,
+        2: step2_done,
+        3: step3_done,
+        4: step4_done,
+    }
 
 
-def open_path(path: Path) -> None:
-    try:
-        if sys.platform == "darwin":
-            subprocess.run(["open", str(path)])
-        elif sys.platform.startswith("win"):
-            subprocess.run(["start", str(path)], shell=True)
+def print_asset_status(slug: str, profile: str, status: dict) -> None:
+    print()
+    print(f"{BOLD}Pipeline status for slug={slug}, profile={profile}{RESET}")
+    labels = {
+        1: "txt+mp3 generation (1_txt_mp3)",
+        2: "stems/mix (Demucs + mix UI)",
+        3: "timings CSV (3_timing)",
+        4: "mp4 generation (4_mp4)",
+    }
+    for step in range(1, 5):
+        s = "DONE" if status.get(step) else "MISSING"
+        color = GREEN if status.get(step) else YELLOW
+        print(f"{color}[{step}] {labels[step]}  -> {s}{RESET}")
+    print()
+
+
+def suggest_steps(status: dict) -> str:
+    missing = "".join(str(k) for k in range(1, 5) if not status.get(k))
+    return missing or "0"
+
+
+def parse_steps_string(s: str) -> list[int]:
+    steps: list[int] = []
+    for ch in s:
+        if ch in "01234":
+            v = int(ch)
+            if v not in steps:
+                steps.append(v)
+    steps.sort()
+    return steps
+
+
+def run_step1_txt_mp3(query: str) -> tuple[str, float]:
+    t = run([sys.executable, str(SCRIPTS_DIR / "1_txt_mp3.py"), query], "STEP1")
+    slug = detect_slug_from_latest_mp3()
+    log("STEP1", f"1_txt_mp3 slug detected: {slug}", GREEN)
+    return slug, t
+
+
+def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> float:
+    if profile == "lyrics":
+        log("STEP2", "Profile 'lyrics' selected, skipping stems/mix.", YELLOW)
+        return 0.0
+
+    mp3_path = MP3_DIR / f"{slug}.mp3"
+    txt_path = TXT_DIR / f"{slug}.txt"
+    if not mp3_path.exists() or not txt_path.exists():
+        raise SystemExit(f"Missing assets for step 2: {mp3_path} or {txt_path}.")
+
+    separated_root = BASE_DIR / "separated"
+
+    # Always prefer 6-stem, then (if absolutely necessary) 4-stem.
+    preferred_models: list[str] = []
+    if model:
+        preferred_models.append(model)
+    if "htdemucs_6s" not in preferred_models:
+        preferred_models.insert(0, "htdemucs_6s")
+    if "htdemucs" not in preferred_models:
+        preferred_models.append("htdemucs")  # 4-stem fallback, never 2-stem
+
+    # Check for existing stems we can reuse.
+    existing_model = None
+    for m in preferred_models:
+        d = separated_root / m / slug
+        if d.exists():
+            existing_model = m
+            break
+
+    reuse_stems = False
+    actual_model = existing_model
+
+    if existing_model:
+        if interactive:
+            ans = input(
+                f"Stems already exist at {separated_root / existing_model / slug} "
+                f"for model '{existing_model}'. Reuse and skip Demucs? [Y/n]: "
+            ).strip().lower()
+            reuse_stems = ans in ("", "y", "yes")
         else:
-            subprocess.run(["xdg-open", str(path)])
-    except Exception as e:
-        log("OPEN", f"Failed to open {path}: {e}", YELLOW)
+            reuse_stems = True
+
+    t_demucs = 0.0
+
+    if not reuse_stems:
+        import subprocess as sp
+
+        log("STEP2", f"No reusable stems; trying models {preferred_models}", CYAN)
+        actual_model = None
+        for m in preferred_models:
+            try:
+                t_demucs += run(["demucs", "-n", m, str(mp3_path)], "STEP2-DEMUX")
+                actual_model = m
+                break
+            except sp.CalledProcessError:
+                log("STEP2", f"Demucs model '{m}' failed, trying next.", YELLOW)
+        if actual_model is None:
+            raise SystemExit(
+                "Demucs failed for 6-stem and 4-stem models; "
+                "no 2-stem fallback is allowed by policy."
+            )
+    elif actual_model is None:
+        raise SystemExit("Asked to reuse stems but none were found for any supported model.")
+
+    log("STEP2", f"Using Demucs model '{actual_model}' for mixing.", GREEN)
+
+    # Open mix UI (using remembered percentages) for this model/profile.
+    t_mix_ui = run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "2_stems.py"),
+            "--mp3",
+            str(mp3_path),
+            "--profile",
+            profile,
+            "--model",
+            actual_model,
+            "--mix-ui-only",
+        ],
+        "STEP2-MIXUI",
+    )
+
+    out_wav = MIXES_DIR / f"{slug}_{profile}.wav"
+    t_render = run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "2_stems.py"),
+            "--mp3",
+            str(mp3_path),
+            "--profile",
+            profile,
+            "--model",
+            actual_model,
+            "--render-only",
+            "--output",
+            str(out_wav),
+        ],
+        "STEP2-RENDER",
+    )
+
+    total = t_demucs + t_mix_ui + t_render
+    log("STEP2", f"Stems/mix completed in {fmt_secs_mmss(total)}", GREEN)
+    return total
+
+
+def run_step3_timing(slug: str) -> float:
+    mp3_path = MP3_DIR / f"{slug}.mp3"
+    txt_path = TXT_DIR / f"{slug}.txt"
+    timing_path = TIMINGS_DIR / f"{slug}.csv"
+    timing_path.parent.mkdir(parents=True, exist_ok=True)
+
+    t = run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "3_timing.py"),
+            "--txt",
+            str(txt_path),
+            "--audio",
+            str(mp3_path),
+            "--timings",
+            str(timing_path),
+        ],
+        "STEP3",
+    )
+    return t
+
+
+def run_step4_mp4(slug: str, profile: str) -> float:
+    cmd = [
+        sys.executable,
+        str(SCRIPTS_DIR / "4_mp4.py"),
+        "--slug",
+        slug,
+        "--profile",
+        profile,
+    ]
+    try:
+        t = run(cmd, "STEP4")
+        return t
+    except subprocess.CalledProcessError as e:
+        log(
+            "STEP4",
+            f"Step 4 failed (exit {e.returncode}). "
+            "Most likely the mixed WAV for this slug/profile is missing. "
+            "Run step 2 (stems/mix) first.",
+            RED,
+        )
+        return 0.0
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Generate karaoke MP4 from slug/profile.")
-    p.add_argument("--slug", required=True, help="Song slug, e.g. californication")
+    p = argparse.ArgumentParser(
+        description="Karaoke pipeline master (1=txt/mp3, 2=stems, 3=timing, 4=mp4)."
+    )
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--query", type=str, help="Search query for step 1 (1_txt_mp3)")
+    src.add_argument("--slug", type=str, help="Slug to operate on (e.g. californication)")
     p.add_argument(
         "--profile",
-        required=True,
-        choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
-        help="Mix profile name (matches WAV/MP3 name in mixes/).",
-    )
-    p.add_argument(
-        "--font-size",
-        type=int,
-        help="Subtitle font size (20–200). Default 120.",
-    )
-    p.add_argument(
-        "--font-name",
         type=str,
-        default="Helvetica",
-        help="Subtitle font name. Default Helvetica.",
+        default="karaoke",
+        choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
     )
+    p.add_argument("--model", type=str, default="htdemucs_6s", help="Demucs model name")
+    p.add_argument("--steps", type=str, help="Steps to run, e.g. 24 or 1234")
+    p.add_argument(
+        "--do",
+        type=str,
+        choices=["new", "remix", "retime", "mp4"],
+        help=(
+            "High-level action shortcut: "
+            "new=1+2+3+4 from query, "
+            "remix=2+4 from existing slug, "
+            "retime=3+4 from existing slug, "
+            "mp4=4 only."
+        ),
+    )
+    p.add_argument("--skip-ui", action="store_true", help="Non-interactive; use --steps / --do as-is")
     return p.parse_args(argv)
+
+
+def interactive_slug_and_steps(args):
+    slug = args.slug
+    t1 = 0.0
+
+    # If query is given and no slug, run step 1 first
+    if args.query and not slug:
+        log("MASTER", f'Running step 1 (1_txt_mp3) for query "{args.query}"', CYAN)
+        slug, t1 = run_step1_txt_mp3(args.query)
+
+    # If we still don't have a slug, try to infer last slug from latest meta/mp3
+    last_slug = None
+    if not slug:
+        try:
+            last_slug = detect_slug_from_latest_mp3()
+        except Exception:
+            last_slug = None
+
+    if not slug:
+        if last_slug:
+            prompt = (
+                f'Enter search query for step 1 '
+                f'(or ENTER to reuse last slug "{last_slug}"): '
+            )
+        else:
+            prompt = "Enter search query for step 1 (or leave blank to use existing slug): "
+
+        try:
+            q = input(prompt).strip()
+        except EOFError:
+            q = ""
+
+        if q:
+            log("MASTER", f'Running step 1 (1_txt_mp3) for query "{q}"', CYAN)
+            slug, t1 = run_step1_txt_mp3(q)
+        else:
+            if last_slug:
+                slug = last_slug
+            else:
+                try:
+                    slug = input("Enter existing slug (e.g. californication): ").strip()
+                except EOFError:
+                    slug = ""
+                if not slug:
+                    raise SystemExit("Slug is required if no query is given.")
+
+    slug = slugify(slug)
+    status = detect_assets(slug, args.profile)
+    print_asset_status(slug, args.profile, status)
+
+    suggested = suggest_steps(status)
+    try:
+        s = input(
+            f"Steps to run (1=txt/mp3,2=stems,3=timing,4=mp4, 0=none, ENTER for suggested={suggested}): "
+        ).strip()
+    except EOFError:
+        s = ""
+    if not s:
+        s = suggested
+    if s == "0":
+        log("MASTER", "Nothing selected; exiting.", YELLOW)
+        return slug, [], t1
+
+    steps = parse_steps_string(s)
+    if 1 in steps and not args.query:
+        try:
+            q = input("Step 1 selected. Enter search query for 1_txt_mp3: ").strip()
+        except EOFError:
+            q = ""
+        if not q:
+            log("MASTER", "No query provided; dropping step 1.", YELLOW)
+            steps.remove(1)
+        else:
+            args.query = q
+
+    return slug, steps, t1
+
+
+def noninteractive_slug_and_steps(args):
+    if not args.steps:
+        raise SystemExit("--skip-ui requires --steps like 24 or 1234.")
+    steps = parse_steps_string(args.steps)
+    if not steps:
+        return "", []
+
+    slug = args.slug
+    if 1 in steps:
+        if not args.query:
+            raise SystemExit("Step 1 selected but no --query given.")
+        slug, _ = run_step1_txt_mp3(args.query)
+
+    if not slug:
+        raise SystemExit("Slug is required for steps 2–4 (use --slug or include step 1 with --query).")
+
+    slug = slugify(slug)
+    return slug, steps
 
 
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
-    slug = slugify(args.slug)
-    profile = args.profile
+    total_start = time.perf_counter()
 
-    default_font_size = DEFAULT_UI_FONT_SIZE
-    font_size_value = args.font_size
+    # High-level shortcuts: --do
+    if args.do:
+        if args.do == "new":
+            if not args.query:
+                raise SystemExit("--do new requires --query.")
+            args.steps = "1234"
+        elif args.do == "remix":
+            if not args.slug:
+                raise SystemExit("--do remix requires --slug.")
+            args.steps = "24"
+        elif args.do == "retime":
+            if not args.slug:
+                raise SystemExit("--do retime requires --slug.")
+            args.steps = "34"
+        elif args.do == "mp4":
+            if not args.slug:
+                raise SystemExit("--do mp4 requires --slug.")
+            args.steps = "4"
 
-    if font_size_value is None:
-        if sys.stdin.isatty():
-            try:
-                resp = input(
-                    f"Subtitle font size [20–200, default {default_font_size}]: "
-                ).strip()
-            except EOFError:
-                resp = ""
-            if not resp:
-                font_size_value = default_font_size
-            else:
-                try:
-                    v = int(resp)
-                    if 20 <= v <= 200:
-                        font_size_value = v
-                    else:
-                        print(
-                            f"Value {v} out of range; using default {default_font_size}"
-                        )
-                        font_size_value = default_font_size
-                except ValueError:
-                    print(
-                        f"Invalid integer; using default font size {default_font_size}"
-                    )
-                    font_size_value = default_font_size
-        else:
-            font_size_value = default_font_size
+        # When using --do, run non-interactively by default.
+        args.skip_ui = True
 
-    ui_font_size = max(20, min(200, font_size_value))
-    ass_font_size = int(ui_font_size * ASS_FONT_MULTIPLIER)
-    log(
-        "FONT",
-        f"Using UI font size {ui_font_size} (ASS Fontsize={ass_font_size})",
-        CYAN,
-    )
+    if args.skip_ui:
+        slug, steps = noninteractive_slug_and_steps(args)
+        t1 = 0.0
+    else:
+        slug, steps, t1 = interactive_slug_and_steps(args)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if not steps:
+        return
 
-    log("MP4GEN", f"Slug={slug}, profile={profile}", CYAN)
+    log("MASTER", f"Running steps {steps} for slug={slug}, profile={args.profile}", CYAN)
 
-    audio_path = choose_audio(slug, profile)
-    audio_duration = probe_audio_duration(audio_path)
-    if audio_duration <= 0:
-        log("DUR", f"Audio duration unknown or zero for {audio_path}", YELLOW)
+    t2 = t3 = t4 = 0.0
 
-    artist, title = read_meta(slug)
-    timings = read_timings(slug)
-    log("META", f'Artist="{artist}", Title="{title}", entries={len(timings)}', CYAN)
+    if 1 in steps and not args.skip_ui and t1 == 0.0:
+        if not args.query:
+            raise SystemExit("Interactive step 1 requires a query.")
+        slug, t1 = run_step1_txt_mp3(args.query)
 
-    ass_path = build_ass(
-        slug, artist, title, timings, audio_duration, args.font_name, ass_font_size
-    )
+    if 2 in steps:
+        t2 = run_step2_stems(slug, args.profile, args.model, interactive=not args.skip_ui)
 
-    out_mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
+    if 3 in steps:
+        t3 = run_step3_timing(slug)
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30:d={max(audio_duration, 1.0)}",
-        "-i",
-        str(audio_path),
-        "-vf",
-        f"subtitles={ass_path}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        "18",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-shortest",
-        str(out_mp4),
-    ]
+    if 4 in steps:
+        t4 = run_step4_mp4(slug, args.profile)
 
-    log("FFMPEG", " ".join(cmd), BLUE)
-    t0 = time.perf_counter()
-    subprocess.run(cmd, check=True)
-    t1 = time.perf_counter()
-    log("MP4", f"Wrote MP4 to {out_mp4} in {t1 - t0:6.2f} s", GREEN)
+    total_end = time.perf_counter()
+    total = total_end - total_start
 
     print()
-    print(f"{BOLD}{BLUE}MP4 generation complete:{RESET} {out_mp4}")
-    print("What would you like to open?")
-    print("  1 = output directory")
-    print("  2 = MP4 file")
-    print("  3 = both (dir then MP4)")
-    print("  0 = none")
-
-    try:
-        choice = input("Choice [0–3]: ").strip()
-    except EOFError:
-        choice = "0"
-
-    if choice == "1":
-        open_path(OUTPUT_DIR)
-    elif choice == "2":
-        open_path(out_mp4)
-    elif choice == "3":
-        open_path(OUTPUT_DIR)
-        open_path(out_mp4)
-    else:
-        log("OPEN", "No open action selected.", YELLOW)
+    print(f"{BOLD}{BLUE}========= PIPELINE SUMMARY ({slug}, profile={args.profile}) ========={RESET}")
+    print(f"{CYAN}Step 1 txt/mp3:  {fmt_secs_mmss(t1)}{RESET}")
+    print(f"{CYAN}Step 2 stems:    {fmt_secs_mmss(t2)}{RESET}")
+    print(f"{CYAN}Step 3 timing:   {fmt_secs_mmss(t3)}{RESET}")
+    print(f"{CYAN}Step 4 mp4:      {fmt_secs_mmss(t4)}{RESET}")
+    print(f"{BOLD}{GREEN}Total pipeline: {fmt_secs_mmss(total)}{RESET}")
+    print(f"{BOLD}{BLUE}====================================================={RESET}")
 
 
 if __name__ == "__main__":
     main()
 
-# end of 4_mp4.py
+# end of 0_master.py
