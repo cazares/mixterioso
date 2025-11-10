@@ -12,6 +12,7 @@ Steps:
 
 import sys
 import argparse
+import csv
 import subprocess
 from pathlib import Path
 from rich.console import Console
@@ -38,43 +39,56 @@ SCRIPT_MAP = {
 MP3_DIR = PROJECT_ROOT / "mp3s"
 TXT_DIR = PROJECT_ROOT / "txts"
 STEMS_DIR = PROJECT_ROOT / "stems"
-TIMING_DIR = PROJECT_ROOT / "timings"   # CSV from 3time.py
-OFFSET_DIR = PROJECT_ROOT / "offsets"   # JSON from 4calibrate.py
-MP4_DIR = PROJECT_ROOT / "mp4s"         # final videos from 5gen_mp4.py
-META_DIR = PROJECT_ROOT / "meta"        # meta/<slug>.json from 1download.py
+TIMING_DIR = PROJECT_ROOT / "timings"
+OFFSET_DIR = PROJECT_ROOT / "offsets"
+MP4_DIR = PROJECT_ROOT / "mp4s"
 
 
-def infer_slug_from_input(input_str: str) -> str:
-    """Infer a slug from a YouTube URL or generic string."""
-    import urllib.parse
+def infer_slug_from_input(input_str: str | None) -> str | None:
+    """
+    Best-effort slug inference.
+
+    - If the user passed a YouTube URL, we don't actually parse it; we rely on
+      1download.py to decide the slug, and we use detect_slug_from_disk later.
+    - If it looks like a bare slug (no spaces, no 'http'), we return it.
+    - Otherwise, None for now.
+    """
+    if not input_str:
+        return None
 
     s = input_str.strip()
-    # YouTube watch URL
-    if "youtube.com" in s and "v=" in s:
-        parsed = urllib.parse.urlparse(s)
-        qs = urllib.parse.parse_qs(parsed.query)
-        vid = qs.get("v", [""])[0]
-        if vid:
-            s = vid
-    # youtu.be short URL
-    elif "youtu.be/" in s:
-        s = s.rstrip("/").split("/")[-1]
+    if not s:
+        return None
 
-    slug = "".join(c for c in s.lower() if c.isalnum() or c in "-_").strip("_-")
-    return slug[:64] or "song"
+    lower = s.lower()
+    if lower.startswith("http://") or lower.startswith("https://"):
+        return None
+
+    if " " not in s and "/" not in s:
+        return s
+
+    return None
 
 
 def detect_slug_from_disk() -> str | None:
     """
-    Detect the most recent slug based on meta/*.json or mp3s/*.mp3.
-
-    Used after step 1 so later steps use the real slug that 1download.py chose,
-    and as a "last used slug" when starting without arguments.
+    Try to guess a slug based on files in mp3s/txts, favoring latest modified.
     """
-    if META_DIR.exists():
-        metas = sorted(META_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
-        if metas:
-            return metas[-1].stem
+    candidates = set()
+
+    if MP3_DIR.exists():
+        for mp3 in MP3_DIR.glob("*.mp3"):
+            candidates.add(mp3.stem)
+
+    if TXT_DIR.exists():
+        for txt in TXT_DIR.glob("*.txt"):
+            candidates.add(txt.stem)
+
+    if not candidates:
+        return None
+
+    if len(candidates) == 1:
+        return next(iter(candidates))
 
     if MP3_DIR.exists():
         mp3s = sorted(MP3_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
@@ -109,6 +123,29 @@ def step_done(step: int, slug: str | None) -> bool:
     return False
 
 
+def timings_has_rows(slug: str | None) -> bool:
+    """Return True if timings/<slug>.csv exists and has at least one data row."""
+    if not slug:
+        return False
+    timing_path = TIMING_DIR / f"{slug}.csv"
+    if not timing_path.exists():
+        return False
+    try:
+        with timing_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            # Skip header
+            try:
+                next(reader)
+            except StopIteration:
+                return False
+            # Check if there is at least one data row
+            for _ in reader:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def run_step(step: int, arg: str | None) -> int:
     """
     Run the script for a given step.
@@ -127,32 +164,20 @@ def run_step(step: int, arg: str | None) -> int:
         console.print(f"[red]Script not found:[/] {script_path}")
         return 1
 
-    # Special handling: for step 5, always force regeneration by deleting existing MP4.
-    if step == 5 and arg:
+    if step == 3 and arg:
         slug = arg.strip()
-        if slug:
-            mp4_path = MP4_DIR / f"{slug}.mp4"
-            if mp4_path.exists():
-                try:
-                    console.print(
-                        f"[yellow][MP4] Removing existing file to regenerate:[/] {mp4_path}"
-                    )
-                    mp4_path.unlink()
-                except OSError as e:
-                    console.print(
-                        f"[red][MP4] Failed to delete existing MP4 ({mp4_path}): {e}[/red]"
-                    )
-                    # Still continue; 5gen_mp4.py may choose to overwrite.
-
-    if step == 3:
-        slug = (arg or "").strip()
-        if not slug:
-            console.print("[red]Step 3 requires a slug but none was provided.[/red]")
-            return 1
-
         txt_path = TXT_DIR / f"{slug}.txt"
         audio_path = MP3_DIR / f"{slug}.mp3"
         timings_path = TIMING_DIR / f"{slug}.csv"
+
+        if not txt_path.exists():
+            console.print(f"[red]Missing lyrics txt:[/] {txt_path}")
+            return 1
+        if not audio_path.exists():
+            console.print(f"[red]Missing audio mp3:[/] {audio_path}")
+            return 1
+
+        TIMING_DIR.mkdir(parents=True, exist_ok=True)
 
         cmd = [
             sys.executable,
@@ -192,11 +217,17 @@ def auto_pipeline(url: str) -> None:
             console.print("[yellow]Pipeline aborted by user.[/yellow]")
             return
         if code != 0:
-            console.print(
-                f"[red]Step {step} failed with code {code}. Stopping.[/red]"
-            )
-            sys.exit(code)
-        console.print(f"[green]Step {step} OK.[/green]")
+            if step == 3 and timings_has_rows(slug):
+                console.print(
+                    "[yellow]Step 3 returned non-zero but timings CSV exists; continuing with saved timings.[/yellow]"
+                )
+            else:
+                console.print(
+                    f"[red]Step {step} failed with code {code}. Stopping.[/red]"
+                )
+                sys.exit(code)
+        else:
+            console.print(f"[green]Step {step} OK.[/green]")
 
         if step == 1 and code == 0:
             detected = detect_slug_from_disk()
@@ -225,6 +256,11 @@ def auto_pipeline_existing_slug(slug: str) -> None:
             console.print("[yellow]Pipeline aborted by user.[/yellow]")
             return
         if code != 0:
+            if step == 3 and timings_has_rows(slug):
+                console.print(
+                    "[yellow]Step 3 returned non-zero but timings CSV exists; continuing with saved timings.[/yellow]"
+                )
+                continue
             console.print(
                 f"[red]Step {step} failed with code {code}. Stopping.[/red]"
             )
@@ -270,122 +306,110 @@ def manual_menu(url_or_slug: str | None) -> None:
         )
         table.add_row(
             "4", SCRIPT_MAP[4], status_map[4],
-            "Offset calibration (curses → offsets JSON)",
+            "Calibration (offset JSON)",
         )
         table.add_row(
             "5", SCRIPT_MAP[5], status_map[5],
-            "Final MP4 generation (ffmpeg, uses offset)",
+            "Final MP4 generation",
         )
 
         console.print()
         console.print(table)
         console.print(
-            "[bold white]Choose step [1–5], 'a' for all 1–5, or 'q' to quit:[/] ",
+            "[bold white]"
+            "Select step to run "
+            "(1–5), or 'a' for auto 1→5, 'r' to infer slug, "
+            "'q' to quit:[/] ",
             end="",
         )
         choice = sys.stdin.readline().strip().lower()
 
         if choice == "q":
-            console.print("[green]Exiting manual mode.[/green]")
+            console.print("[yellow]Exiting.[/yellow]")
             return
-
-        if choice == "a":
-            if not url:
+        elif choice == "a":
+            if not url and not slug:
                 console.print(
-                    "[bold white]Audio+lyrics: YouTube url / search:[/] ",
-                    end="",
+                    "[red]Auto mode requires either a query/URL or a known slug.[/red]"
                 )
-                url = sys.stdin.readline().strip()
-            if not url:
-                console.print("[red]No input provided. Aborting.[/red]")
-                return
-            slug = infer_slug_from_input(url)
-
-            # Run all 5 steps, no skip-done optimization
-            for step in range(1, 6):
-                arg = url if step == 1 else slug
-                code = run_step(step, arg)
-                if code == ABORT_CODE:
-                    console.print("[yellow]User aborted. Returning to menu.[/yellow]")
-                    break
-                if code != 0:
-                    console.print(
-                        f"[red]Step {step} failed (code {code}). Returning to menu.[/red]"
-                    )
-                    break
-                if step == 1 and code == 0:
-                    detected = detect_slug_from_disk()
-                    if detected:
-                        console.print(
-                            f"[cyan]Detected slug from assets: [magenta]{detected}[/magenta][/cyan]"
-                        )
-                        slug = detected
+                continue
+            if not url and slug:
+                auto_pipeline_existing_slug(slug)
+            else:
+                auto_pipeline(url)
+            continue
+        elif choice == "r":
+            new_slug = detect_slug_from_disk()
+            if new_slug:
+                console.print(
+                    f"[green]Detected slug from disk: [magenta]{new_slug}[/magenta][/green]"
+                )
+                slug = new_slug
+                url = slug
+            else:
+                console.print("[yellow]Could not detect slug from disk.[/yellow]")
             continue
 
-        if choice not in {"1", "2", "3", "4", "5"}:
-            console.print("[yellow]Invalid choice.[/yellow]")
+        try:
+            step = int(choice)
+        except ValueError:
+            console.print("[red]Invalid choice.[/red]")
             continue
 
-        step = int(choice)
+        if step not in SCRIPT_MAP:
+            console.print("[red]Invalid step number.[/red]")
+            continue
 
         if step == 1:
             console.print(
-                "[bold white]Audio+lyrics: YouTube url / search:[/] ",
+                "[bold white]Enter query / YouTube URL for step 1:[/] ",
                 end="",
             )
-            url = sys.stdin.readline().strip()
-            arg = url
+            new_input = sys.stdin.readline().strip()
+            if not new_input:
+                console.print("[yellow]No input given.[/yellow]")
+                continue
+            url = new_input
+            slug = infer_slug_from_input(url)
         else:
             if not slug:
                 console.print(
-                    "[bold white]Enter slug (e.g. under_the_bridge):[/] ",
-                    end="",
+                    "[red]No slug known yet. Run step 1 first or infer from disk (r).[/red]"
                 )
-                slug = sys.stdin.readline().strip()
-            arg = slug
-
-        if step_done(step, slug):
-            console.print(
-                f"[yellow]Step {step} already DONE. Re-run anyway? [y/N]:[/] ",
-                end="",
-            )
-            ans = sys.stdin.readline().strip().lower()
-            if ans not in ("y", "yes"):
                 continue
 
-        code = run_step(step, arg)
+        code = run_step(step, url if step == 1 else slug)
         if code == ABORT_CODE:
-            console.print("[yellow]User aborted step.[/yellow]")
+            console.print("[yellow]Step aborted by user.[/yellow]")
         elif code != 0:
-            console.print(f"[red]Step {step} failed (code {code}).[/red]")
+            console.print(
+                f"[red]Step {step} exited with code {code}.[/red]"
+            )
         else:
-            console.print(f"[green]Step {step} completed.[/green]")
-
-        if step == 1 and code == 0:
-            detected = detect_slug_from_disk()
-            if detected:
-                console.print(
-                    f"[cyan]Detected slug from assets: [magenta]{detected}[/magenta][/cyan]"
-                )
-                slug = detected
+            console.print(f"[green]Step {step} completed successfully.[/green]")
 
 
-def main() -> None:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Karaoke pipeline master script (0master.py)."
+        description="Karaoke pipeline master orchestrator."
     )
     parser.add_argument(
         "input",
         nargs="?",
-        help="Initial query / YT URL / slug (optional).",
+        help="YouTube URL, search query, or slug. "
+             "If omitted, will try to reuse last slug.",
     )
     parser.add_argument(
         "--manual",
-        "-m",
         action="store_true",
         help="Force interactive manual mode (menu).",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    return args
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv or sys.argv[1:])
 
     url_or_slug = args.input
     last_slug = detect_slug_from_disk()
@@ -404,18 +428,14 @@ def main() -> None:
                 if entered:
                     url_or_slug = entered
                 else:
+                    url_or_slug = last_slug
                     reuse_last = True
             else:
                 console.print(
-                    "[bold white]Audio+lyrics: YouTube url / search:[/] ",
-                    end="...",
+                    "[bold white]Audio+lyrics: YouTube search or slug:[/] ",
+                    end="",
                 )
-                sys.stdout.flush()
-                console.print("\r[bold white]Audio+lyrics: YouTube url / search:[/] ", end="")
                 url_or_slug = sys.stdin.readline().strip()
-                if not url_or_slug:
-                    console.print("[yellow]No input provided. Exiting.[/yellow]")
-                    return
 
         if reuse_last and last_slug:
             console.print(

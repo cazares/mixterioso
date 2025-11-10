@@ -34,27 +34,12 @@ BORDER_W = 2
 
 # Durations
 LYRIC_DURATION = 2.5   # seconds each lyric line is on screen
-NOTE_DURATION = 1.5    # seconds for glyph events
-INTRO_MIN_DURATION = 3.0  # minimum intro duration if first event is very late
+NOTE_DURATION = 2.0    # seconds each note glyph is on screen
+INTRO_MIN_DURATION = 3.0  # minimum intro screen duration
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
-
-
-def fmt_time(sec: float) -> str:
-    sec = max(0.0, sec)
-    m = int(sec // 60)
-    rem = sec - m * 60
-    s = int(rem)
-    ms = int(round((rem - s) * 1000))
-    if ms == 1000:
-        s += 1
-        ms = 0
-    if s == 60:
-        m += 1
-        s = 0
-    return f"{m:02d}:{s:02d}.{ms:03d}"
 
 
 def ffprobe_duration(audio_path: Path) -> float:
@@ -78,27 +63,32 @@ def ffprobe_duration(audio_path: Path) -> float:
 def load_timings(slug: str) -> tuple[list[dict], Path]:
     timing_path = TIMING_DIR / f"{slug}.csv"
     if not timing_path.exists():
-        log("MP4", f"Timings CSV not found: {timing_path}", RED)
-        sys.exit(1)
+        raise SystemExit(f"Timing CSV not found: {timing_path}")
 
     events: list[dict] = []
-    with timing_path.open("r", encoding="utf-8") as f:
+    with timing_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
+                idx = int(row["line_index"])
                 t = float(row["time_secs"])
-            except (KeyError, ValueError):
+                text = row["text"]
+            except (KeyError, ValueError) as e:
+                log("CSV", f"Skipping row due to parse error: {row} ({e})", YELLOW)
                 continue
-            text = row.get("text", "")
-            try:
-                idx = int(row.get("line_index", -1) or -1)
-            except ValueError:
-                idx = -1
-            events.append({"time": t, "text": text, "line_index": idx})
-    events.sort(key=lambda e: e["time"])
+            events.append(
+                {
+                    "index": idx,
+                    "time": t,
+                    "text": text,
+                }
+            )
+
     if not events:
-        log("MP4", f"No timing rows in {timing_path}", RED)
-        sys.exit(1)
+        raise SystemExit(f"No events loaded from {timing_path}")
+
+    # Sort by time_secs
+    events.sort(key=lambda e: e["time"])
     return events, timing_path
 
 
@@ -134,10 +124,13 @@ def load_title(slug: str) -> str:
         try:
             data = json.loads(meta_path.read_text(encoding="utf-8"))
             artist = data.get("artist") or ""
-            title = data.get("title") or slug
-            if artist:
+            title = data.get("title") or ""
+            if artist and title:
                 return f"{artist} – {title}"
-            return title
+            if title:
+                return title
+            if artist:
+                return artist
         except Exception:
             pass
     # Fallback: nice slug
@@ -153,6 +146,8 @@ def escape_drawtext_text(s: str) -> str:
     s = s.replace(":", "\\:")
     s = s.replace(",", "\\,")
     s = s.replace("'", "\\'")
+    s = s.replace("%", "\\%")
+    s = s.replace("\n", "\\n")
     return s
 
 
@@ -160,28 +155,39 @@ def build_drawtext_filter(
     text: str,
     start: float,
     end: float,
-    is_note: bool = False,
+    is_note: bool,
 ) -> str:
+    """
+    Construct a single drawtext filter string with proper escaping.
+    """
     esc = escape_drawtext_text(text)
+
+    y_expr = NOTE_Y if is_note else LYRIC_Y
     fontsize = NOTE_FONT_SIZE if is_note else LYRIC_FONT_SIZE
-    y_pos = NOTE_Y if is_note else LYRIC_Y
+
     return (
         f"drawtext=fontfile='{FONTFILE}':"
         f"text=\"{esc}\":"
-        f"fontsize={fontsize}:"
-        f"fontcolor=white:"
-        f"bordercolor={BORDER_COLOR}:"
-        f"borderw={BORDER_W}:"
-        f"x=(w-text_w)/2:"
-        f"y={y_pos}:"
+        f"x=(w-text_w)/2:y={y_expr}:"
+        f"fontsize={fontsize}:fontcolor=white:"
+        f"borderw={BORDER_W}:bordercolor={BORDER_COLOR}:"
         f"enable='between(t,{start:.3f},{end:.3f})'"
     )
 
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Generate final MP4 with lyrics (step 5).")
-    p.add_argument("slug", help="Song slug, e.g. under_the_bridge")
-    return p.parse_args(argv)
+def fmt_time(t: float) -> str:
+    return f"{t:.3f}s"
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate final MP4 from mp3 + timings CSV + offset JSON."
+    )
+    parser.add_argument(
+        "slug",
+        help="Slug name (base name for mp3/timings/meta/offset/mp4).",
+    )
+    return parser.parse_args(argv or sys.argv[1:])
 
 
 def main(argv=None):
@@ -198,9 +204,12 @@ def main(argv=None):
     MP4_DIR.mkdir(parents=True, exist_ok=True)
     out_path = MP4_DIR / f"{slug}.mp4"
 
-    # Load timings and offset
+    # Load inputs
     events, timing_path = load_timings(slug)
-    offset, _ = load_offset(slug)
+    offset, offset_path = load_offset(slug)
+
+    log("MP4", f"Using timing CSV: {timing_path}", CYAN)
+    log("MP4", f"Using offset JSON: {offset_path}", CYAN)
 
     # Audio duration
     duration = ffprobe_duration(mp3_path)
@@ -214,6 +223,8 @@ def main(argv=None):
     if first_event_time < 0.0:
         first_event_time = 0.0
     intro_end = max(first_event_time, INTRO_MIN_DURATION)
+    if intro_end > duration:
+        intro_end = duration
 
     filters: list[str] = []
 
@@ -235,13 +246,15 @@ def main(argv=None):
         else:
             start = base_t
 
-        is_note = ev["line_index"] < 0
-        dur = NOTE_DURATION if is_note else LYRIC_DURATION
-        end = start + dur
+        if ev["index"] < 0:
+            is_note = True
+            nominal_end = start + NOTE_DURATION
+        else:
+            is_note = False
+            nominal_end = start + LYRIC_DURATION
 
-        # Clamp to audio duration
-        if start >= duration:
-            continue
+        # Clamp end to duration
+        end = nominal_end
         if end > duration:
             end = duration
 
@@ -275,10 +288,9 @@ def main(argv=None):
         "-filter_complex",
         filter_complex,
         "-map",
-        "0:v:0",
+        "0:v",
         "-map",
-        "1:a:0",
-        "-shortest",
+        "1:a",
         "-c:v",
         "libx264",
         "-preset",
