@@ -37,7 +37,7 @@ VERTICAL_OFFSET_FRACTION = 0.0
 # Extra nudge for the title line relative to the main line (fraction of top band).
 TITLE_EXTRA_OFFSET_FRACTION = -0.20
 
-# Fraction from top of bottom band to "up next" line.
+# Fraction from top of bottom band to "up next" line (no longer used for y_next).
 BOTTOM_TEXT_TOP_PADDING_FRACTION = 0.20
 
 # Size of up-next font relative to main lyrics.
@@ -230,7 +230,9 @@ def build_ass(
 
     x_center = playresx // 2
     y_center_full = playresy // 2
-    y_next = y_divider + int(bottom_band_height * BOTTOM_TEXT_TOP_PADDING_FRACTION)
+
+    # Center next-lyric baseline within bottom band so spacing to divider and bottom is equal.
+    y_next = y_divider + bottom_band_height // 2
 
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
     margin_v = 0
@@ -331,10 +333,11 @@ def build_ass(
             )
         )
 
-    # Divider line across the screen at y_divider, only while lyrics are active.
+    # Thin horizontal divider between current lyric region and next-lyric region,
+    # same white and opacity as next-lyric text, 10px tall, only while lyrics are active.
     divider_text = (
-        f"{{\\an7\\pos(0,{y_divider})\\p1\\1a&H{NEXT_LINE_ALPHA_HEX}&\\bord1}}"
-        f"m 0 0 l {playresx} 0{{\\p0}}"
+        f"{{\\an7\\pos(0,{y_divider})\\p1\\1a&H{NEXT_LINE_ALPHA_HEX}&}}"
+        f"m 0 0 l {playresx} 0 l {playresx} 10 l 0 10{{\\p0}}"
     )
     events.append(
         "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(

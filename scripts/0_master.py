@@ -54,7 +54,6 @@ def run(cmd: list[str], section: str) -> float:
     t1 = time.perf_counter()
     return t1 - t0
 
-
 def detect_slug_from_latest_mp3() -> str:
     """
     Infer the most recent slug produced by step 1.
