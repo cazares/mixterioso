@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import json
 import subprocess
 import sys
@@ -67,7 +68,7 @@ VERTICAL_OFFSET_FRACTION = 0.0
 TITLE_EXTRA_OFFSET_FRACTION = -0.20
 
 # How big the next-lyric text is relative to the main lyric text.
-#  0.50 = 50% of the main font size.
+#  0.35 = 35% of the main font size.
 NEXT_LINE_FONT_SCALE = 0.35
 
 # How big the "Next:" label text is relative to the main lyric text.
@@ -158,22 +159,21 @@ def seconds_to_ass_time(sec: float) -> str:
     # ASS time format: H:MM:SS.cs (centiseconds)
     if sec < 0:
         sec = 0.0
-
-    # Work entirely in integer centiseconds to avoid rounding issues.
     total_cs = int(round(sec * 100))
     if total_cs < 0:
         total_cs = 0
-
     total_seconds, cs = divmod(total_cs, 100)
     h, rem = divmod(total_seconds, 3600)
     m, s = divmod(rem, 60)
-
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
 def rgb_to_bgr(rrggbb: str) -> str:
     """
     Convert an RRGGBB hex string into BGR order as required by ASS (&HAABBGGRR).
+    Example:
+        "FFFFFF" -> "FFFFFF"
+        "FF0000" -> "0000FF"
     """
     s = (rrggbb or "").strip().lstrip("#")
     s = s.zfill(6)[-6:]
@@ -185,27 +185,30 @@ def rgb_to_bgr(rrggbb: str) -> str:
 
 def is_music_only(text: str) -> bool:
     """
-    Heuristic: True if the line is basically music notes / instrumental.
+    Heuristic for lines that are "music only" (notes, emoji, or keywords).
+    Used to center the line and hide the bottom rectangle.
     """
     if not text:
         return False
     stripped = text.strip()
-    lower = stripped.lower()
+    if not stripped:
+        return False
 
+    # Explicit music-note characters.
+    if any(ch in MUSIC_NOTE_CHARS for ch in stripped):
+        return True
+
+    # Only symbols / emoji, no alphanumerics.
+    if not any(ch.isalnum() for ch in stripped):
+        return True
+
+    # Keyword-based detection.
+    lower = stripped.lower()
     for kw in MUSIC_NOTE_KEYWORDS:
         if kw in lower:
             return True
 
-    contains_note_char = any(ch in stripped for ch in MUSIC_NOTE_CHARS)
-    if not contains_note_char:
-        return False
-
-    import re
-
-    cleaned = re.sub(r"[^\w]+", "", stripped)
-    for ch in MUSIC_NOTE_CHARS:
-        cleaned = cleaned.replace(ch, "")
-    return cleaned == ""
+    return False
 
 
 def read_meta(slug: str) -> tuple[str, str]:
@@ -222,25 +225,21 @@ def read_meta(slug: str) -> tuple[str, str]:
     return artist, title
 
 
-def read_timings(slug: str) -> list[tuple[float, str, int]]:
+def read_timings(slug: str):
     """
     Return list of (time_secs, text, line_index).
-
     Preferred CSV format:
         line_index,time_secs,text
-
     Fallback 2-column format:
-        time_secs,text   (line_index is treated as 0 = normal lyric)
+        time_secs,text   (line_index is treated as 0).
     """
     timing_path = TIMINGS_DIR / f"{slug}.csv"
     if not timing_path.exists():
         print(f"Timing CSV not found for slug={slug}: {timing_path}")
         sys.exit(1)
 
-    rows: list[tuple[float, str, int]] = []
+    rows = []
     with timing_path.open(newline="", encoding="utf-8") as f:
-        import csv
-
         reader = csv.reader(f)
         header = next(reader, None)
 
@@ -301,7 +300,6 @@ def read_timings(slug: str) -> list[tuple[float, str, int]]:
 def probe_audio_duration(path: Path) -> float:
     if not path.exists():
         return 0.0
-
     cmd = [
         "ffprobe",
         "-v",
@@ -325,7 +323,7 @@ def build_ass(
     slug: str,
     artist: str,
     title: str,
-    timings: list[tuple[float, str, int]],
+    timings,
     audio_duration: float,
     font_name: str,
     font_size_script: int,
@@ -343,22 +341,22 @@ def build_ass(
 
     # Geometry for top/bottom regions.
     top_band_height = int(playresy * TOP_BAND_FRACTION)
-    y_divider_nominal = top_band_height  # theoretical border between top and bottom boxes
+    y_divider_nominal = top_band_height
     bottom_band_height = playresy - y_divider_nominal
 
     # Vertical positions for the top region.
     center_top = top_band_height // 2
     offset_px = int(top_band_height * VERTICAL_OFFSET_FRACTION)
-    y_main_default = center_top + offset_px
-    y_title = y_main_default + int(top_band_height * TITLE_EXTRA_OFFSET_FRACTION)
+    y_main_top = center_top + offset_px
+    y_title = y_main_top + int(top_band_height * TITLE_EXTRA_OFFSET_FRACTION)
 
     x_center = playresx // 2
     y_center_full = playresy // 2
 
-    # Divider line vertical position.
+    # Divider line position.
     line_y = max(0, y_divider_nominal - DIVIDER_LINE_OFFSET_UP_PX)
 
-    # Next-lyric baseline position inside bottom box.
+    # Next-lyric baseline position.
     inner_bottom_box_height = max(
         1, bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX
     )
@@ -368,7 +366,7 @@ def build_ass(
         + inner_bottom_box_height // 2
     )
 
-    # Font sizes for next-lyric line and the "Next:" label.
+    # Font sizes.
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
     next_label_font = max(1, int(font_size_script * NEXT_LABEL_FONT_SCALE))
 
@@ -377,9 +375,8 @@ def build_ass(
     # Precomputed ASS color strings for top band.
     top_primary_ass = f"&H{TOP_LYRIC_TEXT_ALPHA_HEX}{rgb_to_bgr(TOP_LYRIC_TEXT_COLOR_RGB)}"
     top_back_ass = f"&H{TOP_BOX_BG_ALPHA_HEX}{rgb_to_bgr(TOP_BOX_BG_COLOR_RGB)}"
-    # Secondary, outline, etc.
-    secondary_ass = "&H000000FF"  # red (unused for now)
-    outline_ass = "&H00000000"    # black
+    secondary_ass = "&H000000FF"  # unchanged
+    outline_ass = "&H00000000"    # black outline
     back_ass = top_back_ass
 
     header_lines = [
@@ -414,17 +411,10 @@ def build_ass(
         text = text.replace("\n", r"\N")
         return text
 
-    def make_fad_tag() -> str:
-        if FADE_IN_MS <= 0 and FADE_OUT_MS <= 0:
-            return ""
-        return f"\\fad({int(max(0, FADE_IN_MS))},{int(max(0, FADE_OUT_MS))})"
+    events = []
 
-    fade_tag = make_fad_tag()
-
-    events: list[str] = []
-
-    # Normalize timings and filter out-of-range / empty lines.
-    unified: list[tuple[float, str, int]] = []
+    # Normalize timings and filter.
+    unified = []
     for t, text, line_index in timings:
         if t < 0 or (audio_duration and t > audio_duration):
             continue
@@ -437,7 +427,7 @@ def build_ass(
 
     offset = LYRICS_OFFSET_SECS
 
-    # If no timings, just show a centered title card for the whole song.
+    # If no timings, just show centered title card.
     if not unified:
         title_lines = []
         if title:
@@ -462,7 +452,7 @@ def build_ass(
 
     first_lyric_time = max(0.0, unified[0][0] + offset)
 
-    # Intro title / artist card, centered, with no lyrics / previews / divider.
+    # Intro title / artist card.
     title_lines = []
     if title:
         title_lines.append(title)
@@ -474,7 +464,6 @@ def build_ass(
             title_end = min(first_lyric_time, 5.0)
         else:
             title_end = first_lyric_time
-
         intro_block = "\\N".join(title_lines)
         events.append(
             "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
@@ -484,12 +473,29 @@ def build_ass(
             )
         )
 
-    # Build per-line events.
+    # Fade tag used for all per-line events.
+    fade_tag = ""
+    if FADE_IN_MS > 0 or FADE_OUT_MS > 0:
+        fade_tag = f"\\fad({int(FADE_IN_MS)},{int(FADE_OUT_MS)})"
+
     n = len(unified)
     next_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
     divider_color_bgr = rgb_to_bgr(DIVIDER_COLOR_RGB)
     next_label_color_bgr = rgb_to_bgr(NEXT_LABEL_COLOR_RGB)
 
+    divider_height = max(0.5, float(DIVIDER_HEIGHT_PX))
+    left_margin = float(DIVIDER_LEFT_MARGIN_PX)
+    right_margin = float(DIVIDER_RIGHT_MARGIN_PX)
+    x_left = left_margin
+    x_right = playresx - right_margin
+    if x_right <= x_left:
+        x_left = 0.0
+        x_right = float(playresx)
+
+    label_x = NEXT_LABEL_LEFT_MARGIN_PX
+    label_y = y_divider_nominal + NEXT_LABEL_TOP_MARGIN_PX
+
+    # Per-line events.
     for i, (t, raw_text, _line_index) in enumerate(unified):
         start = max(0.0, t + offset)
         if i < n - 1:
@@ -502,12 +508,13 @@ def build_ass(
         if end <= start:
             continue
 
-        is_music = is_music_only(raw_text)
+        text_stripped = raw_text.strip()
+        music_only = is_music_only(text_stripped)
 
-        # Main line (lyric or note).
-        y_main = y_center_full if is_music else y_main_default
-        main_text = ass_escape(raw_text)
-        main_tag = f"{{\\an5\\pos({x_center},{y_main}){fade_tag}}}"
+        # Main lyric line.
+        main_text = ass_escape(text_stripped)
+        y_for_line = y_center_full if music_only else y_main_top
+        main_tag = f"{{\\an5\\pos({x_center},{y_for_line}){fade_tag}}}"
         events.append(
             "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(start),
@@ -516,51 +523,28 @@ def build_ass(
             )
         )
 
-        # For last line or instrumental lines, hide the bottom UI entirely.
-        is_last = i == n - 1
-        if is_music or is_last:
+        # Decide whether to show bottom UI (divider, label, next-lyric preview).
+        if i >= n - 1:
+            continue  # last line: no "Next:" UI at all
+
+        next_raw = unified[i + 1][1]
+        if not next_raw:
             continue
 
-        # Preview text: next line, unless that line is "music-only".
-        preview_text_raw = unified[i + 1][1] if i < n - 1 else ""
-        if preview_text_raw and not is_music_only(preview_text_raw):
-            preview_text = ass_escape(preview_text_raw)
-            preview_tag = (
-                f"{{\\an5\\pos({x_center},{y_next})"
-                f"\\fs{preview_font}"
-                f"\\1c&H{next_color_bgr}&"
-                f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
-                f"{fade_tag}}}"
-            )
-            events.append(
-                "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
-                    start=seconds_to_ass_time(start),
-                    end=seconds_to_ass_time(end),
-                    text=preview_tag + preview_text,
-                )
-            )
+        # Do not show next UI if current or next is "music only".
+        if music_only or is_music_only(next_raw):
+            continue
 
-        # Divider line for this interval.
-        divider_height = max(0.5, float(DIVIDER_HEIGHT_PX))
-        left_margin = max(0.0, float(DIVIDER_LEFT_MARGIN_PX))
-        right_margin = max(0.0, float(DIVIDER_RIGHT_MARGIN_PX))
-        x_left = left_margin
-        x_right = playresx - right_margin
-        if x_right <= x_left:
-            x_left = 0.0
-            x_right = float(playresx)
-
+        # Divider line.
         divider_tag = (
             f"{{\\an7\\pos(0,{line_y})"
             f"\\1c&H{divider_color_bgr}&"
             f"\\1a&H{DIVIDER_ALPHA_HEX}&"
-            f"\\bord0\\shad0"
-            f"{fade_tag}"
-            f"\\p1}}"
+            f"\\bord0\\shad0{fade_tag}\\p1}}"
         )
         divider_shape = (
-            f"m {x_left} 0 l {x_right} 0 l {x_right} {divider_height} "
-            f"l {x_left} {divider_height}{{\\p0}}"
+            f"m {x_left} 0 l {x_right} 0 "
+            f"l {x_right} {divider_height} l {x_left} {divider_height}{{\\p0}}"
         )
         events.append(
             "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
@@ -570,9 +554,7 @@ def build_ass(
             )
         )
 
-        # "Next:" label in upper-left of bottom rectangle during this interval.
-        label_x = NEXT_LABEL_LEFT_MARGIN_PX
-        label_y = y_divider_nominal + NEXT_LABEL_TOP_MARGIN_PX
+        # "Next:" label.
         label_tag = (
             f"{{\\an7\\pos({label_x},{label_y})"
             f"\\fs{next_label_font}"
@@ -585,6 +567,23 @@ def build_ass(
                 start=seconds_to_ass_time(start),
                 end=seconds_to_ass_time(end),
                 text=label_tag + "Next:",
+            )
+        )
+
+        # Next-lyric preview text.
+        preview_text = ass_escape(next_raw)
+        preview_tag = (
+            f"{{\\an5\\pos({x_center},{y_next})"
+            f"\\fs{preview_font}"
+            f"\\1c&H{next_color_bgr}&"
+            f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
+            f"{fade_tag}}}"
+        )
+        events.append(
+            "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(start),
+                end=seconds_to_ass_time(end),
+                text=preview_tag + preview_text,
             )
         )
 
