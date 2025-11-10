@@ -35,3 +35,5 @@ lyrics/
 *.tsv
 *.vtt
 align_env/
+mix_done/
+covers/
