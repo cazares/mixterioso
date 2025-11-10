@@ -69,7 +69,7 @@ TITLE_EXTRA_OFFSET_FRACTION = -0.20
 
 # How big the next-lyric text is relative to the main lyric text.
 #  0.50 = 50% of the main font size.
-NEXT_LINE_FONT_SCALE = 0.3
+NEXT_LINE_FONT_SCALE = 0.35
 
 # How big the "Up next:" label text is relative to the main lyric text.
 # By default this is 40% of the next-lyric font scale, so it is smaller
@@ -79,7 +79,7 @@ UP_NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.45
 # Margins for the "Up next:" label within the bottom box. The label is
 # placed at the top-left corner of the bottom rectangle with these offsets.
 UP_NEXT_LABEL_TOP_MARGIN_PX = 10
-UP_NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX * 1.05
+UP_NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX + UP_NEXT_LABEL_TOP_MARGIN_PX
 
 # =============================================================================
 # COLOR AND OPACITY CONSTANTS
@@ -91,15 +91,15 @@ UP_NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX * 1.05
 
 # Global base text + line color for the *bottom* "next lyric" area and divider line.
 # This does NOT affect the top current-lyric text color; that has its own constant.
-GLOBAL_NEXT_COLOR_RGB = "EEEEEE"   # white
+GLOBAL_NEXT_COLOR_RGB = "FFFFFF"   # white
 
 # Global alpha for the next-lyric text.
-GLOBAL_NEXT_ALPHA_HEX = "14"       # semi-transparent text
+GLOBAL_NEXT_ALPHA_HEX = "4D"       # semi-transparent text
 
 # Divider line color and alpha. Defaults reuse the same color as the
 # next-lyric text but with an independently tweakable opacity.
 DIVIDER_COLOR_RGB = "FFFFFF"
-DIVIDER_ALPHA_HEX = "B3"           # semi-transparent divider
+DIVIDER_ALPHA_HEX = "80"           # semi-transparent divider
 
 # Top (current lyric) font color and alpha.
 TOP_LYRIC_TEXT_COLOR_RGB = "FFFFFF"    # white
@@ -117,8 +117,8 @@ TOP_BOX_BG_ALPHA_HEX = "00"           # 50% opaque back colour for top band
 
 # "Up next:" label color and alpha. Separate from GLOBAL_NEXT_* so you can
 # tweak the label independently if desired.
-UP_NEXT_LABEL_COLOR_RGB = "FFFFFF"    # white
-UP_NEXT_LABEL_ALPHA_HEX = "0D"        # semi-transparent label
+UP_NEXT_LABEL_COLOR_RGB = "FFFFFF"                # white
+UP_NEXT_LABEL_ALPHA_HEX = GLOBAL_NEXT_ALPHA_HEX   # semi-transparent label
 
 # Base UI font size in "points" (converted to ASS by a multiplier).
 DEFAULT_UI_FONT_SIZE = 120
