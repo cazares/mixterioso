@@ -81,13 +81,15 @@ def escape_drawtext_text(text: str) -> str:
     - backslash
     - colon
     - comma
-    - single quote
+    - double quote
+
+    We deliberately do NOT escape single quotes here since we wrap in double quotes.
     """
     s = text
     s = s.replace("\\", r"\\")
     s = s.replace(":", r"\:")
     s = s.replace(",", r"\,")
-    s = s.replace("'", r"\'")
+    s = s.replace('"', r'\"')
     return s
 
 
@@ -138,10 +140,11 @@ def build_filter_complex(events: list[dict], offset: float, fontfile: str) -> st
     for ev in events:
         t_base = ev["time"] + offset
         if t_base < 0:
-            # If shifted before t=0, clamp to 0 so it at least appears
+            # clamp to t=0 so it at least appears
             t_base = 0.0
 
-        text = escape_drawtext_text(ev["text"])
+        text_escaped = escape_drawtext_text(ev["text"])
+
         if ev["line_index"] < 0:
             # note / glyph event
             fontsize = NOTE_FONT_SIZE
@@ -155,9 +158,10 @@ def build_filter_complex(events: list[dict], offset: float, fontfile: str) -> st
         start = t_base
         end = t_base + duration
 
+        # text is wrapped in double quotes; enable expression uses single quotes
         piece = (
             f"drawtext=fontfile='{fontfile}':"
-            f"text='{text}':"
+            f'text="{text_escaped}":'
             f"fontsize={fontsize}:fontcolor=white:bordercolor=black:borderw=2:"
             f"x=(w-text_w)/2:y={y_expr}:"
             f"enable='between(t,{start:.3f},{end:.3f})'"
