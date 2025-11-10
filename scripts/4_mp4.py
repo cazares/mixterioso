@@ -80,10 +80,10 @@ NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.45
 NEXT_LABEL_TOP_MARGIN_PX = 10
 NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX + NEXT_LABEL_TOP_MARGIN_PX
 
-# Fade timing (milliseconds) applied to each lyric change for both the main
-# lyric and the preview lyric (and the bottom UI elements).
-FADE_IN_MS = 250
-FADE_OUT_MS = 250
+# Fade timing (milliseconds) applied to each lyric change.
+# Only used for the main lyric line and the preview ("next line") text.
+FADE_IN_MS = 125
+FADE_OUT_MS = 125
 
 # =============================================================================
 # COLOR AND OPACITY CONSTANTS
@@ -473,10 +473,10 @@ def build_ass(
             )
         )
 
-    # Fade tag used for all per-line events.
-    fade_tag = ""
+    # Fade tag for lyrics only (main and next-line text).
+    fade_tag_main = ""
     if FADE_IN_MS > 0 or FADE_OUT_MS > 0:
-        fade_tag = f"\\fad({int(FADE_IN_MS)},{int(FADE_OUT_MS)})"
+        fade_tag_main = f"\\fad({int(FADE_IN_MS)},{int(FADE_OUT_MS)})"
 
     n = len(unified)
     next_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
@@ -511,10 +511,10 @@ def build_ass(
         text_stripped = raw_text.strip()
         music_only = is_music_only(text_stripped)
 
-        # Main lyric line.
+        # Main lyric line (with fade).
         main_text = ass_escape(text_stripped)
         y_for_line = y_center_full if music_only else y_main_top
-        main_tag = f"{{\\an5\\pos({x_center},{y_for_line}){fade_tag}}}"
+        main_tag = f"{{\\an5\\pos({x_center},{y_for_line}){fade_tag_main}}}"
         events.append(
             "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(start),
@@ -535,12 +535,12 @@ def build_ass(
         if music_only or is_music_only(next_raw):
             continue
 
-        # Divider line.
+        # Divider line (no fade).
         divider_tag = (
             f"{{\\an7\\pos(0,{line_y})"
             f"\\1c&H{divider_color_bgr}&"
             f"\\1a&H{DIVIDER_ALPHA_HEX}&"
-            f"\\bord0\\shad0{fade_tag}\\p1}}"
+            f"\\bord0\\shad0\\p1}}"
         )
         divider_shape = (
             f"m {x_left} 0 l {x_right} 0 "
@@ -554,13 +554,12 @@ def build_ass(
             )
         )
 
-        # "Next:" label.
+        # "Next:" label (no fade).
         label_tag = (
             f"{{\\an7\\pos({label_x},{label_y})"
             f"\\fs{next_label_font}"
             f"\\1c&H{next_label_color_bgr}&"
-            f"\\1a&H{NEXT_LABEL_ALPHA_HEX}&"
-            f"{fade_tag}}}"
+            f"\\1a&H{NEXT_LABEL_ALPHA_HEX}&}}"
         )
         events.append(
             "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
@@ -570,14 +569,14 @@ def build_ass(
             )
         )
 
-        # Next-lyric preview text.
+        # Next-lyric preview text (with fade).
         preview_text = ass_escape(next_raw)
         preview_tag = (
             f"{{\\an5\\pos({x_center},{y_next})"
             f"\\fs{preview_font}"
             f"\\1c&H{next_color_bgr}&"
             f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
-            f"{fade_tag}}}"
+            f"{fade_tag_main}}}"
         )
         events.append(
             "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
