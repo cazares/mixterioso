@@ -57,8 +57,8 @@ DIVIDER_HEIGHT_PX = 0.01
 
 # Horizontal margins for the divider line, in pixels. These are measured
 # from the left/right edges of the video frame. Set to 0 for edge-to-edge.
-DIVIDER_LEFT_MARGIN_PX = 50.0
-DIVIDER_RIGHT_MARGIN_PX = 50.0
+DIVIDER_LEFT_MARGIN_PX = VIDEO_WIDTH * 0.035
+DIVIDER_RIGHT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX
 
 # Within the top band, you can nudge the main line up or down by changing
 # this fraction of the top-band height. Positive values move text DOWN.
@@ -74,12 +74,12 @@ NEXT_LINE_FONT_SCALE = 0.3
 # How big the "Up next:" label text is relative to the main lyric text.
 # By default this is 40% of the next-lyric font scale, so it is smaller
 # than the actual preview line.
-UP_NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.35
+UP_NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.45
 
 # Margins for the "Up next:" label within the bottom box. The label is
 # placed at the top-left corner of the bottom rectangle with these offsets.
 UP_NEXT_LABEL_TOP_MARGIN_PX = 10
-UP_NEXT_LABEL_LEFT_MARGIN_PX = 10
+UP_NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX * 1.05
 
 # =============================================================================
 # COLOR AND OPACITY CONSTANTS
@@ -91,15 +91,15 @@ UP_NEXT_LABEL_LEFT_MARGIN_PX = 10
 
 # Global base text + line color for the *bottom* "next lyric" area and divider line.
 # This does NOT affect the top current-lyric text color; that has its own constant.
-GLOBAL_NEXT_COLOR_RGB = "FFFFFF"   # white
+GLOBAL_NEXT_COLOR_RGB = "EEEEEE"   # white
 
 # Global alpha for the next-lyric text.
-GLOBAL_NEXT_ALPHA_HEX = "B3"       # semi-transparent text
+GLOBAL_NEXT_ALPHA_HEX = "14"       # semi-transparent text
 
 # Divider line color and alpha. Defaults reuse the same color as the
 # next-lyric text but with an independently tweakable opacity.
-DIVIDER_COLOR_RGB = GLOBAL_NEXT_COLOR_RGB
-DIVIDER_ALPHA_HEX = "01"           # semi-transparent divider
+DIVIDER_COLOR_RGB = "FFFFFF"
+DIVIDER_ALPHA_HEX = "B3"           # semi-transparent divider
 
 # Top (current lyric) font color and alpha.
 TOP_LYRIC_TEXT_COLOR_RGB = "FFFFFF"    # white
@@ -107,18 +107,18 @@ TOP_LYRIC_TEXT_ALPHA_HEX = "00"       # fully opaque
 
 # Background color for the bottom "next lyric" rectangle and its alpha.
 # Currently just a configuration hook; if you later draw a bottom bar, use both.
-BOTTOM_BOX_BG_COLOR_RGB = "0A0A0A"    # black
+BOTTOM_BOX_BG_COLOR_RGB = "000000"    # black
 BOTTOM_BOX_BG_ALPHA_HEX = "00"        # 50% opaque if/when used
 
 # Background color for the top "current lyric" rectangle and its alpha.
 # This drives the style's BackColour.
-TOP_BOX_BG_COLOR_RGB = "030303"       # black
+TOP_BOX_BG_COLOR_RGB = "000000"       # black
 TOP_BOX_BG_ALPHA_HEX = "00"           # 50% opaque back colour for top band
 
 # "Up next:" label color and alpha. Separate from GLOBAL_NEXT_* so you can
 # tweak the label independently if desired.
 UP_NEXT_LABEL_COLOR_RGB = "FFFFFF"    # white
-UP_NEXT_LABEL_ALPHA_HEX = "1A"        # semi-transparent label
+UP_NEXT_LABEL_ALPHA_HEX = "0D"        # semi-transparent label
 
 # Base UI font size in "points" (converted to ASS by a multiplier).
 DEFAULT_UI_FONT_SIZE = 120
