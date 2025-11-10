@@ -18,8 +18,8 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 BLUE = "\033[34m"
 
+# project root (this file is expected to live in e.g. project/experimental or project/scripts)
 BASE_DIR = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = BASE_DIR / "scripts"
 TXT_DIR = BASE_DIR / "txts"
 MP3_DIR = BASE_DIR / "mp3s"
 META_DIR = BASE_DIR / "meta"
@@ -160,10 +160,9 @@ def fetch_lyrics_musixmatch(
         log("MM", "Lyrics body missing in response.", YELLOW)
         return None, {"musixmatch_status": "no_lyrics"}
 
+    # Clean standard Musixmatch footer if present
     if "******* This Lyrics is NOT for Commercial use *******" in lyrics_text:
-        lyrics_text = lyrics_text.split(
-            "******* This Lyrics is NOT for Commercial use *******", 1
-        )[0].strip()
+        lyrics_text = lyrics_text.split("******* This Lyrics is NOT for Commercial use *******", 1)[0].strip()
 
     meta = {
         "artist": mm_artist or artist or "",
@@ -174,7 +173,10 @@ def fetch_lyrics_musixmatch(
 
 
 def youtube_search_first(query: str) -> tuple[str | None, str | None, str | None]:
-    """Return (title, uploader, url) for first YouTube result of the query."""
+    """
+    Return (title, uploader, url) for first YouTube result of the query,
+    or (None, None, None) if it fails.
+    """
     try:
         out = subprocess.check_output(
             ["yt-dlp", "-j", f"ytsearch1:{query}"],
@@ -217,6 +219,7 @@ def youtube_download_mp3(search_str: str, slug: str) -> tuple[str | None, str | 
         log("YT", f"yt-dlp audio download failed (exit {e.returncode}).", RED)
         return None, None
 
+    # Re-run a JSON-only search to capture metadata for meta.json
     yt_title, yt_uploader, _ = youtube_search_first(search_str)
     return yt_title, yt_uploader
 
@@ -231,6 +234,7 @@ def fetch_lyrics_with_fallbacks(
     Try Musixmatch (with Genius hints), then YouTube-derived metadata,
     then return placeholder lyrics if still nothing.
     """
+    # 1) Musixmatch using Genius hints
     lyrics, meta = fetch_lyrics_musixmatch(query, genius_artist, genius_title, mm_api_key)
     if lyrics and lyrics.strip():
         meta.setdefault("artist", genius_artist or meta.get("artist") or "")
@@ -238,6 +242,7 @@ def fetch_lyrics_with_fallbacks(
         meta["lyrics_source"] = "musixmatch_genius"
         return lyrics, meta
 
+    # 2) YouTube-based hints
     yt_title, yt_uploader, yt_url = youtube_search_first(query)
     yt_meta = {
         "youtube_title": yt_title,
@@ -251,8 +256,8 @@ def fetch_lyrics_with_fallbacks(
             left, right = yt_title.split(" - ", 1)
             left = left.strip()
             right = right.strip()
-            candidates.append((left, right))
-            candidates.append((right, left))
+            candidates.append((left, right))   # Artist - Title
+            candidates.append((right, left))   # Title - Artist
         else:
             candidates.append((yt_uploader or None, yt_title))
     elif yt_uploader:
@@ -267,6 +272,7 @@ def fetch_lyrics_with_fallbacks(
             meta2["lyrics_source"] = "musixmatch_youtube"
             return lyrics2, meta2
 
+    # 3) Placeholder
     final_artist = genius_artist or yt_uploader or ""
     final_title = genius_title or yt_title or query
 
@@ -281,10 +287,8 @@ def fetch_lyrics_with_fallbacks(
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        description="Generate txt+mp3 from query via Genius/Musixmatch/YouTube."
-    )
-    p.add_argument("query", nargs="+", help="Search query, e.g. 'primus jerry was a race car driver'")
+    p = argparse.ArgumentParser(description="Generate txt+mp3 from query via Genius/Musixmatch/YouTube.")
+    p.add_argument("query", nargs="+", help="Search query, e.g. 'red hot chili peppers californication'")
     return p.parse_args(argv)
 
 
@@ -300,10 +304,13 @@ def main(argv=None):
     MP3_DIR.mkdir(parents=True, exist_ok=True)
     META_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Genius search
     g_artist, g_title, g_id = search_genius(query, genius_token)
 
+    # Lyrics with fallbacks
     lyrics_text, lyrics_meta = fetch_lyrics_with_fallbacks(query, g_artist, g_title, mm_api_key)
 
+    # Decide final artist/title for slug and metadata
     final_artist = lyrics_meta.get("artist") or g_artist or ""
     final_title = lyrics_meta.get("title") or g_title or query
 
@@ -314,12 +321,31 @@ def main(argv=None):
     meta_path = META_DIR / f"{slug}.json"
     mp3_path = MP3_DIR / f"{slug}.mp3"
 
+    # Decide search string for YouTube
     search_str = f"{final_artist} {final_title}".strip() or query
-    yt_title, yt_uploader = youtube_download_mp3(search_str, slug)
 
+    # Check if audio already exists for this slug / metadata
+    yt_title: str | None = None
+    yt_uploader: str | None = None
+
+    if mp3_path.exists():
+        log(
+            "MP3",
+            f'Audio already exists for "{final_artist} - {final_title}" '
+            f'(slug="{slug}"). Reusing {mp3_path} and skipping yt-dlp download.',
+            GREEN,
+        )
+        # Optionally refresh YouTube metadata if not already in lyrics_meta
+        if not lyrics_meta.get("youtube_title") or not lyrics_meta.get("youtube_uploader"):
+            yt_title, yt_uploader, _ = youtube_search_first(search_str)
+    else:
+        yt_title, yt_uploader = youtube_download_mp3(search_str, slug)
+
+    # Write lyrics txt (always, even placeholder)
     txt_path.write_text(lyrics_text, encoding="utf-8")
     log("TXT", f"Wrote lyrics txt to {txt_path}", GREEN)
 
+    # Build meta
     meta: dict = {
         "slug": slug,
         "query": query,
