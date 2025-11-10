@@ -18,11 +18,11 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 BLUE = "\033[34m"
 
-# project root (this file is expected to live in e.g. project/experimental or project/scripts)
-BASE_DIR = Path(__file__).resolve().parent.parent
-TXT_DIR = BASE_DIR / "txts"
-MP3_DIR = BASE_DIR / "mp3s"
-META_DIR = BASE_DIR / "meta"
+# Project root (this file is expected to live in e.g. project/experimental or project/scripts)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TXT_DIR = PROJECT_ROOT / "txts"
+MP3_DIR = PROJECT_ROOT / "mp3s"
+META_DIR = PROJECT_ROOT / "meta"
 
 PLACEHOLDER_LYRICS = """Lyrics not found
 We tried Genius, 
@@ -48,7 +48,7 @@ def slugify(text: str) -> str:
 
 
 def load_env() -> tuple[str, str]:
-    env_path = BASE_DIR / ".env"
+    env_path = PROJECT_ROOT / ".env"
     if env_path.exists():
         log("ENV", f"Loading .env from {env_path}", CYAN)
         load_dotenv(env_path)
@@ -162,7 +162,9 @@ def fetch_lyrics_musixmatch(
 
     # Clean standard Musixmatch footer if present
     if "******* This Lyrics is NOT for Commercial use *******" in lyrics_text:
-        lyrics_text = lyrics_text.split("******* This Lyrics is NOT for Commercial use *******", 1)[0].strip()
+        lyrics_text = lyrics_text.split(
+            "******* This Lyrics is NOT for Commercial use *******", 1
+        )[0].strip()
 
     meta = {
         "artist": mm_artist or artist or "",
@@ -219,7 +221,6 @@ def youtube_download_mp3(search_str: str, slug: str) -> tuple[str | None, str | 
         log("YT", f"yt-dlp audio download failed (exit {e.returncode}).", RED)
         return None, None
 
-    # Re-run a JSON-only search to capture metadata for meta.json
     yt_title, yt_uploader, _ = youtube_search_first(search_str)
     return yt_title, yt_uploader
 
@@ -234,7 +235,6 @@ def fetch_lyrics_with_fallbacks(
     Try Musixmatch (with Genius hints), then YouTube-derived metadata,
     then return placeholder lyrics if still nothing.
     """
-    # 1) Musixmatch using Genius hints
     lyrics, meta = fetch_lyrics_musixmatch(query, genius_artist, genius_title, mm_api_key)
     if lyrics and lyrics.strip():
         meta.setdefault("artist", genius_artist or meta.get("artist") or "")
@@ -242,7 +242,6 @@ def fetch_lyrics_with_fallbacks(
         meta["lyrics_source"] = "musixmatch_genius"
         return lyrics, meta
 
-    # 2) YouTube-based hints
     yt_title, yt_uploader, yt_url = youtube_search_first(query)
     yt_meta = {
         "youtube_title": yt_title,
@@ -256,8 +255,8 @@ def fetch_lyrics_with_fallbacks(
             left, right = yt_title.split(" - ", 1)
             left = left.strip()
             right = right.strip()
-            candidates.append((left, right))   # Artist - Title
-            candidates.append((right, left))   # Title - Artist
+            candidates.append((left, right))
+            candidates.append((right, left))
         else:
             candidates.append((yt_uploader or None, yt_title))
     elif yt_uploader:
@@ -272,7 +271,6 @@ def fetch_lyrics_with_fallbacks(
             meta2["lyrics_source"] = "musixmatch_youtube"
             return lyrics2, meta2
 
-    # 3) Placeholder
     final_artist = genius_artist or yt_uploader or ""
     final_title = genius_title or yt_title or query
 
@@ -287,8 +285,14 @@ def fetch_lyrics_with_fallbacks(
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Generate txt+mp3 from query via Genius/Musixmatch/YouTube.")
-    p.add_argument("query", nargs="+", help="Search query, e.g. 'red hot chili peppers californication'")
+    p = argparse.ArgumentParser(
+        description="Generate txt+mp3 from query via Genius/Musixmatch/YouTube."
+    )
+    p.add_argument(
+        "query",
+        nargs="+",
+        help="Search query, e.g. 'red hot chili peppers californication'",
+    )
     return p.parse_args(argv)
 
 
@@ -298,19 +302,57 @@ def main(argv=None):
 
     log("MODE", f'txt+mp3 generation for "{query}"', CYAN)
 
-    genius_token, mm_api_key = load_env()
-
     TXT_DIR.mkdir(parents=True, exist_ok=True)
     MP3_DIR.mkdir(parents=True, exist_ok=True)
     META_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Genius search
+    # Fast path: if we already have meta for this exact query and both mp3+txt exist,
+    # reuse everything and just refresh meta timestamp.
+    existing_meta = None
+    existing_meta_path: Path | None = None
+    existing_slug: str | None = None
+
+    for meta_file in META_DIR.glob("*.json"):
+        try:
+            data = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if data.get("query") == query:
+            existing_meta = data
+            existing_meta_path = meta_file
+            existing_slug = data.get("slug") or meta_file.stem
+            break
+
+    if existing_meta and existing_meta_path and existing_slug:
+        slug = existing_slug
+        txt_path = TXT_DIR / f"{slug}.txt"
+        mp3_path = MP3_DIR / f"{slug}.mp3"
+        if txt_path.exists() and mp3_path.exists():
+            log(
+                "REUSE",
+                f'Found existing audio+lyrics for query "{query}" '
+                f'as slug "{slug}". Reusing without new downloads.',
+                GREEN,
+            )
+            # Refresh meta timestamp so 0master detects this as "latest" work.
+            existing_meta_path.write_text(
+                json.dumps(existing_meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            log("META", f"Refreshed meta JSON at {existing_meta_path}", GREEN)
+            log("TXT", f"Lyrics txt at {txt_path}", GREEN)
+            log("MP3", f"Audio mp3 at {mp3_path}", GREEN)
+            return
+
+    # Full path (new query or incomplete assets): do API work.
+    genius_token, mm_api_key = load_env()
+
     g_artist, g_title, g_id = search_genius(query, genius_token)
 
-    # Lyrics with fallbacks
-    lyrics_text, lyrics_meta = fetch_lyrics_with_fallbacks(query, g_artist, g_title, mm_api_key)
+    lyrics_text, lyrics_meta = fetch_lyrics_with_fallbacks(
+        query, g_artist, g_title, mm_api_key
+    )
 
-    # Decide final artist/title for slug and metadata
     final_artist = lyrics_meta.get("artist") or g_artist or ""
     final_title = lyrics_meta.get("title") or g_title or query
 
@@ -321,13 +363,12 @@ def main(argv=None):
     meta_path = META_DIR / f"{slug}.json"
     mp3_path = MP3_DIR / f"{slug}.mp3"
 
-    # Decide search string for YouTube
     search_str = f"{final_artist} {final_title}".strip() or query
 
-    # Check if audio already exists for this slug / metadata
     yt_title: str | None = None
     yt_uploader: str | None = None
 
+    # Audio reuse: if mp3 already exists for this slug, skip yt-dlp.
     if mp3_path.exists():
         log(
             "MP3",
@@ -335,17 +376,24 @@ def main(argv=None):
             f'(slug="{slug}"). Reusing {mp3_path} and skipping yt-dlp download.',
             GREEN,
         )
-        # Optionally refresh YouTube metadata if not already in lyrics_meta
         if not lyrics_meta.get("youtube_title") or not lyrics_meta.get("youtube_uploader"):
             yt_title, yt_uploader, _ = youtube_search_first(search_str)
     else:
         yt_title, yt_uploader = youtube_download_mp3(search_str, slug)
 
-    # Write lyrics txt (always, even placeholder)
-    txt_path.write_text(lyrics_text, encoding="utf-8")
-    log("TXT", f"Wrote lyrics txt to {txt_path}", GREEN)
+    # Lyrics reuse: if txt exists for this slug, keep it and do not overwrite.
+    if txt_path.exists():
+        log(
+            "TXT",
+            f"Lyrics already exist for slug '{slug}' at {txt_path}. "
+            "Keeping existing lyrics and skipping overwrite.",
+            GREEN,
+        )
+    else:
+        txt_path.write_text(lyrics_text, encoding="utf-8")
+        log("TXT", f"Wrote lyrics txt to {txt_path}", GREEN)
 
-    # Build meta
+    # Build and write meta (always refresh so mtime is current)
     meta: dict = {
         "slug": slug,
         "query": query,
