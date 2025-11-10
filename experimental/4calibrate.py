@@ -26,9 +26,9 @@ DEFAULT_WINDOW_START = 30.0
 DEFAULT_WINDOW_LEN = 30.0
 
 # Offset step sizes (seconds)
-STEP_FINE = 0.125   # < / >
-STEP_MED = 0.25     # [ / ]
-STEP_GROSS = 0.5    # , / .
+STEP_FINE = 0.125          # < / >
+STEP_MED = 0.25            # [ / ]
+STEP_EXTRA_FINE = STEP_FINE / 2.0  # , / .  => 0.0625
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
@@ -228,7 +228,7 @@ def calibrate_ui(
         h, w = stdscr.getmaxyx()
 
         controls1 = (
-            "[<]/[>] ±0.125s  [[/]] ±0.25s  [,/ .] ±0.5s  "
+            "[<]/[>] ±0.125s  [[/]] ±0.25s  [,/ .] ±0.0625s  "
             "[0] reset  [r] restart  [p] pause  [s] save  [q]/ESC quit"
         )
         stdscr.attron(curses.color_pair(3))
@@ -325,15 +325,15 @@ def calibrate_ui(
             last_msg = f"Offset {cur_offset:+.3f}s (med +)"
             continue
 
-        # gross: 0.5s
+        # extra fine: 0.0625s
         if ch == ord(","):
-            cur_offset -= STEP_GROSS
-            last_msg = f"Offset {cur_offset:+.3f}s (gross -)"
+            cur_offset -= STEP_EXTRA_FINE
+            last_msg = f"Offset {cur_offset:+.4f}s (x-fine -)"
             continue
 
         if ch == ord("."):
-            cur_offset += STEP_GROSS
-            last_msg = f"Offset {cur_offset:+.3f}s (gross +)"
+            cur_offset += STEP_EXTRA_FINE
+            last_msg = f"Offset {cur_offset:+.4f}s (x-fine +)"
             continue
 
 
