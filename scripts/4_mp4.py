@@ -223,6 +223,7 @@ def build_ass(
     y_title = y_main + int(top_band_height * TITLE_EXTRA_OFFSET_FRACTION)
 
     x_center = playresx // 2
+    y_center_full = playresy // 2
     y_next = y_divider + int(bottom_band_height * BOTTOM_TEXT_TOP_PADDING_FRACTION)
 
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
@@ -262,39 +263,6 @@ def build_ass(
 
     events: list[str] = []
 
-    # Divider line across the screen at y_divider, visible all the time.
-    divider_text = (
-        f"{{\\an7\\pos(0,{y_divider})\\p1\\1a&H{NEXT_LINE_ALPHA_HEX}&\\bord1}}"
-        f"m 0 0 l {playresx} 0{{\\p0}}"
-    )
-    events.append(
-        "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
-            start=seconds_to_ass_time(0.0),
-            end=seconds_to_ass_time(audio_duration),
-            text=divider_text,
-        )
-    )
-
-    # Title / artist block.
-    title_lines = []
-    if title:
-        title_lines.append(title)
-    if artist:
-        title_lines.append(f"by {artist}")
-
-    title_start = 0.0
-    title_end = min(5.0, max(3.0, audio_duration * 0.1))
-
-    if title_lines:
-        ev_text = "\\N".join(title_lines)
-        events.append(
-            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(title_start),
-                end=seconds_to_ass_time(title_end),
-                text=f"{{\\an5\\pos({x_center},{y_title})}}{ass_escape(ev_text)}",
-            )
-        )
-
     # Normalize timings and filter out-of-range / empty lines.
     unified: list[tuple[float, str, int]] = []
     for t, text, line_index in timings:
@@ -307,19 +275,66 @@ def build_ass(
 
     unified.sort(key=lambda x: x[0])
 
+    # If no timings, just show a centered title card for the whole song.
     if not unified:
-        # No timings; just show the title.
-        fallback = "\\N".join(title_lines) if title_lines else "No lyrics"
+        title_lines = []
+        if title:
+            title_lines.append(title)
+        if artist:
+            title_lines.append(f"by {artist}")
+        if not title_lines:
+            title_lines = ["No lyrics"]
+
+        intro_block = "\\N".join(title_lines)
         events.append(
-            "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
+            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(0.0),
                 end=seconds_to_ass_time(audio_duration),
-                text=f"{{\\an5\\pos({x_center},{y_main})}}{ass_escape(fallback)}",
+                text=f"{{\\an5\\pos({x_center},{y_center_full})}}{ass_escape(intro_block)}",
             )
         )
+
         ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
-        log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
+        log("ASS", f"Wrote ASS subtitles (title only) to {ass_path}", GREEN)
         return ass_path
+
+    first_lyric_time = max(0.0, unified[0][0])
+
+    # Intro title / artist card, centered, with no lyrics / previews / divider.
+    title_lines = []
+    if title:
+        title_lines.append(title)
+    if artist:
+        title_lines.append(f"by {artist}")
+
+    if title_lines:
+        # End the intro at or before the first lyric so they never overlap.
+        if first_lyric_time > 0.1:
+            title_end = min(first_lyric_time, 5.0)
+        else:
+            title_end = first_lyric_time  # very short intro if lyrics start immediately
+
+        intro_block = "\\N".join(title_lines)
+        events.append(
+            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(0.0),
+                end=seconds_to_ass_time(title_end),
+                text=f"{{\\an5\\pos({x_center},{y_center_full})}}{ass_escape(intro_block)}",
+            )
+        )
+
+    # Divider line across the screen at y_divider, only while lyrics are active.
+    divider_text = (
+        f"{{\\an7\\pos(0,{y_divider})\\p1\\1a&H{NEXT_LINE_ALPHA_HEX}&\\bord1}}"
+        f"m 0 0 l {playresx} 0{{\\p0}}"
+    )
+    events.append(
+        "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+            start=seconds_to_ass_time(first_lyric_time),
+            end=seconds_to_ass_time(audio_duration),
+            text=divider_text,
+        )
+    )
 
     # One main line per event, one up-next line, no overlaps.
     n = len(unified)
@@ -445,7 +460,6 @@ def main(argv=None):
     slug = slugify(args.slug)
     profile = args.profile
 
-    # Determine font size, with interactive prompt when possible.
     default_font_size = DEFAULT_UI_FONT_SIZE
     font_size_value = args.font_size
 
@@ -504,8 +518,6 @@ def main(argv=None):
 
     out_mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
 
-    # ffmpeg command:
-    # - Generate black background at the right resolution and overlay subtitles.
     cmd = [
         "ffmpeg",
         "-y",
@@ -563,3 +575,5 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
+# end of 4_mp4.py
