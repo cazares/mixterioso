@@ -28,6 +28,26 @@ TIMINGS_DIR = BASE_DIR / "timings"
 OUTPUT_DIR = BASE_DIR / "output"
 META_DIR = BASE_DIR / "meta"
 
+# ---------------------------------------------------------------------------
+# Demucs model policy
+# ---------------------------------------------------------------------------
+
+# Profiles that adjust ONLY vocals (no special bass / instrument behavior).
+# For these we default to a lighter 2-stem model (vocals vs accompaniment).
+VOCALS_ONLY_PROFILES = {
+    "karaoke",       # 0% vocals
+    "car-karaoke",   # reduced vocals
+    # add future pure-vocal profiles here, e.g. "boosted-vocals"
+}
+
+# Default 4-stem model for general use (vocals, bass, drums, other).
+FOUR_STEM_MODEL = "htdemucs"
+
+# Default 2-stem model for vocals-only flows (vocals vs accompaniment).
+# If you don't actually have a 2-stem model installed, you can set this
+# equal to FOUR_STEM_MODEL and behavior will still be consistent.
+TWO_STEM_MODEL = "htdemucs_2s"
+
 
 def slugify(text: str) -> str:
     import re
@@ -53,6 +73,7 @@ def run(cmd: list[str], section: str) -> float:
     subprocess.run(cmd, check=True)
     t1 = time.perf_counter()
     return t1 - t0
+
 
 def detect_slug_from_latest_mp3() -> str:
     """
@@ -149,7 +170,59 @@ def run_step1_txt_mp3(query: str) -> tuple[str, float]:
     return slug, t
 
 
+def pick_demucs_model_for_slug(slug: str, profile: str, model_arg: str | None) -> tuple[str, bool]:
+    """
+    Decide which Demucs model to use for a given slug+profile and whether we
+    can reuse existing stems.
+
+    Policy:
+      - If user passes --model != "auto" -> use that model; reuse if its stems exist.
+      - Else:
+          * If 4-stem stems already exist -> always reuse them.
+          * Else if profile is vocals-only (karaoke / car-karaoke):
+                prefer 2-stem (if available), otherwise run 2-stem once.
+          * Else:
+                use 4-stem.
+    """
+    separated_root = BASE_DIR / "separated"
+
+    # 1) Explicit user override.
+    if model_arg and model_arg != "auto":
+        model = model_arg
+        stems_dir = separated_root / model / slug
+        return model, stems_dir.exists()
+
+    vocals_only = profile in VOCALS_ONLY_PROFILES
+
+    four_dir = separated_root / FOUR_STEM_MODEL / slug
+    two_dir = separated_root / TWO_STEM_MODEL / slug
+
+    # 2) If we already have 4-stem, always reuse it.
+    if four_dir.exists():
+        return FOUR_STEM_MODEL, True
+
+    # 3) Vocals-only flows: prefer existing 2-stem, then new 2-stem.
+    if vocals_only:
+        if two_dir.exists():
+            return TWO_STEM_MODEL, True
+        return TWO_STEM_MODEL, False
+
+    # 4) Non-vocals-only flows: 2-stem isn't very useful for bass/guitar/drums,
+    #    so we just default to 4-stem.
+    return FOUR_STEM_MODEL, False
+
+
 def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> float:
+    """
+    Step 2: ensure stems exist and render a mixed WAV for the given profile.
+
+    Default policy:
+      - Use 4-stem model for everything.
+      - Except for vocals-only profiles (e.g. karaoke / car-karaoke),
+        where we use a 2-stem model (vocals vs accompaniment) by default.
+      - If 4-stem stems already exist for the song, always reuse them.
+      - --model can override everything when not equal to "auto".
+    """
     if profile == "lyrics":
         log("STEP2", "Profile 'lyrics' selected, skipping stems/mix.", YELLOW)
         return 0.0
@@ -161,59 +234,22 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
 
     separated_root = BASE_DIR / "separated"
 
-    # Always prefer 6-stem, then (if absolutely necessary) 4-stem.
-    preferred_models: list[str] = []
-    if model:
-        preferred_models.append(model)
-    if "htdemucs_6s" not in preferred_models:
-        preferred_models.insert(0, "htdemucs_6s")
-    if "htdemucs" not in preferred_models:
-        preferred_models.append("htdemucs")  # 4-stem fallback, never 2-stem
-
-    # Check for existing stems we can reuse.
-    existing_model = None
-    for m in preferred_models:
-        d = separated_root / m / slug
-        if d.exists():
-            existing_model = m
-            break
-
-    reuse_stems = False
-    actual_model = existing_model
-
-    if existing_model:
-        if interactive:
-            ans = input(
-                f"Stems already exist at {separated_root / existing_model / slug} "
-                f"for model '{existing_model}'. Reuse and skip Demucs? [Y/n]: "
-            ).strip().lower()
-            reuse_stems = ans in ("", "y", "yes")
-        else:
-            reuse_stems = True
+    model_name, reuse_stems = pick_demucs_model_for_slug(slug, profile, model)
+    stems_dir = separated_root / model_name / slug
 
     t_demucs = 0.0
-
-    if not reuse_stems:
+    if not stems_dir.exists() or not reuse_stems:
         import subprocess as sp
 
-        log("STEP2", f"No reusable stems; trying models {preferred_models}", CYAN)
-        actual_model = None
-        for m in preferred_models:
-            try:
-                t_demucs += run(["demucs", "-n", m, str(mp3_path)], "STEP2-DEMUX")
-                actual_model = m
-                break
-            except sp.CalledProcessError:
-                log("STEP2", f"Demucs model '{m}' failed, trying next.", YELLOW)
-        if actual_model is None:
+        log("STEP2", f"Running Demucs model '{model_name}' for {slug}", CYAN)
+        try:
+            t_demucs = run(["demucs", "-n", model_name, str(mp3_path)], "STEP2-DEMUX")
+        except sp.CalledProcessError as e:
             raise SystemExit(
-                "Demucs failed for 6-stem and 4-stem models; "
-                "no 2-stem fallback is allowed by policy."
+                f"Demucs model '{model_name}' failed with exit {e.returncode}."
             )
-    elif actual_model is None:
-        raise SystemExit("Asked to reuse stems but none were found for any supported model.")
-
-    log("STEP2", f"Using Demucs model '{actual_model}' for mixing.", GREEN)
+    else:
+        log("STEP2", f"Reusing existing stems at {stems_dir}", GREEN)
 
     # Open mix UI (using remembered percentages) for this model/profile.
     t_mix_ui = run(
@@ -225,7 +261,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
             "--profile",
             profile,
             "--model",
-            actual_model,
+            model_name,
             "--mix-ui-only",
         ],
         "STEP2-MIXUI",
@@ -241,7 +277,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
             "--profile",
             profile,
             "--model",
-            actual_model,
+            model_name,
             "--render-only",
             "--output",
             str(out_wav),
@@ -312,7 +348,12 @@ def parse_args(argv=None):
         default="karaoke",
         choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
     )
-    p.add_argument("--model", type=str, default="htdemucs_6s", help="Demucs model name")
+    p.add_argument(
+        "--model",
+        type=str,
+        default="auto",
+        help="Demucs model name (or 'auto' to pick 2-stem vs 4-stem automatically).",
+    )
     p.add_argument("--steps", type=str, help="Steps to run, e.g. 24 or 1234")
     p.add_argument(
         "--do",
@@ -326,7 +367,11 @@ def parse_args(argv=None):
             "mp4=4 only."
         ),
     )
-    p.add_argument("--skip-ui", action="store_true", help="Non-interactive; use --steps / --do as-is")
+    p.add_argument(
+        "--skip-ui",
+        action="store_true",
+        help="Non-interactive; use --steps / --do as-is",
+    )
     return p.parse_args(argv)
 
 

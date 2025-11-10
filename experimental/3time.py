@@ -16,11 +16,6 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-TXT_DIR = BASE_DIR / "txts"
-MP3_DIR = BASE_DIR / "mp3s"
-TIMINGS_DIR = BASE_DIR / "timings"
-
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
@@ -281,7 +276,7 @@ def timing_ui(
         pos = player.current_pos()
 
         controls1 = (
-            "[SPACE/ENTER] tag  "
+            "[SPACE/ENTER] tag  [p] pause/resume  "
             "[<] rewind  [u] undo  [>] ff  [r] restart  [g] goto  "
             "[q] save+quit  [ESC] abort"
         )
@@ -354,6 +349,11 @@ def timing_ui(
         stdscr.timeout(50)
         ch = stdscr.getch()
         if ch == -1:
+            continue
+
+        # While paused, only allow resume or exit keys.
+        if player.paused and ch not in (ord("p"), ord("P"), ord("q"), ord("Q"), 27):
+            last_msg = "Paused; press [p] to resume, [q]/ESC to quit."
             continue
 
         if ch == 27:
@@ -495,6 +495,9 @@ def timing_ui(
 def write_timings(timing_path: Path, lyrics, timings) -> None:
     """
     Always sync main lyric text from lyrics[line_index] on save.
+
+    - For line_index >= 0: ignore any stored 'text', use lyrics[line_index].
+    - For line_index < 0 (note events): keep stored 'text' (glyphs).
     """
     timing_path.parent.mkdir(parents=True, exist_ok=True)
     timings_sorted = sorted(timings, key=lambda t: t["time"])
@@ -513,13 +516,8 @@ def write_timings(timing_path: Path, lyrics, timings) -> None:
 
 def parse_args(argv):
     p = argparse.ArgumentParser(description="Interactive timing editor.")
-    p.add_argument(
-        "slug",
-        nargs="?",
-        help="Song slug (e.g. 'californication'). If provided, --txt/--audio/--timings are inferred.",
-    )
-    p.add_argument("--txt", type=str, help="Lyrics txt path")
-    p.add_argument("--audio", type=str, help="Audio file to play")
+    p.add_argument("--txt", type=str, required=True, help="Lyrics txt path")
+    p.add_argument("--audio", type=str, required=True, help="Audio file to play")
     p.add_argument("--timings", type=str, help="Timings CSV path")
     p.add_argument("--rewind-step", type=float, default=5.0, help="Seconds for < and >")
     p.add_argument("--start", type=str, help="Start time (mm:ss or seconds)")
@@ -529,34 +527,24 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
 
-    if args.slug:
-        slug = slugify(args.slug)
-        txt_path = Path(args.txt).resolve() if args.txt else TXT_DIR / f"{slug}.txt"
-        audio_path = Path(args.audio).resolve() if args.audio else MP3_DIR / f"{slug}.mp3"
-        if args.timings:
-            timing_path = Path(args.timings).resolve()
-        else:
-            timing_path = TIMINGS_DIR / f"{slug}.csv"
-    else:
-        if not args.txt or not args.audio:
-            raise SystemExit("Either slug or both --txt and --audio must be provided.")
-        txt_path = Path(args.txt).resolve()
-        audio_path = Path(args.audio).resolve()
-        slug = infer_slug(txt_path, audio_path)
-        if args.timings:
-            timing_path = Path(args.timings).resolve()
-        else:
-            timing_path = TIMINGS_DIR / f"{slug}.csv"
-
+    txt_path = Path(args.txt).resolve()
+    audio_path = Path(args.audio).resolve()
     if not txt_path.exists():
         raise SystemExit(f"Lyrics not found: {txt_path}")
     if not audio_path.exists():
         raise SystemExit(f"Audio not found: {audio_path}")
 
+    slug = infer_slug(txt_path, audio_path)
+    if args.timings:
+        timing_path = Path(args.timings).resolve()
+    else:
+        timing_path = Path("timings") / f"{slug}.csv"
+
     lyrics = load_lyrics(txt_path)
     if not lyrics:
         raise SystemExit("No lyrics lines found.")
 
+    # Step 3 policy: if timings CSV already exists, delete it and start fresh.
     if timing_path.exists():
         try:
             timing_path.unlink()

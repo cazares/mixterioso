@@ -5,9 +5,9 @@
 Steps:
  1: 1download.py   (takes URL/query, derives slug, downloads assets)
  2: 2mix.py        (takes slug)
- 3: 3time.py       (takes slug, writes timings/<slug>.csv)
- 4: 4calibrate.py  (takes slug, writes offsets/<slug>.json)
- 5: 5gen_mp4.py    (takes slug, reads timings+offsets, writes mp4s/<slug>.mp4)
+ 3: 3time.py       (takes slug → we call it with --txt/--audio/--timings)
+ 4: 4calibrate.py  (takes slug)
+ 5: 5gen_mp4.py    (takes slug)
 """
 
 import sys
@@ -68,8 +68,8 @@ def detect_slug_from_disk() -> str | None:
     """
     Detect the most recent slug based on meta/*.json or mp3s/*.mp3.
 
-    Used right after step 1 so later steps use the real slug that 1download.py chose,
-    and as a "last used slug" when entering manual mode with no input.
+    Used after step 1 so later steps use the real slug that 1download.py chose,
+    and as a "last used slug" when starting without arguments.
     """
     if META_DIR.exists():
         metas = sorted(META_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
@@ -110,7 +110,13 @@ def step_done(step: int, slug: str | None) -> bool:
 
 
 def run_step(step: int, arg: str | None) -> int:
-    """Run the script for a given step, passing arg if not None."""
+    """
+    Run the script for a given step.
+
+    - Step 1: arg is query/URL (positional).
+    - Step 2,4,5: arg is slug (positional).
+    - Step 3: arg is slug, but we call 3time.py with --txt/--audio/--timings.
+    """
     script_name = SCRIPT_MAP.get(step)
     if not script_name:
         console.print(f"[red]Unknown step {step}[/red]")
@@ -121,9 +127,30 @@ def run_step(step: int, arg: str | None) -> int:
         console.print(f"[red]Script not found:[/] {script_path}")
         return 1
 
-    cmd = [sys.executable, str(script_path)]
-    if arg:
-        cmd.append(arg)
+    if step == 3:
+        slug = (arg or "").strip()
+        if not slug:
+            console.print("[red]Step 3 requires a slug but none was provided.[/red]")
+            return 1
+
+        txt_path = TXT_DIR / f"{slug}.txt"
+        audio_path = MP3_DIR / f"{slug}.mp3"
+        timings_path = TIMING_DIR / f"{slug}.csv"
+
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--txt",
+            str(txt_path),
+            "--audio",
+            str(audio_path),
+            "--timings",
+            str(timings_path),
+        ]
+    else:
+        cmd = [sys.executable, str(script_path)]
+        if arg:
+            cmd.append(arg)
 
     console.print(f"[cyan]→ Running step {step}: {script_name}[/cyan]")
     try:
@@ -132,6 +159,62 @@ def run_step(step: int, arg: str | None) -> int:
         console.print("\n[yellow]Interrupted by user.[/yellow]")
         return ABORT_CODE
     return result.returncode
+
+
+def auto_pipeline(url: str) -> None:
+    """Run steps 1–5 in order, never skipping based on existing files."""
+    slug = infer_slug_from_input(url)
+    console.print(
+        f"[bold]Auto mode:[/] query/URL=[cyan]{url}[/cyan], initial slug=[magenta]{slug}[/magenta]"
+    )
+
+    for step in range(1, 6):
+        arg = url if step == 1 else slug
+        code = run_step(step, arg)
+        if code == ABORT_CODE:
+            console.print("[yellow]Pipeline aborted by user.[/yellow]")
+            return
+        if code != 0:
+            console.print(
+                f"[red]Step {step} failed with code {code}. Stopping.[/red]"
+            )
+            sys.exit(code)
+        console.print(f"[green]Step {step} OK.[/green]")
+
+        if step == 1 and code == 0:
+            detected = detect_slug_from_disk()
+            if detected:
+                console.print(
+                    f"[cyan]Detected slug from assets: [magenta]{detected}[/magenta][/cyan]"
+                )
+                slug = detected
+
+    console.print("[bold green]All steps completed. Final MP4 should be ready.[/bold green]")
+
+
+def auto_pipeline_existing_slug(slug: str) -> None:
+    """
+    Auto-mode variant for "reuse previous slug":
+
+    Runs steps 2–5, never calls 1download.py, never skips based on existing files.
+    """
+    console.print(
+        f"[bold]Auto mode (existing slug):[/] slug=[magenta]{slug}[/magenta]"
+    )
+    for step in range(2, 6):
+        arg = slug
+        code = run_step(step, arg)
+        if code == ABORT_CODE:
+            console.print("[yellow]Pipeline aborted by user.[/yellow]")
+            return
+        if code != 0:
+            console.print(
+                f"[red]Step {step} failed with code {code}. Stopping.[/red]"
+            )
+            sys.exit(code)
+        console.print(f"[green]Step {step} OK.[/green]")
+
+    console.print("[bold green]Steps 2–5 completed for existing slug.[/bold green]")
 
 
 def manual_menu(url_or_slug: str | None) -> None:
@@ -192,7 +275,7 @@ def manual_menu(url_or_slug: str | None) -> None:
         if choice == "a":
             if not url:
                 console.print(
-                    "[bold white]Search for audio and lyrics via query or YT url:[/] ",
+                    "[bold white]Audio+lyrics: YouTube url / search:[/] ",
                     end="",
                 )
                 url = sys.stdin.readline().strip()
@@ -201,20 +284,9 @@ def manual_menu(url_or_slug: str | None) -> None:
                 return
             slug = infer_slug_from_input(url)
 
-            console.print(
-                "[bold white]Skip steps that already look DONE?[/] [green][Y/n][/green] ",
-                end="",
-            )
-            ans = sys.stdin.readline().strip().lower()
-            skip_done = ans in ("", "y", "yes")
-
+            # Run all 5 steps, no skip-done optimization
             for step in range(1, 6):
                 arg = url if step == 1 else slug
-                if skip_done and step_done(step, slug):
-                    console.print(
-                        f"[yellow]Skipping step {step} ({SCRIPT_MAP[step]}), already DONE.[/yellow]"
-                    )
-                    continue
                 code = run_step(step, arg)
                 if code == ABORT_CODE:
                     console.print("[yellow]User aborted. Returning to menu.[/yellow]")
@@ -241,7 +313,7 @@ def manual_menu(url_or_slug: str | None) -> None:
 
         if step == 1:
             console.print(
-                "[bold white]Search for audio and lyrics via query or YT url:[/] ",
+                "[bold white]Audio+lyrics: YouTube url / search:[/] ",
                 end="",
             )
             url = sys.stdin.readline().strip()
@@ -281,42 +353,6 @@ def manual_menu(url_or_slug: str | None) -> None:
                 slug = detected
 
 
-def auto_pipeline(url: str, skip_done: bool = True) -> None:
-    """Run steps 1–5 in order, optionally skipping already-done steps."""
-    slug = infer_slug_from_input(url)
-    console.print(
-        f"[bold]Auto mode:[/] query/URL=[cyan]{url}[/cyan], initial slug=[magenta]{slug}[/magenta]"
-    )
-
-    for step in range(1, 6):
-        arg = url if step == 1 else slug
-        if skip_done and step_done(step, slug):
-            console.print(
-                f"[yellow]Skipping step {step} ({SCRIPT_MAP[step]}), already DONE.[/yellow]"
-            )
-            continue
-        code = run_step(step, arg)
-        if code == ABORT_CODE:
-            console.print("[yellow]Pipeline aborted by user.[/yellow]")
-            return
-        if code != 0:
-            console.print(
-                f"[red]Step {step} failed with code {code}. Stopping.[/red]"
-            )
-            sys.exit(code)
-        console.print(f"[green]Step {step} OK.[/green]")
-
-        if step == 1 and code == 0:
-            detected = detect_slug_from_disk()
-            if detected:
-                console.print(
-                    f"[cyan]Detected slug from assets: [magenta]{detected}[/magenta][/cyan]"
-                )
-                slug = detected
-
-    console.print("[bold green]All steps completed. Final MP4 should be ready.[/bold green]")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Karaoke pipeline master script (0master.py)."
@@ -335,43 +371,61 @@ def main() -> None:
     args = parser.parse_args()
 
     url_or_slug = args.input
+    last_slug = detect_slug_from_disk()
 
     if not args.manual:
-        console.print(
-            "[bold white]Automatically run steps 1–5 in order?[/] [green][Y/n][/green] ",
-            end="",
-        )
-        ans = sys.stdin.readline().strip().lower()
-        auto = ans in ("", "y", "yes")
-        if auto:
-            if not url_or_slug:
+        reuse_last = False
+
+        if not url_or_slug:
+            if last_slug:
                 console.print(
-                    "[bold white]Search for audio and lyrics via query or YT url:[/] ",
+                    "[bold white]"
+                    f"Audio+lyrics: YouTube url / search "
+                    f"(ENTER = reuse previous slug '{last_slug}'):[/] ",
                     end="",
                 )
+                entered = sys.stdin.readline().strip()
+                if entered:
+                    url_or_slug = entered
+                else:
+                    reuse_last = True
+            else:
+                console.print(
+                    "[bold white]Audio+lyrics: YouTube url / search:[/] ",
+                    end="...",
+                )
+                # small correction: no ellipsis in actual prompt
+                # but keep behavior consistent
+                sys.stdout.flush()
+                # re-prompt cleanly
+                console.print("\r[bold white]Audio+lyrics: YouTube url / search:[/] ", end="")
                 url_or_slug = sys.stdin.readline().strip()
                 if not url_or_slug:
                     console.print("[yellow]No input provided. Exiting.[/yellow]")
                     return
 
+        if reuse_last and last_slug:
             console.print(
-                "[bold white]Skip steps that already look DONE?[/] [green][Y/n][/green] ",
-                end="",
+                f"[cyan]Reusing previous slug: [magenta]{last_slug}[/magenta][/cyan]"
             )
-            ans2 = sys.stdin.readline().strip().lower()
-            skip_done = ans2 in ("", "y", "yes")
+            auto_pipeline_existing_slug(last_slug)
+        else:
+            auto_pipeline(url_or_slug)
+        return
 
-            auto_pipeline(url_or_slug, skip_done=skip_done)
-            return
-
-    if not url_or_slug:
-        last = detect_slug_from_disk()
-        if last:
-            console.print(
-                f"[cyan]No input provided. Using last slug from disk: "
-                f"[magenta]{last}[/magenta][/cyan]"
-            )
-            url_or_slug = last
+    # Manual mode entry: offer to reuse last slug if we have none yet
+    if not url_or_slug and last_slug:
+        console.print(
+            "[bold white]"
+            f"Manual mode: ENTER = reuse previous slug '{last_slug}', "
+            "or type slug/query/URL:[/] ",
+            end="",
+        )
+        entered = sys.stdin.readline().strip()
+        if entered:
+            url_or_slug = entered
+        else:
+            url_or_slug = last_slug
 
     manual_menu(url_or_slug)
 
