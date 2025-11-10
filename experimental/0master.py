@@ -3,7 +3,7 @@
 0master.py – Orchestrate the karaoke pipeline.
 
 Steps:
- 1: 1download.py   (takes URL/ID, derives slug, downloads assets)
+ 1: 1download.py   (takes URL/query, derives slug, downloads assets)
  2: 2mix.py        (takes slug)
  3: 3time.py       (takes slug, writes timings/<slug>.csv)
  4: 4calibrate.py  (takes slug, writes offsets/<slug>.json)
@@ -21,6 +21,10 @@ console = Console()
 
 ABORT_CODE = 99
 
+# Base paths
+BASE_DIR = Path(__file__).resolve().parent          # e.g. project/experimental
+PROJECT_ROOT = BASE_DIR.parent                      # e.g. project/
+
 # script names (must exist next to this file)
 SCRIPT_MAP = {
     1: "1download.py",
@@ -30,14 +34,14 @@ SCRIPT_MAP = {
     5: "5gen_mp4.py",
 }
 
-# simple output dirs (relative to project root, NOT this file)
-MP3_DIR = "mp3s"
-TXT_DIR = "txts"
-STEMS_DIR = "stems"
-TIMING_DIR = "timings"   # CSV from 3time.py
-OFFSET_DIR = "offsets"   # JSON from 4calibrate.py
-MP4_DIR = "mp4s"         # final videos from 5gen_mp4.py
-META_DIR = "meta"        # meta/<slug>.json from 1download.py
+# output dirs anchored to project root
+MP3_DIR = PROJECT_ROOT / "mp3s"
+TXT_DIR = PROJECT_ROOT / "txts"
+STEMS_DIR = PROJECT_ROOT / "stems"
+TIMING_DIR = PROJECT_ROOT / "timings"   # CSV from 3time.py
+OFFSET_DIR = PROJECT_ROOT / "offsets"   # JSON from 4calibrate.py
+MP4_DIR = PROJECT_ROOT / "mp4s"         # final videos from 5gen_mp4.py
+META_DIR = PROJECT_ROOT / "meta"        # meta/<slug>.json from 1download.py
 
 
 def infer_slug_from_input(input_str: str) -> str:
@@ -64,17 +68,16 @@ def detect_slug_from_disk() -> str | None:
     """
     Detect the most recent slug based on meta/*.json or mp3s/*.mp3.
 
-    Used right after step 1 so later steps use the real slug that 1download.py chose.
+    Used right after step 1 so later steps use the real slug that 1download.py chose,
+    and as a "last used slug" when entering manual mode with no input.
     """
-    meta_dir = Path(META_DIR)
-    if meta_dir.exists():
-        metas = sorted(meta_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    if META_DIR.exists():
+        metas = sorted(META_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
         if metas:
             return metas[-1].stem
 
-    mp3_dir = Path(MP3_DIR)
-    if mp3_dir.exists():
-        mp3s = sorted(mp3_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
+    if MP3_DIR.exists():
+        mp3s = sorted(MP3_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
         if mp3s:
             return mp3s[-1].stem
 
@@ -87,21 +90,21 @@ def step_done(step: int, slug: str | None) -> bool:
         return False
 
     if step == 1:
-        mp3 = Path(MP3_DIR) / f"{slug}.mp3"
-        txt = Path(TXT_DIR) / f"{slug}.txt"
+        mp3 = MP3_DIR / f"{slug}.mp3"
+        txt = TXT_DIR / f"{slug}.txt"
         return mp3.exists() and txt.exists()
     elif step == 2:
-        vocals = Path(STEMS_DIR) / slug / "vocals.wav"
-        marker = Path("mix_done") / f"{slug}.done"
+        vocals = STEMS_DIR / slug / "vocals.wav"
+        marker = PROJECT_ROOT / "mix_done" / f"{slug}.done"
         return vocals.exists() or marker.exists()
     elif step == 3:
-        timing = Path(TIMING_DIR) / f"{slug}.csv"
+        timing = TIMING_DIR / f"{slug}.csv"
         return timing.exists()
     elif step == 4:
-        offset = Path(OFFSET_DIR) / f"{slug}.json"
+        offset = OFFSET_DIR / f"{slug}.json"
         return offset.exists()
     elif step == 5:
-        mp4 = Path(MP4_DIR) / f"{slug}.mp4"
+        mp4 = MP4_DIR / f"{slug}.mp4"
         return mp4.exists()
     return False
 
@@ -136,6 +139,14 @@ def manual_menu(url_or_slug: str | None) -> None:
     url = url_or_slug
     slug = infer_slug_from_input(url) if url else None
 
+    console.print()
+    if slug:
+        console.print(
+            f"[cyan]Manual mode using slug: [magenta]{slug}[/magenta][/cyan]"
+        )
+    else:
+        console.print("[cyan]Manual mode with no slug yet.[/cyan]")
+
     while True:
         status_map = {s: ("DONE" if step_done(s, slug) else "PENDING") for s in range(1, 6)}
 
@@ -147,7 +158,7 @@ def manual_menu(url_or_slug: str | None) -> None:
 
         table.add_row(
             "1", SCRIPT_MAP[1], status_map[1],
-            "Download audio + metadata + lyrics (needs URL/query)",
+            "Download audio + metadata + lyrics (needs query / YT URL)",
         )
         table.add_row(
             "2", SCRIPT_MAP[2], status_map[2],
@@ -180,10 +191,13 @@ def manual_menu(url_or_slug: str | None) -> None:
 
         if choice == "a":
             if not url:
-                console.print("[bold white]Enter YouTube URL or ID:[/] ", end="")
+                console.print(
+                    "[bold white]Search for audio and lyrics via query or YT url:[/] ",
+                    end="",
+                )
                 url = sys.stdin.readline().strip()
             if not url:
-                console.print("[red]No URL provided. Aborting.[/red]")
+                console.print("[red]No input provided. Aborting.[/red]")
                 return
             slug = infer_slug_from_input(url)
 
@@ -203,7 +217,6 @@ def manual_menu(url_or_slug: str | None) -> None:
                         f"[red]Step {step} failed (code {code}). Returning to menu.[/red]"
                     )
                     break
-                # after step 1, resync slug with what 1download.py actually created
                 if step == 1 and code == 0:
                     detected = detect_slug_from_disk()
                     if detected:
@@ -220,9 +233,11 @@ def manual_menu(url_or_slug: str | None) -> None:
         step = int(choice)
 
         if step == 1:
-            if not url:
-                console.print("[bold white]Enter YouTube URL or ID / query:[/] ", end="")
-                url = sys.stdin.readline().strip()
+            console.print(
+                "[bold white]Search for audio and lyrics via query or YT url:[/] ",
+                end="",
+            )
+            url = sys.stdin.readline().strip()
             arg = url
         else:
             if not slug:
@@ -250,7 +265,6 @@ def manual_menu(url_or_slug: str | None) -> None:
         else:
             console.print(f"[green]Step {step} completed.[/green]")
 
-        # If we just ran step 1 successfully, auto-detect and store the real slug
         if step == 1 and code == 0:
             detected = detect_slug_from_disk()
             if detected:
@@ -264,7 +278,7 @@ def auto_pipeline(url: str) -> None:
     """Run steps 1–5 in order, skipping already-done steps, minimal prompts."""
     slug = infer_slug_from_input(url)
     console.print(
-        f"[bold]Auto mode:[/] URL=[cyan]{url}[/cyan], initial slug=[magenta]{slug}[/magenta]"
+        f"[bold]Auto mode:[/] query/URL=[cyan]{url}[/cyan], initial slug=[magenta]{slug}[/magenta]"
     )
 
     for step in range(1, 6):
@@ -285,7 +299,6 @@ def auto_pipeline(url: str) -> None:
             sys.exit(code)
         console.print(f"[green]Step {step} OK.[/green]")
 
-        # After step 1, refresh slug from disk so steps 2–5 see the real slug
         if step == 1 and code == 0:
             detected = detect_slug_from_disk()
             if detected:
@@ -304,7 +317,7 @@ def main() -> None:
     parser.add_argument(
         "input",
         nargs="?",
-        help="YouTube URL/ID (for auto mode) or initial slug/URL (for manual mode).",
+        help="Initial query / YT URL / slug (optional).",
     )
     parser.add_argument(
         "--manual",
@@ -326,7 +339,7 @@ def main() -> None:
         if auto:
             if not url_or_slug:
                 console.print(
-                    "[bold white]Enter YouTube URL or ID / query:[/] ",
+                    "[bold white]Search for audio and lyrics via query or YT url:[/] ",
                     end="",
                 )
                 url_or_slug = sys.stdin.readline().strip()
@@ -336,11 +349,19 @@ def main() -> None:
             auto_pipeline(url_or_slug)
             return
 
+    if not url_or_slug:
+        last = detect_slug_from_disk()
+        if last:
+            console.print(
+                f"[cyan]No input provided. Using last slug from disk: "
+                f"[magenta]{last}[/magenta][/cyan]"
+            )
+            url_or_slug = last
+
     manual_menu(url_or_slug)
 
 
 if __name__ == "__main__":
-    BASE_DIR = Path(__file__).resolve().parent
     main()
 
 # end of 0master.py
