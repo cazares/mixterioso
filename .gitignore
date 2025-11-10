@@ -28,8 +28,12 @@ lyrics/
 *.pkg
 *ffconcat*
 *.txt
+*/bin/*
+*/lib/*
 *.json
 *.srt
 *.tsv
 *.vtt
 align_env/
+mix_done/
+covers/

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # whisper_cli_pipeline.sh
 set -euo pipefail
+set -x
 
 # --- Config ---
-TITLE="Scar Tissue"
-ARTIST="Red Hot Chili Peppers"
-MP3="songs/scar_tissue.mp3"
-BASE="scar_tissue"
+TITLE="Me Dice Que Me Ama"
+ARTIST="Jesus Adrian Romero"
+MP3="songs/auto_jesus-adrian-romero-me-dice-que-me-ama.mp3"
+BASE="auto_jesus-adrian-romero-me-dice-que-me-ama"
 ENABLE_DEMUCS="${ENABLE_DEMUCS:-0}"   # set to 1 to also run vocals-only pass
 
 # --- Preconditions ---
@@ -19,31 +20,31 @@ if [[ "$ENABLE_DEMUCS" == "1" ]]; then need demucs; fi
 mkdir -p lyrics whisper_out whisper_out_vocals
 
 # --- 1) Fetch lyrics (plain) via LRCLIB ---
-curl -s "https://lrclib.net/api/search?track_name=$(python3 - <<'PY'
-import urllib.parse; print(urllib.parse.quote("Scar Tissue"))
+curl "https://lrclib.net/api/search?track_name=$(python3 - <<'PY'
+import urllib.parse; print(urllib.parse.quote("Me Dice Que Me Ama"))
 PY
 )&artist_name=$(python3 - <<'PY'
-import urllib.parse; print(urllib.parse.quote("Red Hot Chili Peppers"))
+import urllib.parse; print(urllib.parse.quote("Jesus Adrian Romero"))
 PY
 )" \
-| jq -r '((map(select((.trackName|ascii_downcase)=="scar tissue" and (.artistName|ascii_downcase)=="red hot chili peppers"))|first)//.[0])|.plainLyrics' \
+| jq -r '((map(select((.trackName|ascii_downcase)=="me dice que me ama" and (.artistName|ascii_downcase)=="jesus adrian romero"))|first)//.[0])|.plainLyrics' \
 | sed 's/\r$//' > "lyrics/${BASE}.txt"
 
 # --- 2) Fetch lyrics (synced LRC) via LRCLIB ---
-curl -s "https://lrclib.net/api/search?track_name=$(python3 - <<'PY'
-import urllib.parse; print(urllib.parse.quote("Scar Tissue"))
+curl "https://lrclib.net/api/search?track_name=$(python3 - <<'PY'
+import urllib.parse; print(urllib.parse.quote("Me Dice Que Me Ama"))
 PY
 )&artist_name=$(python3 - <<'PY'
-import urllib.parse; print(urllib.parse.quote("Red Hot Chili Peppers"))
+import urllib.parse; print(urllib.parse.quote("Jesus Adrian Romero"))
 PY
 )" \
-| jq -r '((map(select((.trackName|ascii_downcase)=="scar tissue" and (.artistName|ascii_downcase)=="red hot chili peppers"))|first)//.[0])|.syncedLyrics' \
+| jq -r '((map(select((.trackName|ascii_downcase)=="me dice que me ama" and (.artistName|ascii_downcase)=="jesus adrian romero"))|first)//.[0])|.syncedLyrics' \
 | sed 's/\r$//' > "lyrics/${BASE}.lrc"
 
 # --- 3) Whisper on full mix (word timestamps, JSON out) ---
 whisper "$MP3" \
   --model large-v3 \
-  --language en \
+  --language es \
   --task transcribe \
   --word_timestamps True \
   --condition_on_previous_text False \
@@ -62,7 +63,7 @@ if [[ "$ENABLE_DEMUCS" == "1" ]]; then
   demucs -n htdemucs_6s "$MP3"
   whisper "separated/htdemucs_6s/${BASE}/vocals.wav" \
     --model large-v3 \
-    --language en \
+    --language es \
     --task transcribe \
     --word_timestamps True \
     --condition_on_previous_text False \
