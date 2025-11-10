@@ -21,7 +21,7 @@ OFFSET_DIR = PROJECT_ROOT / "offsets"
 META_DIR = PROJECT_ROOT / "meta"
 MP4_DIR = PROJECT_ROOT / "mp4s"
 
-# Visual constants – keep close to what you already had
+# Visual constants
 VIDEO_SIZE = "1280x720"
 VIDEO_FPS = 30
 FONTFILE = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
@@ -33,9 +33,9 @@ BORDER_COLOR = "black"
 BORDER_W = 2
 
 # Durations
-LYRIC_DURATION = 2.5   # seconds each lyric line is on screen
-NOTE_DURATION = 2.0    # seconds each note glyph is on screen
-INTRO_MIN_DURATION = 3.0  # minimum intro screen duration
+LYRIC_DURATION = 2.5         # seconds each lyric line is on screen
+NOTE_DURATION = 2.0          # seconds each note glyph is on screen
+INTRO_MIN_DURATION = 3.0     # minimum intro screen duration
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
@@ -87,7 +87,6 @@ def load_timings(slug: str) -> tuple[list[dict], Path]:
     if not events:
         raise SystemExit(f"No events loaded from {timing_path}")
 
-    # Sort by time_secs
     events.sort(key=lambda e: e["time"])
     return events, timing_path
 
@@ -133,7 +132,6 @@ def load_title(slug: str) -> str:
                 return artist
         except Exception:
             pass
-    # Fallback: nice slug
     return slug.replace("_", " ").title()
 
 
@@ -215,7 +213,6 @@ def main(argv=None):
     duration = ffprobe_duration(mp3_path)
     log("MP4", f"Audio duration: {fmt_time(duration)}", CYAN)
 
-    # Build filter graph
     title = load_title(slug)
 
     # First event start (with offset applied) for intro screen
@@ -253,7 +250,6 @@ def main(argv=None):
             is_note = False
             nominal_end = start + LYRIC_DURATION
 
-        # Clamp end to duration
         end = nominal_end
         if end > duration:
             end = duration
@@ -274,7 +270,12 @@ def main(argv=None):
         log("MP4", "No filters produced (this should not happen).", RED)
         sys.exit(1)
 
-    filter_complex = ",".join(filters)
+    # Explicitly wire filter graph: [0:v] → drawtext chain → [vout]
+    # filters[i] are pure drawtext=... expressions.
+    filter_complex = "[0:v]" + filters[0]
+    if len(filters) > 1:
+        filter_complex += "," + ",".join(filters[1:])
+    filter_complex += "[vout]"
 
     cmd = [
         "ffmpeg",
@@ -288,7 +289,7 @@ def main(argv=None):
         "-filter_complex",
         filter_complex,
         "-map",
-        "0:v",
+        "[vout]",
         "-map",
         "1:a",
         "-c:v",
