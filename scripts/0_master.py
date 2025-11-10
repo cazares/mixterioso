@@ -297,6 +297,30 @@ def run_step4_mp4(slug: str, profile: str) -> float:
         return 0.0
 
 
+def run_step4_calibrate(slug: str) -> float:
+    """
+    Run the offset calibration lab (4_calibrate.py) for a given slug.
+
+    This is optional and only used from interactive flow after step 3.
+    """
+    cmd = [
+        sys.executable,
+        str(SCRIPTS_DIR / "4_calibrate.py"),
+        "--slug",
+        slug,
+    ]
+    try:
+        t = run(cmd, "CALIB")
+        return t
+    except subprocess.CalledProcessError as e:
+        log(
+            "CALIB",
+            f"Calibration step failed (exit {e.returncode}).",
+            RED,
+        )
+        return 0.0
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Karaoke pipeline master (1=txt/mp3, 2=stems, 3=timing, 4=mp4)."
@@ -474,9 +498,19 @@ def main(argv=None):
     if 4 in steps:
         t4 = run_step4_mp4(slug, args.profile)
 
-    # NEW: if you just ran timing (step 3) but did not request step 4,
-    # and you're in interactive mode, offer to generate the MP4 now.
+    # If you just ran timing (step 3) but did not request step 4,
+    # and you're in interactive mode, offer optional calibration
+    # first, then the existing "Generate MP4 now?" flow.
     if (3 in steps) and (4 not in steps) and not args.skip_ui:
+        try:
+            cal_ans = input(
+                "Step 3 (timing) completed. Run offset calibration lab before MP4? [y/N]: "
+            ).strip().lower()
+        except EOFError:
+            cal_ans = "n"
+        if cal_ans in ("y", "yes"):
+            run_step4_calibrate(slug)
+
         try:
             ans = input(
                 "Step 3 (timing) completed. Generate MP4 now (step 4) with current offset? [Y/n]: "

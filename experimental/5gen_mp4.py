@@ -271,11 +271,15 @@ def main(argv=None):
         sys.exit(1)
 
     # Explicitly wire filter graph: [0:v] → drawtext chain → [vout]
-    # filters[i] are pure drawtext=... expressions.
     filter_complex = "[0:v]" + filters[0]
     if len(filters) > 1:
         filter_complex += "," + ",".join(filters[1:])
     filter_complex += "[vout]"
+
+    # Bound the color source to the audio duration to avoid infinite video
+    color_src = (
+        f"color=size={VIDEO_SIZE}:rate={VIDEO_FPS}:color=black:d={duration:.3f}"
+    )
 
     cmd = [
         "ffmpeg",
@@ -283,7 +287,7 @@ def main(argv=None):
         "-f",
         "lavfi",
         "-i",
-        f"color=size={VIDEO_SIZE}:rate={VIDEO_FPS}:color=black",
+        color_src,
         "-i",
         str(mp3_path),
         "-filter_complex",
@@ -298,6 +302,7 @@ def main(argv=None):
         "fast",
         "-c:a",
         "aac",
+        "-shortest",
         str(out_path),
     ]
 
