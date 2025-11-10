@@ -298,7 +298,9 @@ def build_ass(
         log("ASS", f"Wrote ASS subtitles (title only) to {ass_path}", GREEN)
         return ass_path
 
-    first_lyric_time = max(0.0, unified[0][0])
+    offsettt = -10.0
+    first_lyric_time = max(0.0, unified[0][0] + offsettt)
+    
 
     # Intro title / artist card, centered, with no lyrics / previews / divider.
     title_lines = []
@@ -339,9 +341,9 @@ def build_ass(
     # One main line per event, one up-next line, no overlaps.
     n = len(unified)
     for i, (t, raw_text, _line_index) in enumerate(unified):
-        start = max(0.0, t)
+        start = max(0.0, t + offsettt)
         if i < n - 1:
-            end = max(start, unified[i + 1][0])
+            end = max(start, unified[i + 1][0] - offsettt)
         else:
             end = audio_duration or (start + 5.0)
 
