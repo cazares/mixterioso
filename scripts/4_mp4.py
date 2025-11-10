@@ -82,8 +82,8 @@ NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX + NEXT_LABEL_TOP_MARGIN_PX
 
 # Fade timing (milliseconds) applied to each lyric change.
 # Only used for the main lyric line and the preview ("next line") text.
-FADE_IN_MS = 125
-FADE_OUT_MS = 125
+FADE_IN_MS = 50
+FADE_OUT_MS = 50
 
 # =============================================================================
 # COLOR AND OPACITY CONSTANTS
