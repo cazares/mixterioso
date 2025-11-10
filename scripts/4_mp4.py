@@ -14,9 +14,9 @@ CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
+BLUE = "\033[34m"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = BASE_DIR / "scripts"
 TXT_DIR = BASE_DIR / "txts"
 MP3_DIR = BASE_DIR / "mp3s"
 MIXES_DIR = BASE_DIR / "mixes"
@@ -38,12 +38,12 @@ def slugify(text: str) -> str:
     return base or "song"
 
 
+# =============================================================================
+# Layout constants for 1920x1080 canvas.
+
 VIDEO_WIDTH = 1920
 VIDEO_HEIGHT = 1080
 
-# =============================================================================
-# LAYOUT CONSTANTS
-# =============================================================================
 # Fraction of the total video height that is reserved for the *bottom* box
 # where the "next lyric" preview text lives. Increase this to make the bottom
 # preview box taller, decrease it to give more space to the main (top) lyrics.
@@ -56,10 +56,20 @@ TOP_BAND_FRACTION = 1.0 - BOTTOM_BOX_HEIGHT_FRACTION
 NEXT_LYRIC_TOP_MARGIN_PX = 50
 NEXT_LYRIC_BOTTOM_MARGIN_PX = 50
 
-# Divider line margins (left/right) as absolute pixels based on VIDEO_WIDTH.
+# Vertical offset (in pixels) by which the thin divider line between the
+# current-lyric region and the next-lyric region is moved upward from the
+# top edge of the bottom box. Positive values move the line up, negative
+# values move it down.
+DIVIDER_LINE_OFFSET_UP_PX = 0
+
+# Total height of the divider line shape in pixels. Can be fractional for
+# anti-aliased "hairline" looks. 1.0 ~= 1px at PlayResY=VIDEO_HEIGHT.
+DIVIDER_HEIGHT_PX = 0.25
+
+# Horizontal margins for the divider line, in pixels. These are measured
+# from the left/right edges of the full video canvas inward.
 DIVIDER_LEFT_MARGIN_PX = int(VIDEO_WIDTH * 0.035)
 DIVIDER_RIGHT_MARGIN_PX = int(VIDEO_WIDTH * 0.035)
-DIVIDER_HEIGHT_PX = 0.25
 
 # Where to position the top "current lyric" text vertically. We put it roughly
 # in the middle of the top band and let ASS's alignment handle the rest.
@@ -67,8 +77,6 @@ TOP_LYRIC_MARGIN_TOP_PX = 200
 
 # Fonts
 DEFAULT_UI_FONT_SIZE = 120
-MAX_FONT_SIZE = 200
-MIN_FONT_SIZE = 20
 
 # Scaling factors for the bottom "next" line and "Next:" label
 NEXT_LINE_FONT_SCALE = 0.35
@@ -80,6 +88,10 @@ NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX + NEXT_LABEL_TOP_MARGIN_PX
 # lyric and the preview lyric. Divider and "Next:" label do NOT fade.
 FADE_IN_MS = 50
 FADE_OUT_MS = 50
+
+# Font size guard rails
+MIN_FONT_SIZE = 20
+MAX_FONT_SIZE = 200
 
 # =============================================================================
 # COLOR AND OPACITY CONSTANTS
@@ -120,9 +132,12 @@ TOP_BOX_BG_ALPHA_HEX = "00"           # fully transparent back color for top ban
 NEXT_LABEL_COLOR_RGB = "FFFFFF"        # white
 NEXT_LABEL_ALPHA_HEX = GLOBAL_NEXT_ALPHA_HEX
 
-# Global lyric offset (seconds). This is read from an environment variable so
-# you can tweak timing without regenerating the CSV.
+# Global lyric offset in seconds. Positive = delay, negative = earlier.
+# This is applied uniformly to all lyric timestamps at render time so you can
+# nudge the whole subtitle track without re-running timing.
 LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0") or "0")
+# If you prefer hardcoded only, comment the line above and do e.g.:
+# LYRICS_OFFSET_SECS = -0.35  # shift lyrics 350 ms earlier
 
 # Music-only heuristic helpers.
 MUSIC_NOTE_CHARS = "♪♫♬♩♭♯"
@@ -155,6 +170,34 @@ def seconds_to_ass_time(sec: float) -> str:
     m = int(rem // 60)
     s = rem % 60
     return f"{h:d}:{m:02d}:{s:05.2f}"
+
+
+def is_music_only(text: str) -> bool:
+    """
+    Heuristic for lines that are "music only" (notes, emoji, or keywords).
+    Used to center the line and hide the bottom rectangle.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    # Explicit music-note characters.
+    if any(ch in MUSIC_NOTE_CHARS for ch in stripped):
+        return True
+
+    # Only symbols / emoji, no alphanumerics.
+    if not any(ch.isalnum() for ch in stripped):
+        return True
+
+    # Keyword-based detection.
+    lower = stripped.lower()
+    for kw in MUSIC_NOTE_KEYWORDS:
+        if kw in lower:
+            return True
+
+    return False
 
 
 def read_meta(slug: str) -> tuple[str, str]:
@@ -223,34 +266,6 @@ def probe_audio_duration(audio_path: Path) -> float:
     return max(0.0, val)
 
 
-def is_music_only(text: str) -> bool:
-    """
-    Heuristic for lines that are "music only" (notes, emoji, or keywords).
-    Used to center the line and hide the bottom rectangle.
-    """
-    if not text:
-        return False
-    stripped = text.strip()
-    if not stripped:
-        return False
-
-    # Explicit music-note characters.
-    if any(ch in MUSIC_NOTE_CHARS for ch in stripped):
-        return True
-
-    # Only symbols / emoji, no alphanumerics.
-    if not any(ch.isalnum() for ch in stripped):
-        return True
-
-    # Keyword-based detection.
-    lower = stripped.lower()
-    for kw in MUSIC_NOTE_KEYWORDS:
-        if kw in lower:
-            return True
-
-    return False
-
-
 def build_ass(
     slug: str,
     artist: str,
@@ -268,20 +283,31 @@ def build_ass(
     if audio_duration <= 0.0:
         audio_duration = 5.0
 
+    # We split the video into a top region (current lyric) and a bottom region
+    # (preview of the next lyric).
     bottom_box_height = int(VIDEO_HEIGHT * BOTTOM_BOX_HEIGHT_FRACTION)
     top_box_height = VIDEO_HEIGHT - bottom_box_height
 
+    # This is roughly the vertical center of the top region.
     y_top_center = int(top_box_height * 0.5)
+
+    # For music-only lines (glyphs, instrumentals), we want full-screen vertical
+    # centering instead of the 2-box layout.
     y_center_full = VIDEO_HEIGHT // 2
-    y_divider_nominal = top_box_height
+
+    # Where the divider line sits nominally.
+    y_divider_nominal = top_box_height - DIVIDER_LINE_OFFSET_UP_PX
+
+    x_center = VIDEO_WIDTH // 2
     y_main_top = y_top_center
 
     margin_v = TOP_LYRIC_MARGIN_TOP_PX
 
+    # Precomputed ASS color strings for top band.
     top_primary_ass = f"&H{TOP_LYRIC_TEXT_ALPHA_HEX}{rgb_to_bgr(TOP_LYRIC_TEXT_COLOR_RGB)}"
     top_back_ass = f"&H{TOP_BOX_BG_ALPHA_HEX}{rgb_to_bgr(TOP_BOX_BG_COLOR_RGB)}"
-    secondary_ass = "&H000000FF"
-    outline_ass = "&H00000000"
+    secondary_ass = "&H000000FF"  # unchanged
+    outline_ass = "&H00000000"    # black outline
     back_ass = top_back_ass
 
     header_lines = [
@@ -331,8 +357,8 @@ def build_ass(
 
     offset = LYRICS_OFFSET_SECS
 
-    # Detect whether timings CSV appears partial. If the gap between
-    # the last timed line (plus offset) and the end of the audio is large,
+    # Detect whether timings CSV appears partial. If the gap between the
+    # last timed line (plus offset) and the end of the audio is large,
     # avoid holding the final line on screen all the way to song end.
     is_partial = False
     if unified and audio_duration:
@@ -351,30 +377,39 @@ def build_ass(
             title_lines = ["No lyrics"]
 
         intro_block = "\\N".join(title_lines)
+        intro_end_time = audio_duration
+
+        # Single centered intro block.
         events.append(
             "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(0.0),
-                end=seconds_to_ass_time(audio_duration),
-                text=f"{{\\an5\\bord2\\shad0}}{intro_block}",
+                end=seconds_to_ass_time(intro_end_time),
+                text=f"{{\\an5\\pos({x_center},{y_center_full})}}{ass_escape(intro_block)}",
             )
         )
+
         ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
         log("ASS", f"Wrote ASS subtitles (title only) to {ass_path}", GREEN)
         return ass_path
 
+    # Fade tag used only for per-line lyric and preview events.
+    fade_tag = ""
+    if FADE_IN_MS > 0 or FADE_OUT_MS > 0:
+        fade_tag = f"\\fad({int(FADE_IN_MS)},{int(FADE_OUT_MS)})"
+
     n = len(unified)
-    playresx = VIDEO_WIDTH
-
-    bottom_box_top = top_box_height
-    bottom_box_bottom = VIDEO_HEIGHT
-
-    next_line_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
-    next_label_font = max(1, int(font_size_script * NEXT_LABEL_FONT_SCALE))
-
     next_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
     divider_color_bgr = rgb_to_bgr(DIVIDER_COLOR_RGB)
     next_label_color_bgr = rgb_to_bgr(NEXT_LABEL_COLOR_RGB)
 
+    playresx = VIDEO_WIDTH
+
+    # Bottom-region geometry.
+    bottom_box_top = top_box_height
+    bottom_box_bottom = VIDEO_HEIGHT
+    bottom_box_height = bottom_box_bottom - bottom_box_top
+
+    # Clamp divider geometry.
     divider_height = max(0.5, float(DIVIDER_HEIGHT_PX))
     left_margin = float(DIVIDER_LEFT_MARGIN_PX)
     right_margin = float(DIVIDER_RIGHT_MARGIN_PX)
@@ -384,8 +419,16 @@ def build_ass(
         x_left = 0.0
         x_right = float(playresx)
 
+    line_y = y_divider_nominal
     label_x = NEXT_LABEL_LEFT_MARGIN_PX
     label_y = y_divider_nominal + NEXT_LABEL_TOP_MARGIN_PX
+
+    # Font sizes for preview and label.
+    preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
+    next_label_font = max(1, int(font_size_script * NEXT_LABEL_FONT_SCALE))
+
+    # Vertical position for preview text.
+    y_next = bottom_box_top + NEXT_LYRIC_TOP_MARGIN_PX
 
     # Per-line events.
     for i, (t, raw_text, _line_index) in enumerate(unified):
@@ -408,68 +451,38 @@ def build_ass(
 
         # Main lyric line (with fade).
         main_text = ass_escape(text_stripped)
-
-        # Top band: center horizontally, near top, fade in/out.
-        fade_in = FADE_IN_MS
-        fade_out = FADE_OUT_MS
-
-        if music_only:
-            main_tag = f"{{\\an5\\bord2\\shad1\\fad({fade_in},{fade_out})}}"
-        else:
-            main_tag = f"{{\\an8\\bord2\\shad1\\fad({fade_in},{fade_out})}}"
-
+        y_for_line = y_center_full if music_only else y_main_top
+        main_tag = f"{{\\an5\\pos({x_center},{y_for_line}){fade_tag}}}"
         events.append(
-            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+            "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(start),
                 end=seconds_to_ass_time(end),
                 text=main_tag + main_text,
             )
         )
 
-        # Decide if we should draw the bottom "Next" UI.
-        is_last = (i == n - 1)
-        show_bottom = (not music_only) and (not is_last)
+        # Decide whether to show bottom UI (divider, label, next-lyric preview).
+        if i >= n - 1:
+            continue  # last line: no "Next:" UI at all
 
-        if not show_bottom:
+        next_raw = unified[i + 1][1]
+        if not next_raw:
             continue
 
-        # Bottom band "Next" preview.
-        next_text_raw = unified[i + 1][1].strip()
-        next_body = ass_escape(next_text_raw)
+        # Do not show next UI if current or next is "music only".
+        if music_only or is_music_only(next_raw):
+            continue
 
-        next_fade_in = FADE_IN_MS
-        next_fade_out = FADE_OUT_MS
-
-        preview_tag = (
-            f"{{\\an8\\fs{next_line_font}\\bord1\\shad0"
-            f"\\pos({playresx // 2},{bottom_box_top + NEXT_LYRIC_TOP_MARGIN_PX})"
-            f"\\1c&H{next_color_bgr}&"
-            f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
-            f"\\fad({next_fade_in},{next_fade_out})}}"
-        )
-
-        events.append(
-            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(start),
-                end=seconds_to_ass_time(end),
-                text=preview_tag + next_body,
-            )
-        )
-
-        # Divider line as a thin filled rectangle.
+        # Divider line (no fade).
         divider_tag = (
-            f"{{\\an8\\bord0\\shad0"
+            f"{{\\an7\\pos(0,{line_y})"
             f"\\1c&H{divider_color_bgr}&"
             f"\\1a&H{DIVIDER_ALPHA_HEX}&"
-            f"\\p1}}"
+            f"\\bord0\\shad0\\p1}}"
         )
         divider_shape = (
-            f"m {x_left} {y_divider_nominal} "
-            f"l {x_right} {y_divider_nominal} "
-            f"l {x_right} {y_divider_nominal + divider_height} "
-            f"l {x_left} {y_divider_nominal + divider_height} "
-            f"l {x_left} {y_divider_nominal}"
-            "{\\p0}"
+            f"m {x_left} 0 l {x_right} 0 "
+            f"l {x_right} {divider_height} l {x_left} {divider_height}{{\\p0}}"
         )
         events.append(
             "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
@@ -494,24 +507,64 @@ def build_ass(
             )
         )
 
+        # Next-lyric preview text (with fade).
+        preview_text = ass_escape(next_raw)
+        preview_tag = (
+            f"{{\\an5\\pos({x_center},{y_next})"
+            f"\\fs{preview_font}"
+            f"\\1c&H{next_color_bgr}&"
+            f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
+            f"{fade_tag}}}"
+        )
+        events.append(
+            "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(start),
+                end=seconds_to_ass_time(end),
+                text=preview_tag + preview_text,
+            )
+        )
+
     ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
     log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
     return ass_path
 
 
 def choose_audio(slug: str, profile: str) -> Path:
-    """
-    Choose audio file:
-      - Prefer mixes/{slug}_{profile}.wav if it exists.
-      - Else fall back to mp3s/{slug}.mp3.
-    """
-    wav_path = MIXES_DIR / f"{slug}_{profile}.wav"
-    if wav_path.exists():
-        return wav_path
+    mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
+    mix_mp3 = MIXES_DIR / f"{slug}_{profile}.mp3"
     mp3_path = MP3_DIR / f"{slug}.mp3"
+
+    if profile == "lyrics":
+        audio_path = mp3_path
+        if not audio_path.exists():
+            print(f"Audio mp3 not found for slug={slug}: {audio_path}")
+            sys.exit(1)
+        print(f"[AUDIO] Using original mp3 for profile=lyrics: {audio_path}")
+        return audio_path
+
+    if mix_wav.exists():
+        print(f"[AUDIO] Using mixed WAV for profile={profile}: {mix_wav}")
+        return mix_wav
+
+    if mix_mp3.exists():
+        print(f"[AUDIO] Using mixed MP3 for profile={profile}: {mix_mp3}")
+        return mix_mp3
+
     if mp3_path.exists():
+        print(
+            f"[AUDIO] Mixed WAV/MP3 for profile={profile} not found.\n"
+            f"        Falling back to original mp3: {mp3_path}"
+        )
         return mp3_path
-    raise SystemExit(f"No audio found for slug={slug}, profile={profile}")
+
+    print(
+        f"Audio not found for slug={slug}, profile={profile}.\n"
+        f"Tried:\n"
+        f"  mix wav: {mix_wav}\n"
+        f"  mix mp3: {mix_mp3}\n"
+        f"  mp3: {mp3_path}"
+    )
+    sys.exit(1)
 
 
 def open_path(path: Path) -> None:
@@ -571,27 +624,35 @@ def main(argv=None):
             except EOFError:
                 resp = ""
             if not resp:
-                font_size_script = default_font_size
+                font_size_value = default_font_size
             else:
                 try:
                     v = int(resp)
-                    font_size_script = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, v))
+                    if MIN_FONT_SIZE <= v <= MAX_FONT_SIZE:
+                        font_size_value = v
+                    else:
+                        print(
+                            f"Value {v} out of range; using default {default_font_size}"
+                        )
+                        font_size_value = default_font_size
                 except ValueError:
-                    font_size_script = default_font_size
+                    print(
+                        f"Invalid integer; using default font size {default_font_size}"
+                    )
+                    font_size_value = default_font_size
         else:
-            font_size_script = default_font_size
-    else:
-        font_size_script = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, font_size_value))
+            font_size_value = default_font_size
 
-    log(
-        "ARGS",
-        f"slug={slug}, profile={profile}, font={args.font_name}, size={font_size_script}",
-        CYAN,
-    )
+    ui_font_size = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, font_size_value))
+    ass_font_size = ui_font_size
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    log("MP4GEN", f"Slug={slug}, profile={profile}", CYAN)
 
     audio_path = choose_audio(slug, profile)
     audio_duration = probe_audio_duration(audio_path)
-    if audio_duration <= 0.0:
+    if audio_duration <= 0:
         log("DUR", f"Audio duration unknown or zero for {audio_path}", YELLOW)
 
     artist, title = read_meta(slug)
@@ -599,7 +660,7 @@ def main(argv=None):
     log("META", f'Artist="{artist}", Title="{title}", entries={len(timings)}', CYAN)
 
     ass_path = build_ass(
-        slug, artist, title, timings, audio_duration, args.font_name, font_size_script
+        slug, artist, title, timings, audio_duration, args.font_name, ass_font_size
     )
 
     out_mp4 = Path(args.output_mp4) if getattr(args, "output_mp4", None) else OUTPUT_DIR / f"{slug}_{profile}.mp4"
