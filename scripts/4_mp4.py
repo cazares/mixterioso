@@ -42,14 +42,14 @@ TOP_BAND_FRACTION = 1.0 - BOTTOM_BOX_HEIGHT_FRACTION
 # These control how far the preview text sits away from the top and bottom
 # edges of the bottom box. The preview baseline is centered between these
 # margins.
-NEXT_LYRIC_TOP_MARGIN_PX = 50
-NEXT_LYRIC_BOTTOM_MARGIN_PX = 50
+NEXT_LYRIC_TOP_MARGIN_PX = 60
+NEXT_LYRIC_BOTTOM_MARGIN_PX = 60
 
 # Vertical offset (in pixels) by which the thin divider line between the
 # current-lyric region and the next-lyric region is moved upward from the
 # top edge of the bottom box. Positive values move the line up, negative
 # values move it down.
-DIVIDER_LINE_OFFSET_UP_PX = 50
+DIVIDER_LINE_OFFSET_UP_PX = 0
 
 # Within the top band, you can nudge the main line up or down by changing
 # this fraction of the top-band height. Positive values move text DOWN.
@@ -60,7 +60,7 @@ TITLE_EXTRA_OFFSET_FRACTION = -0.20
 
 # How big the next-lyric text is relative to the main lyric text.
 #  0.60 = 60% of the main font size.
-NEXT_LINE_FONT_SCALE = 0.60
+NEXT_LINE_FONT_SCALE = 0.50
 
 # =============================================================================
 # COLOR AND OPACITY CONSTANTS
@@ -422,8 +422,9 @@ def build_ass(
 
     # Thin horizontal divider between current lyric region and next-lyric region.
     # Uses the GLOBAL_NEXT_COLOR_RGB and GLOBAL_NEXT_ALPHA_HEX so the line and
-    # the preview text always share the same "UI" look. \bord0\shad0 keeps it
-    # visually 1px tall even though the style has Outline=4.
+    # the preview text always share the same "UI" look.
+    # \bord0 and \shad0 ensure it renders as a 1px bar even though the style
+    # Outline is larger.
     divider_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
     divider_text = (
         f"{{\\an7\\pos(0,{line_y})"
