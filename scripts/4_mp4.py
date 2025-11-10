@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import os
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -48,6 +49,11 @@ NEXT_LINE_ALPHA_HEX = "8080"
 # Base UI font size in "points" (converted to ASS by a multiplier).
 DEFAULT_UI_FONT_SIZE = 120
 ASS_FONT_MULTIPLIER = 1.5  # multiple of UI font size to get ASS fontsize
+
+# Global lyrics offset in seconds. Positive = delay, negative = earlier.
+LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0") or "0")
+# If you prefer hardcoded only, comment the line above and do e.g.:
+# LYRICS_OFFSET_SECS = -0.35  # shift lyrics 350 ms earlier
 
 
 def log(prefix: str, msg: str, color: str = RESET) -> None:
@@ -275,6 +281,8 @@ def build_ass(
 
     unified.sort(key=lambda x: x[0])
 
+    offset = LYRICS_OFFSET_SECS
+
     # If no timings, just show a centered title card for the whole song.
     if not unified:
         title_lines = []
@@ -298,9 +306,7 @@ def build_ass(
         log("ASS", f"Wrote ASS subtitles (title only) to {ass_path}", GREEN)
         return ass_path
 
-    offsettt = -10.0
-    first_lyric_time = max(0.0, unified[0][0] + offsettt)
-    
+    first_lyric_time = max(0.0, unified[0][0] + offset)
 
     # Intro title / artist card, centered, with no lyrics / previews / divider.
     title_lines = []
@@ -341,9 +347,9 @@ def build_ass(
     # One main line per event, one up-next line, no overlaps.
     n = len(unified)
     for i, (t, raw_text, _line_index) in enumerate(unified):
-        start = max(0.0, t + offsettt)
+        start = max(0.0, t + offset)
         if i < n - 1:
-            end = max(start, unified[i + 1][0] - offsettt)
+            end = max(start, unified[i + 1][0] + offset)
         else:
             end = audio_duration or (start + 5.0)
 
