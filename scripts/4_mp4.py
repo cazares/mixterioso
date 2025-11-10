@@ -42,14 +42,23 @@ TOP_BAND_FRACTION = 1.0 - BOTTOM_BOX_HEIGHT_FRACTION
 # These control how far the preview text sits away from the top and bottom
 # edges of the bottom box. The preview baseline is centered between these
 # margins.
-NEXT_LYRIC_TOP_MARGIN_PX = 60
-NEXT_LYRIC_BOTTOM_MARGIN_PX = 60
+NEXT_LYRIC_TOP_MARGIN_PX = 50
+NEXT_LYRIC_BOTTOM_MARGIN_PX = 50
 
 # Vertical offset (in pixels) by which the thin divider line between the
 # current-lyric region and the next-lyric region is moved upward from the
 # top edge of the bottom box. Positive values move the line up, negative
 # values move it down.
 DIVIDER_LINE_OFFSET_UP_PX = 0
+
+# Total height of the divider line shape in pixels. Can be fractional for
+# anti-aliased "hairline" looks. 1.0 ~= 1px at PlayResY=VIDEO_HEIGHT.
+DIVIDER_HEIGHT_PX = 0.01
+
+# Horizontal margins for the divider line, in pixels. These are measured
+# from the left/right edges of the video frame. Set to 0 for edge-to-edge.
+DIVIDER_LEFT_MARGIN_PX = 50.0
+DIVIDER_RIGHT_MARGIN_PX = 50.0
 
 # Within the top band, you can nudge the main line up or down by changing
 # this fraction of the top-band height. Positive values move text DOWN.
@@ -59,38 +68,57 @@ VERTICAL_OFFSET_FRACTION = 0.0
 TITLE_EXTRA_OFFSET_FRACTION = -0.20
 
 # How big the next-lyric text is relative to the main lyric text.
-#  0.60 = 60% of the main font size.
-NEXT_LINE_FONT_SCALE = 0.50
+#  0.50 = 50% of the main font size.
+NEXT_LINE_FONT_SCALE = 0.3
+
+# How big the "Up next:" label text is relative to the main lyric text.
+# By default this is 40% of the next-lyric font scale, so it is smaller
+# than the actual preview line.
+UP_NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.35
+
+# Margins for the "Up next:" label within the bottom box. The label is
+# placed at the top-left corner of the bottom rectangle with these offsets.
+UP_NEXT_LABEL_TOP_MARGIN_PX = 10
+UP_NEXT_LABEL_LEFT_MARGIN_PX = 10
 
 # =============================================================================
 # COLOR AND OPACITY CONSTANTS
 # =============================================================================
-# All ASS colors are encoded as AABBGGRR (alpha, blue, green, red) under the hood.
-# To make configuration less painful, we keep everything as simple hex RRGGBB here
-# and build the AABBGGRR/BGGRR codes where needed.
+# All ASS colors are encoded as AABBGGRR (alpha, blue, green, red).
+# Alpha:
+#   "00" = fully opaque
+#   "FF" = fully transparent
 
 # Global base text + line color for the *bottom* "next lyric" area and divider line.
 # This does NOT affect the top current-lyric text color; that has its own constant.
-GLOBAL_NEXT_COLOR_RGB = "FFFFFF"  # white
+GLOBAL_NEXT_COLOR_RGB = "FFFFFF"   # white
 
-# Global alpha for both the divider line and the next-lyric text.
-#  - "00" = fully opaque
-#  - "FF" = fully transparent
-GLOBAL_NEXT_ALPHA_HEX = "70"  # semi-transparent
+# Global alpha for the next-lyric text.
+GLOBAL_NEXT_ALPHA_HEX = "B3"       # semi-transparent text
 
-# Top (current lyric) font color.
-TOP_LYRIC_TEXT_COLOR_RGB = "FFFFFF"  # white
+# Divider line color and alpha. Defaults reuse the same color as the
+# next-lyric text but with an independently tweakable opacity.
+DIVIDER_COLOR_RGB = GLOBAL_NEXT_COLOR_RGB
+DIVIDER_ALPHA_HEX = "01"           # semi-transparent divider
 
-# Background color for the bottom "next lyric" rectangle.
-# Right now this is only wired as a configuration hook; if you want a solid
-# bottom bar behind the preview text, we can use this to draw a p1 rectangle.
-BOTTOM_BOX_BG_COLOR_RGB = "000000"  # black (currently unused as a solid bar)
+# Top (current lyric) font color and alpha.
+TOP_LYRIC_TEXT_COLOR_RGB = "FFFFFF"    # white
+TOP_LYRIC_TEXT_ALPHA_HEX = "00"       # fully opaque
 
-# Background color for the top "current lyric" rectangle.
-# This currently drives the style's BackColour, which gives a subtle
-# background when BorderStyle=3. With the current style (BorderStyle=1),
-# this mostly matters for karaoke highlight or if we later turn on boxes.
-TOP_BOX_BG_COLOR_RGB = "000000"  # black
+# Background color for the bottom "next lyric" rectangle and its alpha.
+# Currently just a configuration hook; if you later draw a bottom bar, use both.
+BOTTOM_BOX_BG_COLOR_RGB = "0A0A0A"    # black
+BOTTOM_BOX_BG_ALPHA_HEX = "00"        # 50% opaque if/when used
+
+# Background color for the top "current lyric" rectangle and its alpha.
+# This drives the style's BackColour.
+TOP_BOX_BG_COLOR_RGB = "030303"       # black
+TOP_BOX_BG_ALPHA_HEX = "00"           # 50% opaque back colour for top band
+
+# "Up next:" label color and alpha. Separate from GLOBAL_NEXT_* so you can
+# tweak the label independently if desired.
+UP_NEXT_LABEL_COLOR_RGB = "FFFFFF"    # white
+UP_NEXT_LABEL_ALPHA_HEX = "1A"        # semi-transparent label
 
 # Base UI font size in "points" (converted to ASS by a multiplier).
 DEFAULT_UI_FONT_SIZE = 120
@@ -296,7 +324,7 @@ def build_ass(
     x_center = playresx // 2
     y_center_full = playresy // 2
 
-    # Divider line: we start from the nominal divider (top of bottom box)
+    # Divider line: start from the nominal divider (top of bottom box)
     # and move it upward by DIVIDER_LINE_OFFSET_UP_PX.
     line_y = max(0, y_divider_nominal - DIVIDER_LINE_OFFSET_UP_PX)
 
@@ -313,15 +341,18 @@ def build_ass(
         + inner_bottom_box_height // 2
     )
 
+    # Font sizes for next-lyric line and the "Up next:" label.
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
+    up_next_label_font = max(1, int(font_size_script * UP_NEXT_LABEL_FONT_SCALE))
+
     margin_v = 0
 
-    # Precomputed ASS color strings.
-    top_primary_ass = f"&H00{rgb_to_bgr(TOP_LYRIC_TEXT_COLOR_RGB)}"
-    top_back_ass = f"&H80{rgb_to_bgr(TOP_BOX_BG_COLOR_RGB)}"
+    # Precomputed ASS color strings for top band (PrimaryColour and BackColour).
+    top_primary_ass = f"&H{TOP_LYRIC_TEXT_ALPHA_HEX}{rgb_to_bgr(TOP_LYRIC_TEXT_COLOR_RGB)}"
+    top_back_ass = f"&H{TOP_BOX_BG_ALPHA_HEX}{rgb_to_bgr(TOP_BOX_BG_COLOR_RGB)}"
     # Secondary, outline, etc. remain close to the original defaults.
-    secondary_ass = "&H000000FF"  # red (used for karaoke highlighting if ever needed)
-    outline_ass = "&H00000000"    # black
+    secondary_ass = "&H000000FF"  # opaque red (used for karaoke highlighting if ever needed)
+    outline_ass = "&H00000000"    # opaque black outline
     back_ass = top_back_ass
 
     header_lines = [
@@ -421,24 +452,51 @@ def build_ass(
         )
 
     # Thin horizontal divider between current lyric region and next-lyric region.
-    # Uses the GLOBAL_NEXT_COLOR_RGB and GLOBAL_NEXT_ALPHA_HEX so the line and
-    # the preview text always share the same "UI" look.
-    # \bord0 and \shad0 ensure it renders as a 1px bar even though the style
-    # Outline is larger.
-    divider_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
+    # Uses the DIVIDER_COLOR_RGB and DIVIDER_ALPHA_HEX so the line opacity is
+    # independently adjustable. \bord0 and \shad0 ensure it renders as a
+    # hairline even though the style Outline is larger. Height and margins
+    # are configurable.
+    divider_color_bgr = rgb_to_bgr(DIVIDER_COLOR_RGB)
+    divider_height = max(0.5, float(DIVIDER_HEIGHT_PX))
+    left_margin = max(0.0, float(DIVIDER_LEFT_MARGIN_PX))
+    right_margin = max(0.0, float(DIVIDER_RIGHT_MARGIN_PX))
+    x_left = left_margin
+    x_right = playresx - right_margin
+    if x_right <= x_left:
+        x_left = 0.0
+        x_right = float(playresx)
+
     divider_text = (
         f"{{\\an7\\pos(0,{line_y})"
         f"\\1c&H{divider_color_bgr}&"
-        f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
+        f"\\1a&H{DIVIDER_ALPHA_HEX}&"
         f"\\bord0\\shad0"
         f"\\p1}}"
-        f"m 0 0 l {playresx} 0 l {playresx} 1 l 0 1{{\\p0}}"
+        f"m {x_left} 0 l {x_right} 0 l {x_right} {divider_height} l {x_left} {divider_height}{{\\p0}}"
     )
     events.append(
         "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
             start=seconds_to_ass_time(first_lyric_time),
             end=seconds_to_ass_time(audio_duration),
             text=divider_text,
+        )
+    )
+
+    # "Up next:" label in the upper-left corner of the bottom rectangle.
+    up_next_label_color_bgr = rgb_to_bgr(UP_NEXT_LABEL_COLOR_RGB)
+    label_x = UP_NEXT_LABEL_LEFT_MARGIN_PX
+    label_y = y_divider_nominal + UP_NEXT_LABEL_TOP_MARGIN_PX
+    up_next_label_event = (
+        f"{{\\an7\\pos({label_x},{label_y})"
+        f"\\fs{up_next_label_font}"
+        f"\\1c&H{up_next_label_color_bgr}&"
+        f"\\1a&H{UP_NEXT_LABEL_ALPHA_HEX}&}}Up next:"
+    )
+    events.append(
+        "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+            start=seconds_to_ass_time(first_lyric_time),
+            end=seconds_to_ass_time(audio_duration),
+            text=up_next_label_event,
         )
     )
 
