@@ -17,7 +17,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 MP3_DIR = BASE_DIR / "mp3s"
 TIMINGS_DIR = BASE_DIR / "timings"
 OFFSETS_DIR = BASE_DIR / "offsets"
-OUTPUT_DIR = BASE_DIR / "output"
+MP4_DIR = BASE_DIR / "mp4s"
 
 WIDTH = 1280
 HEIGHT = 720
@@ -75,7 +75,7 @@ def load_offset(slug: str) -> float:
 
 def build_drawtext_filters(events: list[dict], offset: float) -> str:
     """
-    Build a drawtext chain from timing events and a global offset.
+    Build drawtext chain from timing events and a global offset.
     CSV remains intact; we only shift times here.
     """
     if not events:
@@ -146,8 +146,8 @@ def main(argv=None):
     if not audio_path.exists():
         raise SystemExit(f"Audio not found: {audio_path}")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_DIR / f"{slug}.mp4"
+    MP4_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = MP4_DIR / f"{slug}.mp4"
 
     if SAFE_REGEN and out_path.exists():
         log("MP4", f"Output already exists, skipping: {out_path}", YELLOW)
@@ -197,4 +197,4 @@ def main(argv=None):
 if __name__ == "__main__":
     main()
 
-# end of 5_gen_mp4.py
+# end of 5gen_mp4.py

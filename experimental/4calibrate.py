@@ -133,7 +133,7 @@ class SnippetPlayer:
 def find_current_event(events: list[dict], pos: float, offset: float) -> int:
     """
     Given absolute audio position 'pos' and global offset,
-    return index of current lyric line (or -1 if before first).
+    return index (in events list) of current lyric line (or -1).
     We treat 'pos - offset' as the logical position on the timing axis.
     """
     adjusted = pos - offset
@@ -191,21 +191,22 @@ def calibration_ui(
         prev_text = ""
         curr_text = "<no line>"
         next_text = ""
-        if lines:
-            # map idx (over events) to index in lines
-            line_pos = -1
-            for j, e in enumerate(events):
-                if e["line_index"] < 0:
-                    continue
-                if j == idx:
-                    line_pos = len([x for x in lines if x["time"] <= e["time"]]) - 1
+
+        if idx >= 0:
+            curr_event = events[idx]
+            curr_time = curr_event["time"]
+            # which lyric index in 'lines' has this time?
+            curr_line_idx = None
+            for i, e in enumerate(lines):
+                if abs(e["time"] - curr_time) < 1e-6:
+                    curr_line_idx = i
                     break
-            if line_pos >= 0:
-                curr_text = lines[line_pos]["text"]
-                if line_pos > 0:
-                    prev_text = lines[line_pos - 1]["text"]
-                if line_pos + 1 < len(lines):
-                    next_text = lines[line_pos + 1]["text"]
+            if curr_line_idx is not None:
+                curr_text = lines[curr_line_idx]["text"]
+                if curr_line_idx > 0:
+                    prev_text = lines[curr_line_idx - 1]["text"]
+                if curr_line_idx + 1 < len(lines):
+                    next_text = lines[curr_line_idx + 1]["text"]
 
         mid = h // 2
         if prev_text and mid - 2 > 1:
@@ -249,6 +250,7 @@ def calibration_ui(
             last_msg = "Replaying snippet"
             continue
 
+        # small steps
         if ch in (curses.KEY_LEFT, ord("h")):
             offset -= 0.05
             last_msg = f"Offset {offset:+.3f}s"
@@ -257,6 +259,8 @@ def calibration_ui(
             offset += 0.05
             last_msg = f"Offset {offset:+.3f}s"
             continue
+
+        # bigger steps
         if ch in (curses.KEY_UP, ord("k")):
             offset += 0.25
             last_msg = f"Offset {offset:+.3f}s"
@@ -353,4 +357,4 @@ def main(argv=None):
 if __name__ == "__main__":
     main()
 
-# end of 4_calibrate.py
+# end of 4calibrate.py

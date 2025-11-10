@@ -5,12 +5,11 @@
 Steps:
  1: 1download.py   (takes URL/ID, derives slug, downloads assets)
  2: 2mix.py        (takes slug)
- 3: 3time.py       (takes slug)
- 4: 4calibrate.py  (takes slug)
- 5: 5gen_mp4.py    (takes slug)
+ 3: 3time.py       (takes slug, writes timings/<slug>.csv)
+ 4: 4calibrate.py  (takes slug, writes offsets/<slug>.json)
+ 5: 5gen_mp4.py    (takes slug, reads timings+offsets, writes mp4s/<slug>.mp4)
 """
 
-import os
 import sys
 import argparse
 import subprocess
@@ -22,7 +21,7 @@ console = Console()
 
 ABORT_CODE = 99
 
-# script names
+# script names (must exist next to this file)
 SCRIPT_MAP = {
     1: "1download.py",
     2: "2mix.py",
@@ -31,18 +30,18 @@ SCRIPT_MAP = {
     5: "5gen_mp4.py",
 }
 
-# simple output dirs (must match your other scripts)
+# simple output dirs (relative to project root, NOT this file)
 MP3_DIR = "mp3s"
 TXT_DIR = "txts"
 STEMS_DIR = "stems"
-TIMING_DIR = "timing"
-OFFSET_DIR = "offsets"
-MP4_DIR = "mp4s"
+TIMING_DIR = "timings"   # CSV from 3time.py
+OFFSET_DIR = "offsets"   # JSON from 4calibrate.py
+MP4_DIR = "mp4s"         # final videos from 5gen_mp4.py
+META_DIR = "meta"        # meta/<slug>.json from 1download.py
 
 
-def infer_slug_from_input(input_str):
+def infer_slug_from_input(input_str: str) -> str:
     """Infer a slug from a YouTube URL or generic string."""
-    import re
     import urllib.parse
 
     s = input_str.strip()
@@ -57,12 +56,32 @@ def infer_slug_from_input(input_str):
     elif "youtu.be/" in s:
         s = s.rstrip("/").split("/")[-1]
 
-    # Simple slugify
     slug = "".join(c for c in s.lower() if c.isalnum() or c in "-_").strip("_-")
     return slug[:64] or "song"
 
 
-def step_done(step, slug):
+def detect_slug_from_disk() -> str | None:
+    """
+    Detect the most recent slug based on meta/*.json or mp3s/*.mp3.
+
+    Used right after step 1 so later steps use the real slug that 1download.py chose.
+    """
+    meta_dir = Path(META_DIR)
+    if meta_dir.exists():
+        metas = sorted(meta_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        if metas:
+            return metas[-1].stem
+
+    mp3_dir = Path(MP3_DIR)
+    if mp3_dir.exists():
+        mp3s = sorted(mp3_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
+        if mp3s:
+            return mp3s[-1].stem
+
+    return None
+
+
+def step_done(step: int, slug: str | None) -> bool:
     """Check if a given step appears to be completed based on expected files."""
     if not slug:
         return False
@@ -76,7 +95,7 @@ def step_done(step, slug):
         marker = Path("mix_done") / f"{slug}.done"
         return vocals.exists() or marker.exists()
     elif step == 3:
-        timing = Path(TIMING_DIR) / f"{slug}.json"
+        timing = Path(TIMING_DIR) / f"{slug}.csv"
         return timing.exists()
     elif step == 4:
         offset = Path(OFFSET_DIR) / f"{slug}.json"
@@ -87,7 +106,7 @@ def step_done(step, slug):
     return False
 
 
-def run_step(step, arg):
+def run_step(step: int, arg: str | None) -> int:
     """Run the script for a given step, passing arg if not None."""
     script_name = SCRIPT_MAP.get(step)
     if not script_name:
@@ -112,16 +131,13 @@ def run_step(step, arg):
     return result.returncode
 
 
-def manual_menu(url_or_slug):
+def manual_menu(url_or_slug: str | None) -> None:
     """Interactive menu mode with status for each step."""
     url = url_or_slug
     slug = infer_slug_from_input(url) if url else None
 
     while True:
-        # compute status
-        status_map = {}
-        for s in range(1, 6):
-            status_map[s] = "DONE" if step_done(s, slug) else "PENDING"
+        status_map = {s: ("DONE" if step_done(s, slug) else "PENDING") for s in range(1, 6)}
 
         table = Table(title="Karaoke Pipeline Menu")
         table.add_column("Step", justify="right")
@@ -131,23 +147,23 @@ def manual_menu(url_or_slug):
 
         table.add_row(
             "1", SCRIPT_MAP[1], status_map[1],
-            "Download + metadata + lyrics (needs URL)",
+            "Download audio + metadata + lyrics (needs URL/query)",
         )
         table.add_row(
             "2", SCRIPT_MAP[2], status_map[2],
-            "Demucs / stems (needs slug)",
+            "Audio mix / Demucs (needs slug)",
         )
         table.add_row(
             "3", SCRIPT_MAP[3], status_map[3],
-            "Manual lyric timing (curses)",
+            "Manual lyric timing (curses → timings CSV)",
         )
         table.add_row(
             "4", SCRIPT_MAP[4], status_map[4],
-            "Offset calibration (curses)",
+            "Offset calibration (curses → offsets JSON)",
         )
         table.add_row(
             "5", SCRIPT_MAP[5], status_map[5],
-            "Final MP4 generation",
+            "Final MP4 generation (ffmpeg, uses offset)",
         )
 
         console.print()
@@ -163,7 +179,6 @@ def manual_menu(url_or_slug):
             return
 
         if choice == "a":
-            # ensure URL + slug established
             if not url:
                 console.print("[bold white]Enter YouTube URL or ID:[/] ", end="")
                 url = sys.stdin.readline().strip()
@@ -188,6 +203,14 @@ def manual_menu(url_or_slug):
                         f"[red]Step {step} failed (code {code}). Returning to menu.[/red]"
                     )
                     break
+                # after step 1, resync slug with what 1download.py actually created
+                if step == 1 and code == 0:
+                    detected = detect_slug_from_disk()
+                    if detected:
+                        console.print(
+                            f"[cyan]Detected slug from assets: [magenta]{detected}[/magenta][/cyan]"
+                        )
+                        slug = detected
             continue
 
         if choice not in {"1", "2", "3", "4", "5"}:
@@ -196,18 +219,15 @@ def manual_menu(url_or_slug):
 
         step = int(choice)
 
-        # Ask URL/slug as needed
         if step == 1:
             if not url:
-                console.print("[bold white]Enter YouTube URL or ID:[/] ", end="")
+                console.print("[bold white]Enter YouTube URL or ID / query:[/] ", end="")
                 url = sys.stdin.readline().strip()
             arg = url
-            if url and not slug:
-                slug = infer_slug_from_input(url)
         else:
             if not slug:
                 console.print(
-                    "[bold white]Enter slug (e.g. jerry_was_a_race_car_driver):[/] ",
+                    "[bold white]Enter slug (e.g. under_the_bridge):[/] ",
                     end="",
                 )
                 slug = sys.stdin.readline().strip()
@@ -230,12 +250,21 @@ def manual_menu(url_or_slug):
         else:
             console.print(f"[green]Step {step} completed.[/green]")
 
+        # If we just ran step 1 successfully, auto-detect and store the real slug
+        if step == 1 and code == 0:
+            detected = detect_slug_from_disk()
+            if detected:
+                console.print(
+                    f"[cyan]Detected slug from assets: [magenta]{detected}[/magenta][/cyan]"
+                )
+                slug = detected
 
-def auto_pipeline(url):
+
+def auto_pipeline(url: str) -> None:
     """Run steps 1–5 in order, skipping already-done steps, minimal prompts."""
     slug = infer_slug_from_input(url)
     console.print(
-        f"[bold]Auto mode:[/] URL=[cyan]{url}[/cyan], slug=[magenta]{slug}[/magenta]"
+        f"[bold]Auto mode:[/] URL=[cyan]{url}[/cyan], initial slug=[magenta]{slug}[/magenta]"
     )
 
     for step in range(1, 6):
@@ -256,10 +285,19 @@ def auto_pipeline(url):
             sys.exit(code)
         console.print(f"[green]Step {step} OK.[/green]")
 
+        # After step 1, refresh slug from disk so steps 2–5 see the real slug
+        if step == 1 and code == 0:
+            detected = detect_slug_from_disk()
+            if detected:
+                console.print(
+                    f"[cyan]Detected slug from assets: [magenta]{detected}[/magenta][/cyan]"
+                )
+                slug = detected
+
     console.print("[bold green]All steps completed. Final MP4 should be ready.[/bold green]")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Karaoke pipeline master script (0master.py)."
     )
@@ -279,17 +317,16 @@ def main():
     url_or_slug = args.input
 
     if not args.manual:
-        # Ask once if the user wants full auto
         console.print(
             "[bold white]Automatically run steps 1–5 in order?[/] [green][Y/n][/green] ",
             end="",
         )
         ans = sys.stdin.readline().strip().lower()
-        auto = (ans in ("", "y", "yes"))
+        auto = ans in ("", "y", "yes")
         if auto:
             if not url_or_slug:
                 console.print(
-                    "[bold white]Enter YouTube URL or ID:[/] ",
+                    "[bold white]Enter YouTube URL or ID / query:[/] ",
                     end="",
                 )
                 url_or_slug = sys.stdin.readline().strip()
@@ -298,7 +335,6 @@ def main():
                     return
             auto_pipeline(url_or_slug)
             return
-        # if user said no, fall through to manual menu
 
     manual_menu(url_or_slug)
 
