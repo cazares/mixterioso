@@ -201,9 +201,16 @@ def manual_menu(url_or_slug: str | None) -> None:
                 return
             slug = infer_slug_from_input(url)
 
+            console.print(
+                "[bold white]Skip steps that already look DONE?[/] [green][Y/n][/green] ",
+                end="",
+            )
+            ans = sys.stdin.readline().strip().lower()
+            skip_done = ans in ("", "y", "yes")
+
             for step in range(1, 6):
                 arg = url if step == 1 else slug
-                if step_done(step, slug):
+                if skip_done and step_done(step, slug):
                     console.print(
                         f"[yellow]Skipping step {step} ({SCRIPT_MAP[step]}), already DONE.[/yellow]"
                     )
@@ -274,8 +281,8 @@ def manual_menu(url_or_slug: str | None) -> None:
                 slug = detected
 
 
-def auto_pipeline(url: str) -> None:
-    """Run steps 1–5 in order, skipping already-done steps, minimal prompts."""
+def auto_pipeline(url: str, skip_done: bool = True) -> None:
+    """Run steps 1–5 in order, optionally skipping already-done steps."""
     slug = infer_slug_from_input(url)
     console.print(
         f"[bold]Auto mode:[/] query/URL=[cyan]{url}[/cyan], initial slug=[magenta]{slug}[/magenta]"
@@ -283,7 +290,7 @@ def auto_pipeline(url: str) -> None:
 
     for step in range(1, 6):
         arg = url if step == 1 else slug
-        if step_done(step, slug):
+        if skip_done and step_done(step, slug):
             console.print(
                 f"[yellow]Skipping step {step} ({SCRIPT_MAP[step]}), already DONE.[/yellow]"
             )
@@ -346,7 +353,15 @@ def main() -> None:
                 if not url_or_slug:
                     console.print("[yellow]No input provided. Exiting.[/yellow]")
                     return
-            auto_pipeline(url_or_slug)
+
+            console.print(
+                "[bold white]Skip steps that already look DONE?[/] [green][Y/n][/green] ",
+                end="",
+            )
+            ans2 = sys.stdin.readline().strip().lower()
+            skip_done = ans2 in ("", "y", "yes")
+
+            auto_pipeline(url_or_slug, skip_done=skip_done)
             return
 
     if not url_or_slug:
