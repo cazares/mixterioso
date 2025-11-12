@@ -17,8 +17,16 @@ echo -e "${BLUE}🎤 Initializing Karaoke Time environment...${NC}"
 # Step 1: Clean up space first (but keep demucs_env so this is reusable)
 echo -e "${YELLOW}🧹 Cleaning previous caches and venvs (without touching demucs_env)...${NC}"
 rm -rf .venv venv
-rm -rf "$HOME/.cache/pip" "$HOME/.cache/torch" "$HOME/.cache/huggingface" "$HOME/.cache/npm" "$HOME/.cache/yarn"
 rm -rf output/ separated/ merged_output/ intermediate/ logs/
+
+# Drop common caches to save disk
+rm -rf \
+  "$HOME/.cache/pip" \
+  "$HOME/.cache/torch" \
+  "$HOME/.cache/huggingface" \
+  "$HOME/.cache/npm" \
+  "$HOME/.cache/yarn" 2>/dev/null || true
+
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
 # Step 2: Create or reuse virtual environment
@@ -32,15 +40,16 @@ fi
 # shellcheck source=/dev/null
 source demucs_env/bin/activate
 
-# Step 3: Install dependencies (safe to re-run)
-echo -e "${YELLOW}📦 Installing dependencies...${NC}"
-python3 -m pip install --upgrade pip
+# Step 3: Install dependencies (safe to re-run, no pip cache)
+echo -e "${YELLOW}📦 Installing dependencies (no pip cache)...${NC}"
+python3 -m pip install --upgrade --no-cache-dir pip setuptools wheel
+
 if [ -f requirements.txt ]; then
     echo -e "${GREEN}Using requirements.txt...${NC}"
-    python3 -m pip install -r requirements.txt
+    python3 -m pip install --no-cache-dir -r requirements.txt
 else
     echo -e "${YELLOW}No requirements.txt found. Installing default set...${NC}"
-    python3 -m pip install \
+    python3 -m pip install --no-cache-dir \
         soundfile \
         demucs \
         torch \
@@ -52,14 +61,17 @@ else
         openai
 fi
 
+# Just in case anything slipped into cache
+python3 -m pip cache purge >/dev/null 2>&1 || true
+
 # Step 4: Verify binaries and keys
 echo -e "${YELLOW}🔍 Verifying environment...${NC}"
 if ! command -v ffmpeg &> /dev/null; then
-  echo -e "${RED}[fatal] ffmpeg not found. Install it on your system or container (e.g. 'sudo apt-get install ffmpeg').${NC}"
+  echo -e "${RED}[fatal] ffmpeg not found. Install it (devcontainer feature should have done this).${NC}"
   exit 1
 fi
 if ! command -v demucs &> /dev/null; then
-  echo -e "${RED}[fatal] demucs not found. Check requirements.txt or run: python3 -m pip install demucs${NC}"
+  echo -e "${RED}[fatal] demucs not found in venv. Check requirements.txt or run: python3 -m pip install demucs${NC}"
   exit 1
 fi
 if [ ! -f .env ]; then
@@ -68,25 +80,15 @@ fi
 
 echo -e "${GREEN}✅ Environment ready.${NC}"
 
-# Optional: auto-activate in future shells.
-# If you're using the Codespaces zsh profile that already sources demucs_env,
-# you can delete this whole block to avoid double activation.
-SHELL_RC=""
-if [ -n "${ZSH_VERSION-}" ]; then
-  SHELL_RC="$HOME/.zshrc"
-elif [ -n "${BASH_VERSION-}" ]; then
-  SHELL_RC="$HOME/.bashrc"
-else
-  SHELL_RC="$HOME/.bashrc"
-fi
+# Step 5: Auto-activate venv for future shells, using absolute path
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ACTIVATE_LINE="source \"$REPO_ROOT/demucs_env/bin/activate\""
 
-ACTIVATE_LINE="source \"$PWD/demucs_env/bin/activate\""
-
-if [ -n "$SHELL_RC" ]; then
-  if ! grep -qxF "$ACTIVATE_LINE" "$SHELL_RC" 2>/dev/null; then
+for SHELL_RC in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  if [ -w "$SHELL_RC" ] && ! grep -qxF "$ACTIVATE_LINE" "$SHELL_RC" 2>/dev/null; then
     echo "$ACTIVATE_LINE" >> "$SHELL_RC"
     echo -e "${YELLOW}Added auto-activate line to $SHELL_RC${NC}"
   fi
-fi
+done
 
 echo -e "${BLUE}To activate later, run:${NC} source demucs_env/bin/activate"
