@@ -1,0 +1,11 @@
+soundfile
+demucs
+torch
+torchaudio
+ffmpeg-python
+tqdm
+requests
+python-dotenv
+openai
+yt-dlp
+# end of requirements.txt

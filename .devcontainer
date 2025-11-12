@@ -1,0 +1,23 @@
+{
+  "name": "Karaoke Time",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  
+  "postCreateCommand": "chmod +x ./initialize_environment.sh && ./initialize_environment.sh",
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "KaraokeTime",
+        "terminal.integrated.profiles.linux": {
+          "KaraokeTime": {
+            "path": "/bin/zsh",
+            "args": [
+              "-c",
+              "source demucs_env/bin/activate && exec zsh"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

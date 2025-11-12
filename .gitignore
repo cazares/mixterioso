@@ -37,3 +37,4 @@ lyrics/
 align_env/
 mix_done/
 covers/
+!requirements.txt
