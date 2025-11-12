@@ -1,10 +1,7 @@
 {
   "name": "Karaoke Time",
   "image": "mcr.microsoft.com/devcontainers/python:3.11",
-  "features": {
-    "ghcr.io/devcontainers/features/ffmpeg:1": {}
-  },
-  "postCreateCommand": "bash ./initialize_environment.sh",
+  "postCreateCommand": "bash ./init_env.sh",
   "customizations": {
     "vscode": {
       "settings": {
