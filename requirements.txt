@@ -8,4 +8,5 @@ requests
 python-dotenv
 openai
 yt-dlp
+rich
 # end of requirements.txt

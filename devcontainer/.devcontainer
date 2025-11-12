@@ -1,8 +1,8 @@
 {
   "name": "Karaoke Time",
   "image": "mcr.microsoft.com/devcontainers/python:3.11",
-  
-  "postCreateCommand": "chmod +x ./initialize_environment.sh && ./initialize_environment.sh",
+
+  "postCreateCommand": "chmod +x ./initialize_environment.sh && bash ./initialize_environment.sh",
 
   "customizations": {
     "vscode": {
@@ -12,8 +12,9 @@
           "KaraokeTime": {
             "path": "/bin/zsh",
             "args": [
+              "-i",
               "-c",
-              "source demucs_env/bin/activate && exec zsh"
+              "cd /workspaces/${localWorkspaceFolderBasename} && source demucs_env/bin/activate && exec zsh -i"
             ]
           }
         }
