@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # experimental/5gen_mp4.py
+# Final MP4 generation: builds text overlay (-vf) and applies global audio offset (-af)
 
 import argparse
 import csv
@@ -7,11 +8,9 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-
 from ffmpeg_helpers import build_audio_offset_filter
 
 RESET = "\033[0m"
-BOLD = "\033[1m"
 CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
@@ -66,12 +65,11 @@ def load_timings(slug: str) -> list[dict]:
 
 def load_offset(slug: str) -> float:
     """
-    Robust loader:
-    - offsets/{slug}.json  with keys: offset_seconds | offset | seconds | ms
-    - offsets/{slug}.txt   single float seconds
-    - defaults to 0.0 if missing
+    Looks for:
+      offsets/{slug}.json  keys: offset_seconds | offset | seconds | ms
+      offsets/{slug}.txt   single float seconds
+    Defaults to 0.0
     """
-    # JSON first
     j = OFFSETS_DIR / f"{slug}.json"
     if j.exists():
         try:
@@ -84,7 +82,6 @@ def load_offset(slug: str) -> float:
                         return float(data[k])
         except Exception:
             pass
-    # Plain text fallback
     t = OFFSETS_DIR / f"{slug}.txt"
     if t.exists():
         try:
@@ -95,10 +92,7 @@ def load_offset(slug: str) -> float:
 
 
 def build_drawtext_filters(events: list[dict], offset: float) -> str:
-    """
-    Build drawtext chain from timing events and a global offset.
-    CSV remains intact; we only shift times here.
-    """
+    """Build drawtext chain from timing events plus a global offset (sec)."""
     if not events:
         return "null"
 
@@ -111,13 +105,9 @@ def build_drawtext_filters(events: list[dict], offset: float) -> str:
         line_index = ev["line_index"]
 
         start = t + offset
-
         if line_index >= 0:
             next_time = next((events[j]["time"] for j in main_indices if events[j]["time"] > t), None)
-            if next_time is not None:
-                end = min(start + LINE_DURATION_DEFAULT, (next_time + offset) - 0.1)
-            else:
-                end = start + LINE_DURATION_DEFAULT
+            end = min(start + LINE_DURATION_DEFAULT, (next_time + offset - 0.1) if next_time is not None else start + LINE_DURATION_DEFAULT)
             fontsize = MAIN_FONT_SIZE
             y_expr = "h-160"
         else:
@@ -144,9 +134,7 @@ def build_drawtext_filters(events: list[dict], offset: float) -> str:
         )
         filters.append(draw)
 
-    if not filters:
-        return "null"
-    return ",".join(filters)
+    return ",".join(filters) if filters else "null"
 
 
 def parse_args(argv=None):
@@ -172,10 +160,11 @@ def main(argv=None):
 
     events = load_timings(slug)
     offset = load_offset(slug)
-    log("MP4", f"Using offset {offset:+.3f}s for slug {slug}", GREEN)
-
     vf_chain = build_drawtext_filters(events, offset)
     af_chain = build_audio_offset_filter(offset)  # "" if no-op
+
+    # DEBUG: print exactly what we will pass to ffmpeg (helps catch stray numbers)
+    log("MP4", f"offset={offset:+.3f}s  af_chain={'<none>' if not af_chain else af_chain}", GREEN)
 
     cmd = [
         "ffmpeg",
@@ -187,6 +176,7 @@ def main(argv=None):
         "-vf", vf_chain,
     ]
 
+    # Only add -af if we have a real filter (never a bare number)
     if af_chain:
         cmd += ["-af", af_chain]
 
