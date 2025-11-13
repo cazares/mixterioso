@@ -28,6 +28,15 @@ MIXES_DIR = BASE_DIR / "mixes"
 TIMINGS_DIR = BASE_DIR / "timings"
 OUTPUT_DIR = BASE_DIR / "output"
 META_DIR = BASE_DIR / "meta"
+SEPARATED_DIR = BASE_DIR / "separated"
+
+DEMUCS_MODULE = [sys.executable, "-m", "demucs"]  # safer on MacinCloud/venvs
+MODEL_6 = "htdemucs_6s"
+MODEL_4 = "htdemucs"  # also used as base for --two-stems vocals
+
+STEMS_6 = {"vocals", "drums", "bass", "guitar", "piano", "other"}
+STEMS_4 = {"vocals", "drums", "bass", "other"}
+STEMS_2 = {"vocals", "no_vocals"}
 
 
 def slugify(text: str) -> str:
@@ -65,7 +74,6 @@ def run_capture(cmd: list[str], section: str) -> tuple[float, str]:
     cp = subprocess.run(cmd, check=True, capture_output=True, text=True)
     t1 = time.perf_counter()
     out = (cp.stdout or "").strip()
-    # also reflect stderr if useful for debugging
     if cp.stderr:
         log(section, f"(stderr) {cp.stderr.strip()}", YELLOW)
     return (t1 - t0), out
@@ -194,6 +202,72 @@ def run_step1_txt_mp3(query: str) -> tuple[str, float]:
     return slug, t
 
 
+def profile_is_vocals_only(profile: str) -> bool:
+    """
+    True when only vocals are modified by the chosen profile.
+    Adjust if your 2_stems.py profiles change.
+    """
+    # Heuristics: 'karaoke' and 'car-karaoke' mute/reduce vocals only.
+    return profile in {"karaoke", "car-karaoke"}
+
+
+def _model_track_dir(model: str, slug: str) -> Path:
+    return SEPARATED_DIR / model / slug
+
+
+def _stems_present(track_dir: Path, expected: set[str]) -> bool:
+    if not track_dir.exists():
+        return False
+    names = {p.stem for p in track_dir.glob("*.wav")}
+    return expected.issubset(names)
+
+
+def _ensure_two_stems(slug: str, mp3_path: Path) -> float:
+    """Run 2-stem (vocals vs accompaniment) using htdemucs base model."""
+    t = 0.0
+    track_dir = _model_track_dir(MODEL_4, slug)
+    if _stems_present(track_dir, STEMS_2):
+        log("STEP2", f"Reusing 2-stem at {track_dir}", CYAN)
+        return 0.0
+    log("STEP2", "Running 2-stem separation (vocals vs accompaniment)", CYAN)
+    t += run(DEMUCS_MODULE + ["--two-stems", "vocals", "-n", MODEL_4, str(mp3_path)], "STEP2-2STEM")
+    if not _stems_present(track_dir, STEMS_2):
+        raise SystemExit("2-stem separation finished but expected stems not found.")
+    return t
+
+
+def _ensure_six_then_four(slug: str, mp3_path: Path) -> tuple[str, float]:
+    """Try htdemucs_6s first; on failure/incomplete, fallback to htdemucs (4-stem)."""
+    t = 0.0
+    d6 = _model_track_dir(MODEL_6, slug)
+    d4 = _model_track_dir(MODEL_4, slug)
+
+    if _stems_present(d6, STEMS_6):
+        log("STEP2", f"Reusing 6-stem at {d6}", CYAN)
+        return MODEL_6, 0.0
+
+    if _stems_present(d4, STEMS_4):
+        log("STEP2", f"Reusing 4-stem at {d4}", CYAN)
+        return MODEL_4, 0.0
+
+    # Try 6-stem fresh
+    try:
+        log("STEP2", "Running 6-stem separation (htdemucs_6s)", CYAN)
+        t += run(DEMUCS_MODULE + ["-n", MODEL_6, str(mp3_path)], "STEP2-6STEM")
+        if _stems_present(d6, STEMS_6):
+            return MODEL_6, t
+        log("STEP2", "6-stem finished but stems incomplete; falling back to 4-stem.", YELLOW)
+    except subprocess.CalledProcessError:
+        log("STEP2", "6-stem failed; falling back to 4-stem.", YELLOW)
+
+    # Fallback: 4-stem
+    log("STEP2", "Running 4-stem separation (htdemucs)", CYAN)
+    t += run(DEMUCS_MODULE + ["-n", MODEL_4, str(mp3_path)], "STEP2-4STEM")
+    if not _stems_present(d4, STEMS_4):
+        raise SystemExit("4-stem separation finished but expected stems not found.")
+    return MODEL_4, t
+
+
 def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> float:
     if profile == "lyrics":
         log("STEP2", "Profile 'lyrics' selected, skipping stems/mix.", YELLOW)
@@ -204,60 +278,45 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     if not mp3_path.exists() or not txt_path.exists():
         raise SystemExit(f"Missing assets for step 2: {mp3_path} or {txt_path}.")
 
-    separated_root = BASE_DIR / "separated"
-
-    preferred_models: list[str] = []
-    if model:
-        preferred_models.append(model)
-    if "htdemucs_6s" not in preferred_models:
-        preferred_models.insert(0, "htdemucs_6s")
-    if "htdemucs" not in preferred_models:
-        preferred_models.append("htdemucs")  # 4-stem fallback, never 2-stem
-
-    existing_model = None
-    for m in preferred_models:
-        d = separated_root / m / slug
-        if d.exists():
-            existing_model = m
-            break
-
-    reuse_stems = False
-    actual_model = existing_model
-
-    if existing_model:
-        if interactive:
-            ans = input(
-                f"Stems already exist at {separated_root / existing_model / slug} "
-                f"for model '{existing_model}'. Reuse and skip Demucs? [Y/n]: "
-            ).strip().lower()
-            reuse_stems = ans in ("", "y", "yes")
-        else:
-            reuse_stems = True
-
+    SEPARATED_DIR.mkdir(parents=True, exist_ok=True)
     t_demucs = 0.0
+    actual_model = None
+    use_two_stem = profile_is_vocals_only(profile)
 
-    if not reuse_stems:
-        import subprocess as sp
+    # Reuse prompt (only if interactive and any stems exist)
+    any_existing = (
+        _stems_present(_model_track_dir(MODEL_6, slug), STEMS_6)
+        or _stems_present(_model_track_dir(MODEL_4, slug), STEMS_4)
+        or _stems_present(_model_track_dir(MODEL_4, slug), STEMS_2)
+    )
+    if interactive and any_existing:
+        try:
+            ans = input("Stems exist for this slug. Reuse and skip separation? [Y/n]: ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans in ("", "y", "yes"):
+            log("STEP2", "Reusing existing stems.", CYAN)
+            # Prefer 6 > 4 > 2 for mixing model tag
+            if _stems_present(_model_track_dir(MODEL_6, slug), STEMS_6):
+                actual_model = MODEL_6
+            elif _stems_present(_model_track_dir(MODEL_4, slug), STEMS_4):
+                actual_model = MODEL_4
+            else:
+                actual_model = MODEL_4  # two-stem lives under htdemucs folder
+        else:
+            log("STEP2", "Will regenerate stems.", YELLOW)
 
-        log("STEP2", f"No reusable stems; trying models {preferred_models}", CYAN)
-        actual_model = None
-        for m in preferred_models:
-            try:
-                t_demucs += run(["demucs", "-n", m, str(mp3_path)], "STEP2-DEMUX")
-                actual_model = m
-                break
-            except sp.CalledProcessError:
-                log("STEP2", f"Demucs model '{m}' failed, trying next.", YELLOW)
-        if actual_model is None:
-            raise SystemExit(
-                "Demucs failed for 6-stem and 4-stem models; "
-                "no 2-stem fallback is allowed by policy."
-            )
-    elif actual_model is None:
-        raise SystemExit("Asked to reuse stems but none were found for any supported model.")
+    if actual_model is None:
+        if use_two_stem:
+            t_demucs += _ensure_two_stems(slug, mp3_path)
+            actual_model = MODEL_4  # folder tag; two-stem outputs under htdemucs
+        else:
+            actual_model, t_added = _ensure_six_then_four(slug, mp3_path)
+            t_demucs += t_added
 
-    log("STEP2", f"Using Demucs model '{actual_model}' for mixing.", GREEN)
+    log("STEP2", f"Mixing with model folder '{actual_model}' (two-stem={use_two_stem})", GREEN)
 
+    # Launch UI to set per-stem gains according to profile, then render
     t_mix_ui = run(
         [
             sys.executable,
@@ -328,7 +387,6 @@ def run_step4_mp4(slug: str, profile: str, offset: float) -> float:
         profile,
         "--offset",
         str(offset),
-        # default behavior inside 4_mp4: skip if target exists (use --force to override)
     ]
     try:
         t = run(cmd, "STEP4")
@@ -386,7 +444,6 @@ def run_step5_upload(
         cmd += ["--thumb-from-sec", str(thumb_from_sec)]
 
     t, rc, out, err = run_capture_no_throw(cmd, "STEP5")
-    # Save receipt next to the MP4 for step-5 detection
     receipt_path = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(offset)}.uploaded.json"
     payload = {
         "invoked": "5_upload.py",
@@ -396,7 +453,6 @@ def run_step5_upload(
         "stderr": err,
         "ts": time.time(),
     }
-    # Merge JSON payload if stdout is JSON
     try:
         parsed = json.loads(out) if out else {}
         if isinstance(parsed, dict):
@@ -441,7 +497,7 @@ def parse_args(argv=None):
         default="karaoke",
         choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
     )
-    p.add_argument("--model", type=str, default="htdemucs_6s", help="Demucs model name")
+    p.add_argument("--model", type=str, default=MODEL_6, help="Demucs model name (default tries 6→4)")
     p.add_argument("--steps", type=str, help="Steps to run, e.g. 24 or 12345")
     p.add_argument(
         "--do",

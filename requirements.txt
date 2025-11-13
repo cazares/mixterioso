@@ -1,19 +1,31 @@
+# requirements.txt — KaraokeTime + Step1 REST API (MacinCloud)
+
+# --- Core audio/ML ---
 soundfile
 demucs
-torch==2.5.*           # keep in lockstep with torchaudio/torchcodec
+torch==2.5.*            # keep in lockstep with torchaudio/torchcodec
 torchaudio==2.5.*
 torchcodec==0.2.*
 
+# --- Utilities / I/O ---
 ffmpeg-python
 tqdm
 requests
 python-dotenv
-openai
-yt-dlp
 rich
+yt-dlp                  # YouTube downloader
 
-# YouTube upload (for scripts/5_upload.py)
+# --- REST API (Step1: MP3 endpoint) ---
+fastapi
+uvicorn[standard]
+pydantic>=2
+python-multipart        # enables multipart/form-data (future-friendly)
+aiofiles                # async file serving
+
+# --- YouTube upload (scripts/5_upload.py) ---
 google-api-python-client
+google-auth
 google-auth-oauthlib
 google-auth-httplib2
+
 # end of requirements.txt
