@@ -1,0 +1,19 @@
+soundfile
+demucs
+torch==2.5.*           # keep in lockstep with torchaudio/torchcodec
+torchaudio==2.5.*
+torchcodec==0.2.*
+
+ffmpeg-python
+tqdm
+requests
+python-dotenv
+openai
+yt-dlp
+rich
+
+# YouTube upload (for scripts/5_upload.py)
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+# end of requirements.txt

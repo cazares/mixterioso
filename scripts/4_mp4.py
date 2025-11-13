@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# scripts/4_mp4.py
 import argparse
 import csv
 import json
@@ -30,113 +31,48 @@ VIDEO_HEIGHT = 1080
 # =============================================================================
 # LAYOUT CONSTANTS
 # =============================================================================
-# Fraction of the total video height that is reserved for the *bottom* box
-# where the "next lyric" preview text lives. Increase this to make the bottom
-# preview box taller, decrease it to give more space to the main (top) lyrics.
-BOTTOM_BOX_HEIGHT_FRACTION = 0.20  # 0.20 = 20% of the screen height
-
-# The remaining height is automatically used by the top "current lyric" box.
+BOTTOM_BOX_HEIGHT_FRACTION = 0.20  # 20% of screen height
 TOP_BAND_FRACTION = 1.0 - BOTTOM_BOX_HEIGHT_FRACTION
-
-# Vertical padding (in pixels) inside the bottom box around the NEXT lyric text.
-# These control how far the preview text sits away from the top and bottom
-# edges of the bottom box. The preview baseline is centered between these
-# margins.
 NEXT_LYRIC_TOP_MARGIN_PX = 50
 NEXT_LYRIC_BOTTOM_MARGIN_PX = 50
-
-# Vertical offset (in pixels) by which the thin divider line between the
-# current-lyric region and the next-lyric region is moved upward from the
-# top edge of the bottom box. Positive values move the line up, negative
-# values move it down.
 DIVIDER_LINE_OFFSET_UP_PX = 0
-
-# Total height of the divider line shape in pixels. Can be fractional for
-# anti-aliased "hairline" looks. 1.0 ~= 1px at PlayResY=VIDEO_HEIGHT.
 DIVIDER_HEIGHT_PX = 0.25
-
-# Horizontal margins for the divider line, in pixels. These are measured
-# from the left/right edges of the video frame. Set to 0 for edge-to-edge.
 DIVIDER_LEFT_MARGIN_PX = VIDEO_WIDTH * 0.035
 DIVIDER_RIGHT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX
-
-# Within the top band, you can nudge the main line up or down by changing
-# this fraction of the top-band height. Positive values move text DOWN.
 VERTICAL_OFFSET_FRACTION = 0.0
-
-# Extra nudge for the title line relative to the main line (fraction of top band).
 TITLE_EXTRA_OFFSET_FRACTION = -0.20
-
-# How big the next-lyric text is relative to the main lyric text.
-#  0.35 = 35% of the main font size.
 NEXT_LINE_FONT_SCALE = 0.35
-
-# How big the "Next:" label text is relative to the main lyric text.
-# By default this is smaller than the actual preview line.
 NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.45
-
-# Margins for the "Next:" label within the bottom box. The label is
-# placed at the top-left corner of the bottom rectangle with these offsets.
 NEXT_LABEL_TOP_MARGIN_PX = 10
 NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX + NEXT_LABEL_TOP_MARGIN_PX
-
-# Fade timing (milliseconds) applied to each lyric change.
-# Only used for the main lyric line and the preview ("next line") text.
 FADE_IN_MS = 50
 FADE_OUT_MS = 50
 
 # =============================================================================
 # COLOR AND OPACITY CONSTANTS
 # =============================================================================
-# All ASS colors are encoded as AABBGGRR (alpha, blue, green, red) under the hood.
-# To make configuration less painful, we keep everything as simple hex RRGGBB here
-# and build the AABBGGRR/BGGRR codes where needed.
-
-# Global base text + line color for the *bottom* "next lyric" area.
-# This does NOT affect the top current-lyric text color; that has its own constant.
-GLOBAL_NEXT_COLOR_RGB = "FFFFFF"   # white
-
-# Global alpha for the next-lyric text and the divider line.
-#  - "00" = fully opaque
-#  - "FF" = fully transparent
-GLOBAL_NEXT_ALPHA_HEX = "4D"  # semi-transparent
-
-# Divider line color and alpha. Defaults to reuse the same color as the
-# next-lyric text but with an independently tweakable opacity.
+GLOBAL_NEXT_COLOR_RGB = "FFFFFF"
+GLOBAL_NEXT_ALPHA_HEX = "4D"
 DIVIDER_COLOR_RGB = "FFFFFF"
-DIVIDER_ALPHA_HEX = "80"           # semi-transparent divider
+DIVIDER_ALPHA_HEX = "80"
+TOP_LYRIC_TEXT_COLOR_RGB = "FFFFFF"
+TOP_LYRIC_TEXT_ALPHA_HEX = "00"
+BOTTOM_BOX_BG_COLOR_RGB = "000000"
+BOTTOM_BOX_BG_ALPHA_HEX = "00"
+TOP_BOX_BG_COLOR_RGB = "000000"
+TOP_BOX_BG_ALPHA_HEX = "00"
+NEXT_LABEL_COLOR_RGB = "FFFFFF"
+NEXT_LABEL_ALPHA_HEX = GLOBAL_NEXT_ALPHA_HEX
 
-# Top (current lyric) font color and alpha.
-TOP_LYRIC_TEXT_COLOR_RGB = "FFFFFF"    # white
-TOP_LYRIC_TEXT_ALPHA_HEX = "00"       # fully opaque
-
-# Background color for the bottom "next lyric" rectangle and its alpha.
-# Currently just a configuration hook; if you later draw a bottom bar, use both.
-BOTTOM_BOX_BG_COLOR_RGB = "000000"    # black
-BOTTOM_BOX_BG_ALPHA_HEX = "00"        # fully transparent (no visible bar)
-
-# Background color for the top "current lyric" rectangle and its alpha.
-# This drives the style's BackColour.
-TOP_BOX_BG_COLOR_RGB = "000000"       # black
-TOP_BOX_BG_ALPHA_HEX = "00"           # 50% opaque back color for top band
-
-# "Next:" label color and alpha. Separate from GLOBAL_NEXT_* so you can
-# tweak the label independently if desired.
-NEXT_LABEL_COLOR_RGB = "FFFFFF"        # white
-NEXT_LABEL_ALPHA_HEX = GLOBAL_NEXT_ALPHA_HEX  # semi-transparent label
-
-# Base UI font size in "points" (converted to ASS by a multiplier).
+# Font sizing
 DEFAULT_UI_FONT_SIZE = 120
-ASS_FONT_MULTIPLIER = 1.5  # multiple of UI font size to get ASS fontsize
+ASS_FONT_MULTIPLIER = 1.5  # UI points -> ASS "Fontsize"
 
-# Global lyrics timing offset in seconds. Positive = delay, negative = earlier.
-# This is applied uniformly to all lyric timestamps at render time so you can
-# nudge the whole subtitle track without re-running timing.
+# Global lyrics timing offset in seconds.
+# Negative => lyrics earlier (sooner); Positive => lyrics later.
+# Default from env; can be overridden by --offset argument.
 LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0") or "0")
-# If you prefer hardcoded only, comment the line above and do e.g.:
-# LYRICS_OFFSET_SECS = -0.35  # shift lyrics 350 ms earlier
 
-# Simple heuristics for "music only" lines.
 MUSIC_NOTE_CHARS = "♪♫♬♩♭♯"
 MUSIC_NOTE_KEYWORDS = {"instrumental", "solo", "guitar solo", "piano solo"}
 
@@ -156,12 +92,10 @@ def slugify(text: str) -> str:
 
 
 def seconds_to_ass_time(sec: float) -> str:
-    # ASS time format: H:MM:SS.cs (centiseconds)
+    # ASS format: H:MM:SS.cs
     if sec < 0:
         sec = 0.0
     total_cs = int(round(sec * 100))
-    if total_cs < 0:
-        total_cs = 0
     total_seconds, cs = divmod(total_cs, 100)
     h, rem = divmod(total_seconds, 3600)
     m, s = divmod(rem, 60)
@@ -169,45 +103,26 @@ def seconds_to_ass_time(sec: float) -> str:
 
 
 def rgb_to_bgr(rrggbb: str) -> str:
-    """
-    Convert an RRGGBB hex string into BGR order as required by ASS (&HAABBGGRR).
-    Example:
-        "FFFFFF" -> "FFFFFF"
-        "FF0000" -> "0000FF"
-    """
     s = (rrggbb or "").strip().lstrip("#")
     s = s.zfill(6)[-6:]
-    rr = s[0:2]
-    gg = s[2:4]
-    bb = s[4:6]
+    rr = s[0:2]; gg = s[2:4]; bb = s[4:6]
     return f"{bb}{gg}{rr}"
 
 
 def is_music_only(text: str) -> bool:
-    """
-    Heuristic for lines that are "music only" (notes, emoji, or keywords).
-    Used to center the line and hide the bottom rectangle.
-    """
     if not text:
         return False
     stripped = text.strip()
     if not stripped:
         return False
-
-    # Explicit music-note characters.
     if any(ch in MUSIC_NOTE_CHARS for ch in stripped):
         return True
-
-    # Only symbols / emoji, no alphanumerics.
     if not any(ch.isalnum() for ch in stripped):
         return True
-
-    # Keyword-based detection.
     lower = stripped.lower()
     for kw in MUSIC_NOTE_KEYWORDS:
         if kw in lower:
             return True
-
     return False
 
 
@@ -228,10 +143,8 @@ def read_meta(slug: str) -> tuple[str, str]:
 def read_timings(slug: str):
     """
     Return list of (time_secs, text, line_index).
-    Preferred CSV format:
-        line_index,time_secs,text
-    Fallback 2-column format:
-        time_secs,text   (line_index is treated as 0).
+    Preferred CSV format: line_index,time_secs,text
+    Fallback 2-column   : time_secs,text
     """
     timing_path = TIMINGS_DIR / f"{slug}.csv"
     if not timing_path.exists():
@@ -302,12 +215,9 @@ def probe_audio_duration(path: Path) -> float:
         return 0.0
     cmd = [
         "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
         str(path),
     ]
     log("FFPROBE", f"Probing duration of {path}", BLUE)
@@ -319,17 +229,24 @@ def probe_audio_duration(path: Path) -> float:
         return 0.0
 
 
+def offset_tag(val: float) -> str:
+    s = f"{val:+.3f}".replace("-", "m").replace("+", "p").replace(".", "p")
+    return f"_offset_{s}s"
+
+
 def build_ass(
     slug: str,
+    profile: str,
     artist: str,
     title: str,
     timings,
     audio_duration: float,
     font_name: str,
     font_size_script: int,
+    offset_applied: float,
 ) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    ass_path = OUTPUT_DIR / f"{slug}.ass"
+    ass_path = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(offset_applied)}.ass"
 
     if audio_duration <= 0.0 and timings:
         audio_duration = max(t for t, _, _ in timings) + 5.0
@@ -344,7 +261,6 @@ def build_ass(
     y_divider_nominal = top_band_height
     bottom_band_height = playresy - y_divider_nominal
 
-    # Vertical positions for the top region.
     center_top = top_band_height // 2
     offset_px = int(top_band_height * VERTICAL_OFFSET_FRACTION)
     y_main_top = center_top + offset_px
@@ -353,30 +269,20 @@ def build_ass(
     x_center = playresx // 2
     y_center_full = playresy // 2
 
-    # Divider line position.
     line_y = max(0, y_divider_nominal - DIVIDER_LINE_OFFSET_UP_PX)
 
-    # Next-lyric baseline position.
-    inner_bottom_box_height = max(
-        1, bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX
-    )
-    y_next = (
-        y_divider_nominal
-        + NEXT_LYRIC_TOP_MARGIN_PX
-        + inner_bottom_box_height // 2
-    )
+    inner_bottom_box_height = max(1, bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX)
+    y_next = y_divider_nominal + NEXT_LYRIC_TOP_MARGIN_PX + inner_bottom_box_height // 2
 
-    # Font sizes.
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
     next_label_font = max(1, int(font_size_script * NEXT_LABEL_FONT_SCALE))
-
     margin_v = 0
 
-    # Precomputed ASS color strings for top band.
+    # ASS color strings for top band.
     top_primary_ass = f"&H{TOP_LYRIC_TEXT_ALPHA_HEX}{rgb_to_bgr(TOP_LYRIC_TEXT_COLOR_RGB)}"
     top_back_ass = f"&H{TOP_BOX_BG_ALPHA_HEX}{rgb_to_bgr(TOP_BOX_BG_COLOR_RGB)}"
-    secondary_ass = "&H000000FF"  # unchanged
-    outline_ass = "&H00000000"    # black outline
+    secondary_ass = "&H000000FF"
+    outline_ass = "&H00000000"
     back_ass = top_back_ass
 
     header_lines = [
@@ -407,8 +313,7 @@ def build_ass(
 
     def ass_escape(text: str) -> str:
         text = text.replace("{", "(").replace("}", ")")
-        text = text.replace("\\N", "\\N")
-        text = text.replace("\n", r"\N")
+        text = text.replace("\\N", "\\N").replace("\n", r"\N")
         return text
 
     events = []
@@ -425,18 +330,13 @@ def build_ass(
 
     unified.sort(key=lambda x: x[0])
 
-    offset = LYRICS_OFFSET_SECS
+    offset = offset_applied
 
-    # If no timings, just show centered title card.
+    # If no timings, show center title card for entire duration.
     if not unified:
-        title_lines = []
-        if title:
-            title_lines.append(title)
-        if artist:
-            title_lines.append(f"by {artist}")
+        title_lines = [line for line in (title, f"by {artist}" if artist else "") if line]
         if not title_lines:
             title_lines = ["No lyrics"]
-
         intro_block = "\\N".join(title_lines)
         events.append(
             "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
@@ -445,7 +345,6 @@ def build_ass(
                 text=f"{{\\an5\\pos({x_center},{y_center_full})}}{ass_escape(intro_block)}",
             )
         )
-
         ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
         log("ASS", f"Wrote ASS subtitles (title only) to {ass_path}", GREEN)
         return ass_path
@@ -458,12 +357,8 @@ def build_ass(
         title_lines.append(title)
     if artist:
         title_lines.append(f"by {artist}")
-
     if title_lines:
-        if first_lyric_time > 0.1:
-            title_end = min(first_lyric_time, 5.0)
-        else:
-            title_end = first_lyric_time
+        title_end = min(first_lyric_time, 5.0) if first_lyric_time > 0.1 else first_lyric_time
         intro_block = "\\N".join(title_lines)
         events.append(
             "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
@@ -473,7 +368,6 @@ def build_ass(
             )
         )
 
-    # Fade tag for lyrics only (main and next-line text).
     fade_tag_main = ""
     if FADE_IN_MS > 0 or FADE_OUT_MS > 0:
         fade_tag_main = f"\\fad({int(FADE_IN_MS)},{int(FADE_OUT_MS)})"
@@ -513,8 +407,8 @@ def build_ass(
 
         # Main lyric line (with fade).
         main_text = ass_escape(text_stripped)
-        y_for_line = y_center_full if music_only else y_main_top
-        main_tag = f"{{\\an5\\pos({x_center},{y_for_line}){fade_tag_main}}}"
+        y_for_line = (VIDEO_HEIGHT // 2) if music_only else y_main_top
+        main_tag = f"{{\\an5\\pos({playresx // 2},{y_for_line}){fade_tag_main}}}"
         events.append(
             "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
                 start=seconds_to_ass_time(start),
@@ -523,15 +417,12 @@ def build_ass(
             )
         )
 
-        # Decide whether to show bottom UI (divider, label, next-lyric preview).
+        # Do not show next UI on last line, or when music-only lines are involved.
         if i >= n - 1:
-            continue  # last line: no "Next:" UI at all
-
+            continue
         next_raw = unified[i + 1][1]
         if not next_raw:
             continue
-
-        # Do not show next UI if current or next is "music only".
         if music_only or is_music_only(next_raw):
             continue
 
@@ -572,7 +463,7 @@ def build_ass(
         # Next-lyric preview text (with fade).
         preview_text = ass_escape(next_raw)
         preview_tag = (
-            f"{{\\an5\\pos({x_center},{y_next})"
+            f"{{\\an5\\pos({playresx // 2},{y_next})"
             f"\\fs{preview_font}"
             f"\\1c&H{next_color_bgr}&"
             f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
@@ -650,34 +541,98 @@ def parse_args(argv=None):
         choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
         help="Mix profile name (matches WAV/MP3 name in mixes/).",
     )
+    p.add_argument("--font-size", type=int, help="Subtitle font size (20–200). Default 120.")
+    p.add_argument("--font-name", type=str, default="Helvetica", help="Subtitle font name. Default Helvetica.")
     p.add_argument(
-        "--font-size",
-        type=int,
-        help="Subtitle font size (20–200). Default 120.",
+        "--offset",
+        type=float,
+        default=None,
+        help="Global lyrics/text offset in seconds. Negative=sooner, Positive=later. Overrides KARAOKE_OFFSET_SECS.",
     )
     p.add_argument(
-        "--font-name",
-        type=str,
-        default="Helvetica",
-        help="Subtitle font name. Default Helvetica.",
+        "--force",
+        action="store_true",
+        help="Re-render even if the exact output MP4 already exists.",
     )
     return p.parse_args(argv)
 
 
 def main(argv=None):
+    global LYRICS_OFFSET_SECS
+
     args = parse_args(argv or sys.argv[1:])
     slug = slugify(args.slug)
     profile = args.profile
 
+    # Resolve effective offset: CLI flag wins; fallback to env.
+    if args.offset is not None:
+        LYRICS_OFFSET_SECS = float(args.offset)
+
+    log("OFFSET", f"Applying global lyrics offset {LYRICS_OFFSET_SECS:+.3f}s (neg=sooner, pos=later)", CYAN)
+
+    # Output path reflects profile + offset so multiple variants can co-exist.
+    out_mp4 = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(LYRICS_OFFSET_SECS)}.mp4"
+
+    # Skip all work if target exists and not forcing.
+    if out_mp4.exists() and not args.force:
+        log("MP4", f"Exists, skipping render: {out_mp4.name}", YELLOW)
+        print()
+        print(f"{BOLD}{BLUE}MP4 already present:{RESET} {out_mp4}")
+        print("What would you like to open?")
+        print("  1 = output directory")
+        print("  2 = MP4 file")
+        print("  3 = both (dir then MP4)")
+        print("  4 = upload to YouTube (private)")
+        print("  0 = none")
+        try:
+            choice = input("Choice [0–4]: ").strip()
+        except EOFError:
+            choice = "0"
+        if choice == "1":
+            open_path(OUTPUT_DIR)
+        elif choice == "2":
+            open_path(out_mp4)
+        elif choice == "3":
+            open_path(OUTPUT_DIR); open_path(out_mp4)
+        elif choice == "4":
+            # Lightweight upload entrypoint; defaults handled in 5_upload.py
+            artist, title = read_meta(slug)
+            # Default title: "Artist - Title (profile, offset +X.XXXs)"
+            default_title = None
+            if artist or title:
+                display = f"{artist} - {title}" if artist and title else (title or artist or slug)
+                default_title = f"{display} ({profile}, offset {LYRICS_OFFSET_SECS:+.3f}s)"
+            # Ask for title override
+            try:
+                resp = input(f'YouTube title [ENTER for default{" ("+default_title+")" if default_title else ""}]: ').strip()
+            except EOFError:
+                resp = ""
+            final_title = resp or (default_title or out_mp4.stem)
+            cmd = [
+                sys.executable,
+                str(BASE_DIR / "scripts" / "5_upload.py"),
+                "--file",
+                str(out_mp4),
+                "--title",
+                final_title,
+                # privacy default is private; omit flag to keep default
+            ]
+            log("UPLOAD", " ".join(cmd), BLUE)
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                log("UPLOAD", f"Upload failed (exit {e.returncode}).", RED)
+        else:
+            log("OPEN", "No open action selected.", YELLOW)
+        return
+
+    # Continue with full render path.
     default_font_size = DEFAULT_UI_FONT_SIZE
     font_size_value = args.font_size
-
     if font_size_value is None:
         if sys.stdin.isatty():
             try:
-                resp = input(
-                    f"Subtitle font size [20–200, default {default_font_size}]: "
-                ).strip()
+                resp = input(f"Subtitle font size [20–200, default {default_font_size}]: ").strip()
             except EOFError:
                 resp = ""
             if not resp:
@@ -688,28 +643,19 @@ def main(argv=None):
                     if 20 <= v <= 200:
                         font_size_value = v
                     else:
-                        print(
-                            f"Value {v} out of range; using default {default_font_size}"
-                        )
+                        print(f"Value {v} out of range; using default {default_font_size}")
                         font_size_value = default_font_size
                 except ValueError:
-                    print(
-                        f"Invalid integer; using default font size {default_font_size}"
-                    )
+                    print(f"Invalid integer; using default font size {default_font_size}")
                     font_size_value = default_font_size
         else:
             font_size_value = default_font_size
 
     ui_font_size = max(20, min(200, font_size_value))
     ass_font_size = int(ui_font_size * ASS_FONT_MULTIPLIER)
-    log(
-        "FONT",
-        f"Using UI font size {ui_font_size} (ASS Fontsize={ass_font_size})",
-        CYAN,
-    )
+    log("FONT", f"Using UI font size {ui_font_size} (ASS Fontsize={ass_font_size})", CYAN)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
     log("MP4GEN", f"Slug={slug}, profile={profile}", CYAN)
 
     audio_path = choose_audio(slug, profile)
@@ -722,32 +668,21 @@ def main(argv=None):
     log("META", f'Artist="{artist}", Title="{title}", entries={len(timings)}', CYAN)
 
     ass_path = build_ass(
-        slug, artist, title, timings, audio_duration, args.font_name, ass_font_size
+        slug, profile, artist, title, timings, audio_duration, args.font_name, ass_font_size, LYRICS_OFFSET_SECS
     )
-
-    out_mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
 
     cmd = [
         "ffmpeg",
         "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30:d={max(audio_duration, 1.0)}",
-        "-i",
-        str(audio_path),
-        "-vf",
-        f"subtitles={ass_path}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        "18",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
+        "-f", "lavfi",
+        "-i", f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30:d={max(audio_duration, 1.0)}",
+        "-i", str(audio_path),
+        "-vf", f"subtitles={ass_path}",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "192k",
         "-shortest",
         str(out_mp4),
     ]
@@ -764,10 +699,11 @@ def main(argv=None):
     print("  1 = output directory")
     print("  2 = MP4 file")
     print("  3 = both (dir then MP4)")
+    print("  4 = upload to YouTube (private)")
     print("  0 = none")
 
     try:
-        choice = input("Choice [0–3]: ").strip()
+        choice = input("Choice [0–4]: ").strip()
     except EOFError:
         choice = "0"
 
@@ -778,11 +714,36 @@ def main(argv=None):
     elif choice == "3":
         open_path(OUTPUT_DIR)
         open_path(out_mp4)
+    elif choice == "4":
+        # Lightweight upload entrypoint; defaults handled in 5_upload.py
+        artist, title = read_meta(slug)
+        default_title = None
+        if artist or title:
+            display = f"{artist} - {title}" if artist and title else (title or artist or slug)
+            default_title = f"{display} ({profile}, offset {LYRICS_OFFSET_SECS:+.3f}s)"
+        try:
+            resp = input(f'YouTube title [ENTER for default{" ("+default_title+")" if default_title else ""}]: ').strip()
+        except EOFError:
+            resp = ""
+        final_title = resp or (default_title or out_mp4.stem)
+        cmd_up = [
+            sys.executable,
+            str(BASE_DIR / "scripts" / "5_upload.py"),
+            "--file",
+            str(out_mp4),
+            "--title",
+            final_title,
+            # privacy default is private
+        ]
+        log("UPLOAD", " ".join(cmd_up), BLUE)
+        try:
+            subprocess.run(cmd_up, check=True)
+        except subprocess.CalledProcessError as e:
+            log("UPLOAD", f"Upload failed (exit {e.returncode}).", RED)
     else:
         log("OPEN", "No open action selected.", YELLOW)
 
 
 if __name__ == "__main__":
     main()
-
 # end of 4_mp4.py

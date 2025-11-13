@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# scripts/0_master.py
 import argparse
 import json
 import subprocess
@@ -54,6 +55,46 @@ def run(cmd: list[str], section: str) -> float:
     t1 = time.perf_counter()
     return t1 - t0
 
+
+def run_capture(cmd: list[str], section: str) -> tuple[float, str]:
+    """
+    Like run(), but captures stdout for JSON emitted by scripts/5_upload.py.
+    """
+    log(section, " ".join(cmd), BLUE)
+    t0 = time.perf_counter()
+    cp = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    t1 = time.perf_counter()
+    out = (cp.stdout or "").strip()
+    # also reflect stderr if useful for debugging
+    if cp.stderr:
+        log(section, f"(stderr) {cp.stderr.strip()}", YELLOW)
+    return (t1 - t0), out
+
+
+def run_capture_no_throw(cmd: list[str], section: str) -> tuple[float, int, str, str]:
+    """
+    Non-throwing variant: returns (elapsed_secs, returncode, stdout, stderr).
+    Ensures we can write an upload receipt even if the child process fails.
+    """
+    log(section, " ".join(cmd), BLUE)
+    t0 = time.perf_counter()
+    cp = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    t1 = time.perf_counter()
+    if cp.stderr:
+        log(section, f"(stderr) {cp.stderr.strip()}", YELLOW)
+    return (t1 - t0), cp.returncode, (cp.stdout or "").strip(), (cp.stderr or "").strip()
+
+
+def offset_tag(val: float) -> str:
+    """
+    Safe suffix for filenames, e.g.
+      +0.000  -> _offset_p0p000s
+      -1.500  -> _offset_m1p500s
+    """
+    s = f"{val:+.3f}".replace("-", "m").replace("+", "p").replace(".", "p")
+    return f"_offset_{s}s"
+
+
 def detect_slug_from_latest_mp3() -> str:
     """
     Infer the most recent slug produced by step 1.
@@ -86,13 +127,14 @@ def load_meta(slug: str):
         return None, None
 
 
-def detect_assets(slug: str, profile: str) -> dict:
+def detect_assets(slug: str, profile: str, offset: float) -> dict:
     txt = TXT_DIR / f"{slug}.txt"
     mp3 = MP3_DIR / f"{slug}.mp3"
     meta = META_DIR / f"{slug}.json"
     mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
     timing_csv = TIMINGS_DIR / f"{slug}.csv"
-    mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
+    mp4 = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(offset)}.mp4"
+    uploaded_flag = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(offset)}.uploaded.json"
 
     step1_done = txt.exists() and mp3.exists() and meta.exists()
     if profile == "lyrics":
@@ -101,12 +143,14 @@ def detect_assets(slug: str, profile: str) -> dict:
         step2_done = mix_wav.exists()
     step3_done = timing_csv.exists()
     step4_done = mp4.exists()
+    step5_done = uploaded_flag.exists()
 
     return {
         1: step1_done,
         2: step2_done,
         3: step3_done,
         4: step4_done,
+        5: step5_done,
     }
 
 
@@ -118,8 +162,9 @@ def print_asset_status(slug: str, profile: str, status: dict) -> None:
         2: "stems/mix (Demucs + mix UI)",
         3: "timings CSV (3_timing)",
         4: "mp4 generation (4_mp4)",
+        5: "YouTube upload (5_upload)",
     }
-    for step in range(1, 5):
+    for step in range(1, 6):
         s = "DONE" if status.get(step) else "MISSING"
         color = GREEN if status.get(step) else YELLOW
         print(f"{color}[{step}] {labels[step]}  -> {s}{RESET}")
@@ -127,14 +172,14 @@ def print_asset_status(slug: str, profile: str, status: dict) -> None:
 
 
 def suggest_steps(status: dict) -> str:
-    missing = "".join(str(k) for k in range(1, 5) if not status.get(k))
+    missing = "".join(str(k) for k in range(1, 6) if not status.get(k))
     return missing or "0"
 
 
 def parse_steps_string(s: str) -> list[int]:
     steps: list[int] = []
     for ch in s:
-        if ch in "01234":
+        if ch in "012345":
             v = int(ch)
             if v not in steps:
                 steps.append(v)
@@ -161,7 +206,6 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
 
     separated_root = BASE_DIR / "separated"
 
-    # Always prefer 6-stem, then (if absolutely necessary) 4-stem.
     preferred_models: list[str] = []
     if model:
         preferred_models.append(model)
@@ -170,7 +214,6 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     if "htdemucs" not in preferred_models:
         preferred_models.append("htdemucs")  # 4-stem fallback, never 2-stem
 
-    # Check for existing stems we can reuse.
     existing_model = None
     for m in preferred_models:
         d = separated_root / m / slug
@@ -215,7 +258,6 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
 
     log("STEP2", f"Using Demucs model '{actual_model}' for mixing.", GREEN)
 
-    # Open mix UI (using remembered percentages) for this model/profile.
     t_mix_ui = run(
         [
             sys.executable,
@@ -276,7 +318,7 @@ def run_step3_timing(slug: str) -> float:
     return t
 
 
-def run_step4_mp4(slug: str, profile: str) -> float:
+def run_step4_mp4(slug: str, profile: str, offset: float) -> float:
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "4_mp4.py"),
@@ -284,6 +326,9 @@ def run_step4_mp4(slug: str, profile: str) -> float:
         slug,
         "--profile",
         profile,
+        "--offset",
+        str(offset),
+        # default behavior inside 4_mp4: skip if target exists (use --force to override)
     ]
     try:
         t = run(cmd, "STEP4")
@@ -299,9 +344,93 @@ def run_step4_mp4(slug: str, profile: str) -> float:
         return 0.0
 
 
+def run_step5_upload(
+    slug: str,
+    profile: str,
+    offset: float,
+    title: str | None,
+    privacy: str | None,
+    tags_csv: str | None,
+    made_for_kids: bool,
+    thumb_from_sec: float | None,
+    no_thumbnail: bool,
+) -> float:
+    """
+    Upload the offset-specific MP4 using scripts/5_upload.py and persist a simple
+    upload receipt to OUTPUT_DIR/<slug>_<profile>_offset_*.uploaded.json
+
+    This variant never raises, so master can summarize gracefully.
+    """
+    mp4 = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(offset)}.mp4"
+    if not mp4.exists():
+        log("STEP5", f"Target MP4 not found for upload: {mp4.name}", RED)
+        return 0.0
+
+    cmd = [
+        sys.executable,
+        str(SCRIPTS_DIR / "5_upload.py"),
+        "--file",
+        str(mp4),
+    ]
+    if title:
+        cmd += ["--title", title]
+    if privacy:
+        cmd += ["--privacy", privacy]
+    if tags_csv:
+        cmd += ["--tags", tags_csv]
+    if made_for_kids:
+        cmd += ["--made-for-kids"]
+    if no_thumbnail:
+        cmd += ["--no-thumbnail"]
+    if thumb_from_sec is not None:
+        cmd += ["--thumb-from-sec", str(thumb_from_sec)]
+
+    t, rc, out, err = run_capture_no_throw(cmd, "STEP5")
+    # Save receipt next to the MP4 for step-5 detection
+    receipt_path = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(offset)}.uploaded.json"
+    payload = {
+        "invoked": "5_upload.py",
+        "args": cmd,
+        "returncode": rc,
+        "stdout": out,
+        "stderr": err,
+        "ts": time.time(),
+    }
+    # Merge JSON payload if stdout is JSON
+    try:
+        parsed = json.loads(out) if out else {}
+        if isinstance(parsed, dict):
+            payload.update(parsed)
+    except json.JSONDecodeError:
+        pass
+    receipt_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    if rc != 0:
+        log("STEP5", "Upload failed. See receipt JSON for details.", RED)
+        if "ModuleNotFoundError" in err or "No module named" in err:
+            log(
+                "STEP5",
+                "Missing YouTube client libraries. Install in your venv:\n"
+                "  pip3 install --upgrade google-api-python-client google-auth-oauthlib google-auth-httplib2",
+                YELLOW,
+            )
+        if "Missing OAuth client secrets" in out or "Missing OAuth client secrets" in err:
+            log(
+                "STEP5",
+                "Provide OAuth client JSON and set env:\n"
+                "  export YOUTUBE_CLIENT_SECRETS_JSON=client_secret.json\n"
+                "(API keys alone cannot upload; OAuth is required.)",
+                YELLOW,
+            )
+    else:
+        log("STEP5", "Upload completed successfully.", GREEN)
+
+    return t
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Karaoke pipeline master (1=txt/mp3, 2=stems, 3=timing, 4=mp4)."
+        description="Karaoke pipeline master (1=txt/mp3, 2=stems, 3=timing, 4=mp4, 5=upload)."
     )
     src = p.add_mutually_exclusive_group()
     src.add_argument("--query", type=str, help="Search query for step 1 (1_txt_mp3)")
@@ -313,20 +442,31 @@ def parse_args(argv=None):
         choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
     )
     p.add_argument("--model", type=str, default="htdemucs_6s", help="Demucs model name")
-    p.add_argument("--steps", type=str, help="Steps to run, e.g. 24 or 1234")
+    p.add_argument("--steps", type=str, help="Steps to run, e.g. 24 or 12345")
     p.add_argument(
         "--do",
         type=str,
-        choices=["new", "remix", "retime", "mp4"],
+        choices=["new", "remix", "retime", "mp4", "publish", "render_upload"],
         help=(
-            "High-level action shortcut: "
-            "new=1+2+3+4 from query, "
-            "remix=2+4 from existing slug, "
-            "retime=3+4 from existing slug, "
-            "mp4=4 only."
+            "Shortcut: new=1+2+3+4 from query; remix=2+4; retime=3+4; mp4=4; "
+            "publish=5 (upload only); render_upload=4+5."
         ),
     )
+    p.add_argument(
+        "--offset",
+        type=float,
+        default=0.0,
+        help="Global lyrics/text offset in seconds. Negative=sooner, Positive=later (baseline=0).",
+    )
     p.add_argument("--skip-ui", action="store_true", help="Non-interactive; use --steps / --do as-is")
+
+    # Optional upload arguments (forwarded to 5_upload.py)
+    p.add_argument("--upload-title", type=str, help="YouTube title override")
+    p.add_argument("--upload-privacy", type=str, choices=["public", "unlisted", "private"], help="YouTube privacy")
+    p.add_argument("--upload-tags", type=str, help="Comma-separated tags")
+    p.add_argument("--upload-made-for-kids", action="store_true", help="Mark as made for kids")
+    p.add_argument("--upload-no-thumbnail", action="store_true", help="Skip setting a thumbnail")
+    p.add_argument("--upload-thumb-from-sec", type=float, help="Capture thumbnail at this second (e.g., 0.5)")
     return p.parse_args(argv)
 
 
@@ -376,13 +516,13 @@ def interactive_slug_and_steps(args):
                     raise SystemExit("Slug is required if no query is given.")
 
     slug = slugify(slug)
-    status = detect_assets(slug, args.profile)
+    status = detect_assets(slug, args.profile, args.offset)
     print_asset_status(slug, args.profile, status)
 
     suggested = suggest_steps(status)
     try:
         s = input(
-            f"Steps to run (1=txt/mp3,2=stems,3=timing,4=mp4, 0=none, ENTER for suggested={suggested}): "
+            f"Steps to run (1=txt/mp3,2=stems,3=timing,4=mp4,5=upload, 0=none, ENTER for suggested={suggested}): "
         ).strip()
     except EOFError:
         s = ""
@@ -409,7 +549,7 @@ def interactive_slug_and_steps(args):
 
 def noninteractive_slug_and_steps(args):
     if not args.steps:
-        raise SystemExit("--skip-ui requires --steps like 24 or 1234.")
+        raise SystemExit("--skip-ui requires --steps like 24 or 12345.")
     steps = parse_steps_string(args.steps)
     if not steps:
         return "", []
@@ -421,7 +561,7 @@ def noninteractive_slug_and_steps(args):
         slug, _ = run_step1_txt_mp3(args.query)
 
     if not slug:
-        raise SystemExit("Slug is required for steps 2–4 (use --slug or include step 1 with --query).")
+        raise SystemExit("Slug is required for steps 2–5 (use --slug or include step 1 with --query).")
 
     slug = slugify(slug)
     return slug, steps
@@ -449,6 +589,14 @@ def main(argv=None):
             if not args.slug:
                 raise SystemExit("--do mp4 requires --slug.")
             args.steps = "4"
+        elif args.do == "publish":
+            if not args.slug:
+                raise SystemExit("--do publish requires --slug.")
+            args.steps = "5"
+        elif args.do == "render_upload":
+            if not args.slug:
+                raise SystemExit("--do render_upload requires --slug.")
+            args.steps = "45"
 
         # When using --do, run non-interactively by default.
         args.skip_ui = True
@@ -462,9 +610,13 @@ def main(argv=None):
     if not steps:
         return
 
-    log("MASTER", f"Running steps {steps} for slug={slug}, profile={args.profile}", CYAN)
+    log(
+        "MASTER",
+        f"Running steps {steps} for slug={slug}, profile={args.profile} (offset {args.offset:+.3f}s)",
+        CYAN,
+    )
 
-    t2 = t3 = t4 = 0.0
+    t2 = t3 = t4 = t5 = 0.0
 
     if 1 in steps and not args.skip_ui and t1 == 0.0:
         if not args.query:
@@ -478,22 +630,38 @@ def main(argv=None):
         t3 = run_step3_timing(slug)
 
     if 4 in steps:
-        t4 = run_step4_mp4(slug, args.profile)
+        t4 = run_step4_mp4(slug, args.profile, args.offset)
+
+    if 5 in steps:
+        t5 = run_step5_upload(
+            slug=slug,
+            profile=args.profile,
+            offset=args.offset,
+            title=args.upload_title,
+            privacy=args.upload_privacy,
+            tags_csv=args.upload_tags,
+            made_for_kids=bool(args.upload_made_for_kids),
+            thumb_from_sec=args.upload_thumb_from_sec,
+            no_thumbnail=bool(args.upload_no_thumbnail),
+        )
 
     total_end = time.perf_counter()
     total = total_end - total_start
 
     print()
-    print(f"{BOLD}{BLUE}========= PIPELINE SUMMARY ({slug}, profile={args.profile}) ========={RESET}")
+    print(
+        f"{BOLD}{BLUE}========= PIPELINE SUMMARY "
+        f"({slug}, profile={args.profile}, offset={args.offset:+.3f}s) ========={RESET}"
+    )
     print(f"{CYAN}Step 1 txt/mp3:  {fmt_secs_mmss(t1)}{RESET}")
     print(f"{CYAN}Step 2 stems:    {fmt_secs_mmss(t2)}{RESET}")
     print(f"{CYAN}Step 3 timing:   {fmt_secs_mmss(t3)}{RESET}")
     print(f"{CYAN}Step 4 mp4:      {fmt_secs_mmss(t4)}{RESET}")
+    print(f"{CYAN}Step 5 upload:   {fmt_secs_mmss(t5)}{RESET}")
     print(f"{BOLD}{GREEN}Total pipeline: {fmt_secs_mmss(total)}{RESET}")
     print(f"{BOLD}{BLUE}====================================================={RESET}")
 
 
 if __name__ == "__main__":
     main()
-
 # end of 0_master.py

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
+# experimental/5gen_mp4.py
+# Final MP4 generation: builds text overlay (-vf) and applies global audio offset (-af)
+
 import argparse
 import csv
 import json
 import subprocess
 import sys
 from pathlib import Path
+from ffmpeg_helpers import build_audio_offset_filter
 
 RESET = "\033[0m"
-BOLD = "\033[1m"
 CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
@@ -35,7 +38,6 @@ def log(section: str, msg: str, color: str = CYAN) -> None:
 
 def slugify(text: str) -> str:
     import re
-
     base = text.strip().lower()
     base = re.sub(r"\s+", "_", base)
     base = re.sub(r"[^\w\-]+", "", base)
@@ -62,22 +64,35 @@ def load_timings(slug: str) -> list[dict]:
 
 
 def load_offset(slug: str) -> float:
-    path = OFFSETS_DIR / f"{slug}.json"
-    if not path.exists():
-        return 0.0
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return float(data.get("offset", 0.0))
-    except Exception:
-        log("MP4", f"Failed to parse offset file {path}, using 0.0", YELLOW)
-        return 0.0
+    """
+    Looks for:
+      offsets/{slug}.json  keys: offset_seconds | offset | seconds | ms
+      offsets/{slug}.txt   single float seconds
+    Defaults to 0.0
+    """
+    j = OFFSETS_DIR / f"{slug}.json"
+    if j.exists():
+        try:
+            data = json.loads(j.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                if "ms" in data:
+                    return float(data["ms"]) / 1000.0
+                for k in ("offset_seconds", "offset", "seconds"):
+                    if k in data:
+                        return float(data[k])
+        except Exception:
+            pass
+    t = OFFSETS_DIR / f"{slug}.txt"
+    if t.exists():
+        try:
+            return float(t.read_text(encoding="utf-8").strip())
+        except Exception:
+            pass
+    return 0.0
 
 
 def build_drawtext_filters(events: list[dict], offset: float) -> str:
-    """
-    Build drawtext chain from timing events and a global offset.
-    CSV remains intact; we only shift times here.
-    """
+    """Build drawtext chain from timing events plus a global offset (sec)."""
     if not events:
         return "null"
 
@@ -90,17 +105,9 @@ def build_drawtext_filters(events: list[dict], offset: float) -> str:
         line_index = ev["line_index"]
 
         start = t + offset
-
         if line_index >= 0:
-            next_time = None
-            for j in main_indices:
-                if events[j]["time"] > t:
-                    next_time = events[j]["time"]
-                    break
-            if next_time is not None:
-                end = min(start + LINE_DURATION_DEFAULT, next_time + offset - 0.1)
-            else:
-                end = start + LINE_DURATION_DEFAULT
+            next_time = next((events[j]["time"] for j in main_indices if events[j]["time"] > t), None)
+            end = min(start + LINE_DURATION_DEFAULT, (next_time + offset - 0.1) if next_time is not None else start + LINE_DURATION_DEFAULT)
             fontsize = MAIN_FONT_SIZE
             y_expr = "h-160"
         else:
@@ -127,9 +134,7 @@ def build_drawtext_filters(events: list[dict], offset: float) -> str:
         )
         filters.append(draw)
 
-    if not filters:
-        return "null"
-    return ",".join(filters)
+    return ",".join(filters) if filters else "null"
 
 
 def parse_args(argv=None):
@@ -155,32 +160,34 @@ def main(argv=None):
 
     events = load_timings(slug)
     offset = load_offset(slug)
-    log("MP4", f"Using offset {offset:+.3f}s for slug {slug}", GREEN)
+    vf_chain = build_drawtext_filters(events, offset)
+    af_chain = build_audio_offset_filter(offset)  # "" if no-op
 
-    filter_complex = build_drawtext_filters(events, offset)
+    # DEBUG: print exactly what we will pass to ffmpeg (helps catch stray numbers)
+    log("MP4", f"offset={offset:+.3f}s  af_chain={'<none>' if not af_chain else af_chain}", GREEN)
 
     cmd = [
         "ffmpeg",
+        "-hide_banner",
         "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        f"color=size={WIDTH}x{HEIGHT}:rate={FPS}:color=black",
-        "-i",
-        str(audio_path),
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
+        "-f", "lavfi",
+        "-i", f"color=size={WIDTH}x{HEIGHT}:rate={FPS}:color=black",
+        "-i", str(audio_path),
+        "-vf", vf_chain,
+    ]
+
+    # Only add -af if we have a real filter (never a bare number)
+    if af_chain:
+        cmd += ["-af", af_chain]
+
+    cmd += [
+        "-map", "0:v:0",
+        "-map", "1:a:0",
         "-shortest",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-c:a",
-        "aac",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "fast",
+        "-c:a", "aac",
         str(out_path),
     ]
 
