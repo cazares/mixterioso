@@ -15,6 +15,10 @@
 
 set -euo pipefail
 
+source demucs_env/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install faster-whisper rapidfuzz
+
 # ---------- styling ----------
 RESET=$'\033[0m'; BOLD=$'\033[1m'; CYAN=$'\033[36m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'; BLUE=$'\033[34m'
 say(){ printf "%b%s%b\n" "$1" "$2" "$RESET"; }

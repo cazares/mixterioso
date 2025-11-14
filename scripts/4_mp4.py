@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # scripts/4_mp4.py
+# Generate a karaoke MP4 from an MP3/WAV + timings CSV.
+# CSV is expected as (line_index, time_secs, text). We reorder to (time_secs, text, line_index) internally.
+
 import argparse
 import csv
 import json
@@ -9,6 +12,14 @@ import time
 from pathlib import Path
 import os
 
+# --- Make sure `scripts/` is importable whether we run as `python3 scripts/4_mp4.py` or via a module ---
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# Pull in our unified CSV loader: returns list of (line_index, time_secs, text)
+from scripts.timings_io import load_timings_any  # type: ignore
+
 RESET = "\033[0m"
 BOLD = "\033[1m"
 CYAN = "\033[36m"
@@ -17,7 +28,7 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 BLUE = "\033[34m"
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = REPO_ROOT
 TXT_DIR = BASE_DIR / "txts"
 MP3_DIR = BASE_DIR / "mp3s"
 MIXES_DIR = BASE_DIR / "mixes"
@@ -84,7 +95,6 @@ def log(prefix: str, msg: str, color: str = RESET) -> None:
 
 def slugify(text: str) -> str:
     import re
-
     base = text.strip().lower()
     base = re.sub(r"\s+", "_", base)
     base = re.sub(r"[^\w\-]+", "", base)
@@ -142,71 +152,21 @@ def read_meta(slug: str) -> tuple[str, str]:
 
 def read_timings(slug: str):
     """
-    Return list of (time_secs, text, line_index).
-    Preferred CSV format: line_index,time_secs,text
-    Fallback 2-column   : time_secs,text
+    Load timings via scripts/timings_io.load_timings_any which returns
+    triplets as (line_index, time_secs, text).
+
+    We convert to the internal order expected by the renderer:
+        (time_secs, text, line_index)
     """
-    timing_path = TIMINGS_DIR / f"{slug}.csv"
-    if not timing_path.exists():
-        print(f"Timing CSV not found for slug={slug}: {timing_path}")
+    csv_path = TIMINGS_DIR / f"{slug}.csv"
+    if not csv_path.exists():
+        print(f"Timing CSV not found for slug={slug}: {csv_path}")
         sys.exit(1)
 
-    rows = []
-    with timing_path.open(newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-
-        if header and "time_secs" in header:
-            try:
-                idx_time = header.index("time_secs")
-            except ValueError:
-                idx_time = 1
-            try:
-                idx_li = header.index("line_index")
-            except ValueError:
-                idx_li = None
-            idx_text = header.index("text") if "text" in header else None
-
-            for row in reader:
-                if not row or len(row) <= idx_time:
-                    continue
-                t_str = row[idx_time].strip()
-                if not t_str:
-                    continue
-                try:
-                    t = float(t_str)
-                except ValueError:
-                    continue
-
-                if idx_li is not None and len(row) > idx_li:
-                    try:
-                        line_index = int(row[idx_li])
-                    except ValueError:
-                        line_index = 0
-                else:
-                    line_index = 0
-
-                text = ""
-                if idx_text is not None and len(row) > idx_text:
-                    text = row[idx_text]
-
-                rows.append((t, text, line_index))
-        else:
-            for row in reader:
-                if len(row) < 2:
-                    continue
-                t_str = row[0].strip()
-                if not t_str:
-                    continue
-                try:
-                    t = float(t_str)
-                except ValueError:
-                    continue
-                text = row[1]
-                rows.append((t, text, 0))
-
+    triples = load_timings_any(csv_path)  # (li, ts, text)
+    rows = [(ts, text, li) for (li, ts, text) in triples]
     rows.sort(key=lambda x: x[0])
-    log("TIMINGS", f"Loaded {len(rows)} timing rows from {timing_path}", CYAN)
+    log("TIMINGS", f"Loaded {len(rows)} timing rows from {csv_path}", CYAN)
     return rows
 
 
@@ -664,7 +624,7 @@ def main(argv=None):
         log("DUR", f"Audio duration unknown or zero for {audio_path}", YELLOW)
 
     artist, title = read_meta(slug)
-    timings = read_timings(slug)
+    timings = read_timings(slug)  # <- uses timings_io and reorders to (time_secs, text, line_index)
     log("META", f'Artist="{artist}", Title="{title}", entries={len(timings)}', CYAN)
 
     ass_path = build_ass(

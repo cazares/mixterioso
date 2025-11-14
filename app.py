@@ -1,176 +1,431 @@
 #!/usr/bin/env python3
-# app.py — hardened Step-1 REST API (YouTube URL → MP3) for MacinCloud or local use
+# app.py — Mixterioso API (Step 1 end-to-end pipeline, NO 3_timing.py)
+# - /mp3:     YouTube URL → MP3
+# - /search:  URL/ID/Query → MP3 + lyrics (delegates to 1_txt_mp3.py for queries)
+# - /pipeline: Input → mp3 + txt + timings (lyrics_align_single.py) + mp4 + optional upload
 
-from __future__ import annotations
-
-import logging
+import asyncio
+import json
 import os
 import re
-import shutil
+import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, HttpUrl
-import yt_dlp
+from fastapi.responses import FileResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 
-# ========== Config ==========
-APP_NAME = "Step1 MP3 API"
-MP3_DIR = Path("mp3s")
-MP3_DIR.mkdir(parents=True, exist_ok=True)
+# ---------- Paths ----------
+BASE_DIR = Path(__file__).resolve().parent
+SCRIPTS_DIR = BASE_DIR / "scripts"
+TXT_DIR = BASE_DIR / "txts"
+MP3_DIR = BASE_DIR / "mp3s"
+MIXES_DIR = BASE_DIR / "mixes"
+TIMINGS_DIR = BASE_DIR / "timings"
+OUTPUT_DIR = BASE_DIR / "output"
+META_DIR = BASE_DIR / "meta"
+SEPARATED_DIR = BASE_DIR / "separated"
 
-# ========== Logging ==========
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-log = logging.getLogger("step1-api")
+for d in (TXT_DIR, MP3_DIR, MIXES_DIR, TIMINGS_DIR, OUTPUT_DIR, META_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
+PYTHON_BIN = sys.executable
 
-# ========== Helpers ==========
-SAFE_MP3_RE = re.compile(r"^[A-Za-z0-9_-]{6,32}\.mp3$")  # YouTube IDs are 11 chars; allow a bit wider for safety.
+# ---------- App ----------
+app = FastAPI(title="Mixterioso — Step-1 Pipeline API", version="0.2.0")
 
-def _ffmpeg_location() -> Optional[str]:
-    """
-    Return a path usable by yt-dlp's 'ffmpeg_location' option.
-    Accepts either a directory containing ffmpeg or the ffmpeg binary itself.
-    """
-    ff = shutil.which("ffmpeg")
-    if not ff:
-        return None
-    # yt-dlp accepts a directory; that is slightly more portable across wrappers
-    return os.path.dirname(ff)
-
-def _looks_like_mp3(p: Path) -> bool:
-    # Basic magic check: 'ID3' (tag) or 0xFF sync word frame header.
-    try:
-        with p.open("rb") as f:
-            head = f.read(3)
-        return head.startswith(b"ID3") or head.startswith(b"\xff")
-    except Exception:
-        return False
-
-def _validate_mp3(path: Path) -> None:
-    if not path.exists():
-        raise HTTPException(status_code=500, detail="MP3 file missing after processing.")
-    if path.stat().st_size < 32_000:  # ~32 KB minimum sanity
-        raise HTTPException(status_code=500, detail="MP3 too small; ffmpeg likely failed.")
-    if not _looks_like_mp3(path):
-        raise HTTPException(status_code=500, detail="Generated file is not a valid MP3.")
-
-
-# ========== API ==========
-app = FastAPI(title=APP_NAME)
-
-# Allow mobile/localhost by default; tighten in production.
+# CORS: wide-open for dev; tighten later if needed
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
+# ---------- Helpers ----------
+def slugify(text: str) -> str:
+    base = text.strip().lower()
+    base = re.sub(r"\s+", "_", base)
+    base = re.sub(r"[^\w\-]+", "", base)
+    return base or "song"
 
-class MP3Request(BaseModel):
-    youtube_url: HttpUrl
-    bitrate_kbps: Optional[int] = 192  # 128/192/256/320
+def is_youtube_url_or_id(s: str) -> bool:
+    s = s.strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
+        return True
+    return bool(re.search(r"(youtube\.com|youtu\.be)", s, re.I))
 
+def extract_video_id(s: str) -> Optional[str]:
+    s = s.strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
+        return s
+    m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", s)
+    return m.group(1) if m else None
 
+@dataclass
+class RunResult:
+    code: int
+    out: str
+    err: str
+    secs: float
+
+async def run_cmd(cmd: list[str], logs: list[str], tag: str, check: bool = False) -> RunResult:
+    t0 = time.perf_counter()
+    logs.append(f"[{tag}] $ {' '.join(cmd)}")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=str(BASE_DIR)
+    )
+    out_b, err_b = await proc.communicate()
+    t1 = time.perf_counter()
+    out = (out_b or b"").decode("utf-8", errors="replace")
+    err = (err_b or b"").decode("utf-8", errors="replace")
+    logs.append(f"[{tag}] exit={proc.returncode} in {t1 - t0:.2f}s")
+    if out.strip():
+        logs.append(f"[{tag}][stdout]\n{out.strip()}")
+    if err.strip():
+        logs.append(f"[{tag}][stderr]\n{err.strip()}")
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"{tag} failed with exit {proc.returncode}")
+    return RunResult(proc.returncode, out, err, t1 - t0)
+
+def write_pipeline_log(slug: str, logs: list[str]) -> str:
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    path = OUTPUT_DIR / f"{slug}_{ts}_pipeline.log"
+    path.write_text("\n".join(logs), encoding="utf-8")
+    return str(path)
+
+def meta_artist_title(slug: str) -> tuple[Optional[str], Optional[str]]:
+    meta = META_DIR / f"{slug}.json"
+    if not meta.exists():
+        return None, None
+    try:
+        data = json.loads(meta.read_text(encoding="utf-8"))
+        return data.get("artist"), data.get("title")
+    except Exception:
+        return None, None
+
+# ---------- Schemas ----------
+class MP3Req(BaseModel):
+    youtube_url: str
+    bitrate_kbps: int = Field(default=192, ge=64, le=320)
+
+class SearchReq(BaseModel):
+    input: str
+    bitrate_kbps: int = Field(default=192, ge=64, le=320)
+
+class PipelineReq(BaseModel):
+    input: str
+    bitrate_kbps: int = Field(default=192, ge=64, le=320)
+    profile: str = Field(default="lyrics")  # other profiles supported by your 2_stems/4_mp4
+    offset: float = 0.0
+    upload: bool = False
+    privacy: Optional[str] = Field(default=None)           # "public"|"unlisted"|"private"
+    made_for_kids: bool = False
+    thumb_from_sec: Optional[float] = None
+    tags_csv: Optional[str] = None
+    title_override: Optional[str] = None
+
+# ---------- Routes ----------
 @app.get("/health")
-def health():
-    return {"ok": True, "service": APP_NAME}
-
-
-@app.head("/files/{filename}")
-def head_file(filename: str):
-    if not SAFE_MP3_RE.match(filename):
-        raise HTTPException(status_code=400, detail="Invalid filename.")
-    path = MP3_DIR / filename
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
-    # HEAD: 200 with no body
-    return Response(status_code=200)
-
+async def health() -> Dict[str, Any]:
+    return {"ok": True, "cwd": str(BASE_DIR)}
 
 @app.get("/files/{filename}")
-def serve_file(filename: str):
-    if not SAFE_MP3_RE.match(filename):
-        raise HTTPException(status_code=400, detail="Invalid filename.")
-    path = MP3_DIR / filename
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
-    return FileResponse(path, media_type="audio/mpeg", filename=filename)
+async def serve_file(filename: str):
+    # Serve from known roots
+    for root in (MP3_DIR, TXT_DIR, TIMINGS_DIR, OUTPUT_DIR, MIXES_DIR, META_DIR):
+        p = root / filename
+        if p.exists() and p.is_file():
+            return FileResponse(str(p))
+    raise HTTPException(404, "file not found")
 
+@app.head("/files/{filename}")
+async def head_file(filename: str):
+    for root in (MP3_DIR, TXT_DIR, TIMINGS_DIR, OUTPUT_DIR, MIXES_DIR, META_DIR):
+        p = root / filename
+        if p.exists() and p.is_file():
+            return PlainTextResponse("", status_code=200)
+    raise HTTPException(404, "file not found")
 
 @app.post("/mp3")
-def create_mp3(body: MP3Request):
-    """
-    Download bestaudio from YouTube and convert it to MP3 at the requested bitrate.
-    Returns metadata and a local download URL (/files/<video_id>.mp3).
-    """
-    ff_loc = _ffmpeg_location()
-    if not ff_loc:
-        # Fast fail with a clear message rather than producing a zero-byte file.
-        raise HTTPException(status_code=500, detail="ffmpeg not found on PATH. Install ffmpeg and retry.")
+async def mp3(req: MP3Req):
+    logs: list[str] = []
+    vid = extract_video_id(req.youtube_url) or "audio"
+    out_mp3 = MP3_DIR / f"{vid}.mp3"
 
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": str(MP3_DIR / "%(id)s.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": str(body.bitrate_kbps or 192),
-            }
-        ],
-        "overwrites": True,
-        "ffmpeg_location": ff_loc,
+    # yt-dlp direct
+    ytdlp_cmd = [
+        "yt-dlp", "-x", "--audio-format", "mp3",
+        "--audio-quality", f"{req.bitrate_kbps}k",
+        "-o", str(out_mp3), req.youtube_url
+    ]
+    rr = await run_cmd(ytdlp_cmd, logs, "STEP1-MP3", check=True)
+
+    # Title extraction from stdout (best-effort)
+    title = None
+    m = re.search(r"\[download\] Destination: .*?/(.+?)\.mp3", rr.out)
+    if m:
+        title = m.group(1).replace("_", " ")
+    return {
+        "video_id": vid,
+        "title": title or vid,
+        "bitrate_kbps": req.bitrate_kbps,
+        "mp3_path": str(out_mp3),
+        "download_url": f"/files/{out_mp3.name}",
+        "logs": logs[-50:],  # tail for brevity
     }
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(str(body.youtube_url), download=True)
-    except yt_dlp.utils.DownloadError as e:
-        # Common cases: region lock, age restriction, network error, invalid URL
-        log.warning("yt-dlp download error: %s", e)
-        raise HTTPException(status_code=400, detail=f"Download failed: {e}")
-    except Exception as e:
-        log.exception("Unexpected error in yt-dlp")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+@app.post("/search")
+async def search(req: SearchReq):
+    """
+    Unified: if input is URL/ID → download MP3 directly
+             else (query) → delegate to scripts/1_txt_mp3.py, which writes mp3+txt+meta
+    """
+    logs: list[str] = []
+    value = req.input.strip()
+    base = value
 
-    video_id = info.get("id")
-    title = info.get("title") or video_id or "audio"
-    mp3_path = MP3_DIR / f"{video_id}.mp3"
+    if is_youtube_url_or_id(value):
+        # Same as /mp3 path
+        vid = extract_video_id(value) or "audio"
+        out_mp3 = MP3_DIR / f"{vid}.mp3"
+        ytdlp_cmd = [
+            "yt-dlp", "-x", "--audio-format", "mp3",
+            "--audio-quality", f"{req.bitrate_kbps}k",
+            "-o", str(out_mp3), value
+        ]
+        await run_cmd(ytdlp_cmd, logs, "STEP1-MP3", check=True)
+        title_guess = vid
+        return {
+            "slug": slugify(title_guess),
+            "title": title_guess,
+            "download_url": f"/files/{out_mp3.name}",
+            "lyrics_text": "",
+            "search_metadata": {"mode": "url_or_id", "input": value},
+            "logs": logs[-100:]
+        }
 
-    # Some postprocessors can vary the final name; be defensive.
-    if not mp3_path.exists():
-        matches = list(MP3_DIR.glob(f"{video_id}*.mp3"))
-        if matches:
-            mp3_path = matches[0]
+    # Query path — use 1_txt_mp3.py to resolve (Genius→Musixmatch/YouTube) and write files
+    if not (SCRIPTS_DIR / "1_txt_mp3.py").exists():
+        raise HTTPException(500, "scripts/1_txt_mp3.py not found for query search.")
+    rr = await run_cmd(
+        [PYTHON_BIN, str(SCRIPTS_DIR / "1_txt_mp3.py"), value], logs, "STEP1-QUERY", check=True
+    )
 
-    _validate_mp3(mp3_path)
+    # Best-effort: infer latest mp3 + txt
+    mp3s = sorted(MP3_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
+    txts = sorted(TXT_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime)
+    if not mp3s:
+        raise HTTPException(500, "MP3 not created by 1_txt_mp3.py")
+    latest_mp3 = mp3s[-1]
+    slug = slugify(latest_mp3.stem)
 
-    # Serve via /files/<video_id>.mp3
-    filename = mp3_path.name
-    if not SAFE_MP3_RE.match(filename):
-        # Normalize an odd filename to the canonical <id>.mp3
-        fixed = MP3_DIR / f"{video_id}.mp3"
-        try:
-            mp3_path.rename(fixed)
-            filename = fixed.name
-            mp3_path = fixed
-        except Exception:
-            # If rename fails, still return the original path safely.
-            pass
+    lyrics_text = ""
+    if txts:
+        latest_txt = txts[-1]
+        if latest_txt.stem == latest_mp3.stem:
+            lyrics_text = latest_txt.read_text(encoding="utf-8", errors="ignore")
+
+    artist, title = meta_artist_title(slug)
+    full_title = f"{artist} - {title}" if artist and title else slug
 
     return {
-        "video_id": video_id,
-        "title": title,
-        "bitrate_kbps": body.bitrate_kbps or 192,
-        "mp3_path": str(mp3_path.resolve()),
-        "download_url": f"/files/{filename}",
+        "slug": slug,
+        "title": full_title,
+        "download_url": f"/files/{latest_mp3.name}",
+        "lyrics_text": lyrics_text,
+        "search_metadata": {"mode": "query_via_1_txt_mp3", "input": value},
+        "logs": logs[-200:],
     }
+
+@app.post("/pipeline")
+async def pipeline(req: PipelineReq):
+    """
+    One-shot: input → mp3 + txt + timings (lyrics_align_single.py) + mp4 + optional YouTube upload.
+    NO USE of scripts/3_timing.py anywhere.
+    """
+    logs: list[str] = []
+    try:
+        # ---- STEP 1: MP3 + TXT (delegate behavior similar to /search) ----
+        if is_youtube_url_or_id(req.input):
+            vid = extract_video_id(req.input) or "audio"
+            out_mp3 = MP3_DIR / f"{vid}.mp3"
+            ytdlp_cmd = [
+                "yt-dlp", "-x", "--audio-format", "mp3",
+                "--audio-quality", f"{req.bitrate_kbps}k",
+                "-o", str(out_mp3), req.input
+            ]
+            await run_cmd(ytdlp_cmd, logs, "STEP1-MP3", check=True)
+            slug = slugify(out_mp3.stem)
+            txt_path = TXT_DIR / f"{slug}.txt"
+            if not txt_path.exists():
+                # create empty lyrics if none resolved
+                txt_path.write_text("", encoding="utf-8")
+        else:
+            if not (SCRIPTS_DIR / "1_txt_mp3.py").exists():
+                raise HTTPException(500, "scripts/1_txt_mp3.py not found for query search.")
+            await run_cmd(
+                [PYTHON_BIN, str(SCRIPTS_DIR / "1_txt_mp3.py"), req.input],
+                logs, "STEP1-QUERY", check=True
+            )
+            # infer latest products
+            mp3s = sorted(MP3_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
+            if not mp3s:
+                raise HTTPException(500, "MP3 not created by 1_txt_mp3.py")
+            out_mp3 = mp3s[-1]
+            slug = slugify(out_mp3.stem)
+            txt_path = TXT_DIR / f"{slug}.txt"
+            if not txt_path.exists():
+                txt_path.write_text("", encoding="utf-8")
+
+        mp3_path = MP3_DIR / f"{slug}.mp3"
+        if not mp3_path.exists():
+            # If yt-dlp wrote with video_id, ensure names align
+            mp3_candidates = sorted(MP3_DIR.glob(f"{slug}*.mp3"), key=lambda p: p.stat().st_mtime)
+            if mp3_candidates:
+                mp3_path = mp3_candidates[-1]
+            else:
+                raise HTTPException(500, "MP3 file not found after Step 1.")
+
+        # ---- STEP 2: Stems/Mix (skip for 'lyrics' profile) ----
+        if req.profile != "lyrics":
+            # Try 6-stem model first, then 4-stem; never 2-stem here automatically
+            actual_model = None
+            for model in ("htdemucs_6s", "htdemucs"):
+                # Reuse if already separated
+                if (SEPARATED_DIR / model / slug).exists():
+                    actual_model = model
+                    logs.append(f"[STEP2] Reusing stems for model {model}")
+                    break
+            if actual_model is None:
+                # Run demucs
+                for model in ("htdemucs_6s", "htdemucs"):
+                    try:
+                        await run_cmd(["demucs", "-n", model, str(mp3_path)], logs, "STEP2-DEMUX", check=True)
+                        actual_model = model
+                        break
+                    except Exception as e:
+                        logs.append(f"[STEP2] model {model} failed; trying next… ({e})")
+                if actual_model is None:
+                    raise HTTPException(500, "Demucs failed for 6-stem and 4-stem models.")
+
+            # Mix UI/render using your 2_stems.py (UI-less render)
+            if (SCRIPTS_DIR / "2_stems.py").exists():
+                # render-only
+                out_wav = MIXES_DIR / f"{slug}_{req.profile}.wav"
+                await run_cmd(
+                    [PYTHON_BIN, str(SCRIPTS_DIR / "2_stems.py"),
+                     "--mp3", str(mp3_path), "--profile", req.profile,
+                     "--model", actual_model, "--render-only", "--output", str(out_wav)],
+                    logs, "STEP2-RENDER", check=True
+                )
+            else:
+                logs.append("[STEP2] scripts/2_stems.py missing; skipping mix render.")
+
+        # ---- STEP 3: Timings via lyrics_align_single.py ONLY ----
+        timings_csv = TIMINGS_DIR / f"{slug}.csv"
+        timings_csv.parent.mkdir(parents=True, exist_ok=True)
+
+        if (BASE_DIR / "lyrics_align_single.py").exists():
+            await run_cmd(
+                [PYTHON_BIN, str(BASE_DIR / "lyrics_align_single.py"),
+                 "--txt", str(TXT_DIR / f"{slug}.txt"),
+                 "--audio", str(mp3_path),
+                 "--timings", str(timings_csv)],
+                logs, "STEP3-ALIGN", check=True
+            )
+        else:
+            # Fallback: naive timings so we can still render during demos
+            logs.append("[STEP3-FALLBACK] lyrics_align_single.py not found; writing naive timings.")
+            lines = [
+                ln.strip() for ln in (TXT_DIR / f"{slug}.txt").read_text(encoding="utf-8", errors="ignore").splitlines()
+                if ln.strip()
+            ]
+            if not lines:
+                lines = ["…"]  # minimal placeholder
+            LINE_SECS = float(os.environ.get("NAIVE_LINE_SECS", "2.5"))
+            t = 0.0
+            rows = ["line,start"]
+            for ln in lines:
+                rows.append(f"{ln.replace(',', '‚')},{t:.3f}")
+                t += LINE_SECS
+            timings_csv.write_text("\n".join(rows), encoding="utf-8")
+
+        if not timings_csv.exists() or timings_csv.stat().st_size == 0:
+            raise HTTPException(500, "Timings CSV not created.")
+
+        # ---- STEP 4: MP4 render ----
+        mp4_path = OUTPUT_DIR / f"{slug}_{req.profile}_offset_{('p' if req.offset>=0 else 'm')}{str(abs(req.offset)).replace('.', 'p')}s.mp4"
+        if (SCRIPTS_DIR / "4_mp4.py").exists():
+            await run_cmd(
+                [PYTHON_BIN, str(SCRIPTS_DIR / "4_mp4.py"),
+                 "--slug", slug, "--profile", req.profile, "--offset", str(req.offset)],
+                logs, "STEP4-MP4", check=True
+            )
+        else:
+            raise HTTPException(500, "scripts/4_mp4.py not found for render.")
+
+        # normalize mp4 filename if 4_mp4.py wrote a different exact name
+        latest_mp4 = sorted(OUTPUT_DIR.glob(f"{slug}_{req.profile}*.mp4"), key=lambda p: p.stat().st_mtime)
+        if latest_mp4:
+            mp4_path = latest_mp4[-1]
+
+        # ---- STEP 5: Upload (optional) ----
+        upload_receipt = None
+        if req.upload:
+            if not (SCRIPTS_DIR / "5_upload.py").exists():
+                raise HTTPException(500, "scripts/5_upload.py not found for upload.")
+            cmd = [PYTHON_BIN, str(SCRIPTS_DIR / "5_upload.py"), "--file", str(mp4_path)]
+            if req.title_override:
+                cmd += ["--title", req.title_override]
+            if req.privacy:
+                cmd += ["--privacy", req.privacy]
+            if req.tags_csv:
+                cmd += ["--tags", req.tags_csv]
+            if req.made_for_kids:
+                cmd += ["--made-for-kids"]
+            if req.thumb_from_sec is not None:
+                cmd += ["--thumb-from-sec", str(req.thumb_from_sec)]
+
+            rr = await run_cmd(cmd, logs, "STEP5-UPLOAD", check=False)
+            # Try parsing JSON from stdout (your 5_upload.py prints JSON)
+            try:
+                upload_receipt = json.loads(rr.out) if rr.out.strip() else None
+            except json.JSONDecodeError:
+                upload_receipt = {"stdout": rr.out, "stderr": rr.err, "code": rr.code}
+
+        # ---- Respond ----
+        artist, title = meta_artist_title(slug)
+        full_title = req.title_override or (f"{artist} - {title}" if artist and title else slug)
+
+        log_path = write_pipeline_log(slug, logs)
+
+        return {
+            "ok": True,
+            "slug": slug,
+            "title": full_title,
+            "profile": req.profile,
+            "offset": req.offset,
+            "artifacts": {
+                "mp3": f"/files/{MP3_DIR.joinpath(f'{slug}.mp3').name}" if (MP3_DIR / f"{slug}.mp3").exists() else None,
+                "txt": f"/files/{TXT_DIR.joinpath(f'{slug}.txt').name}" if (TXT_DIR / f"{slug}.txt").exists() else None,
+                "timings_csv": f"/files/{timings_csv.name}",
+                "mp4": f"/files/{mp4_path.name}",
+                "meta": f"/files/{META_DIR.joinpath(f'{slug}.json').name}" if (META_DIR / f"{slug}.json").exists() else None,
+                "pipeline_log": f"/files/{Path(log_path).name}",
+            },
+            "upload": upload_receipt,
+            "logs_tail": logs[-200:],  # handy for the client
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Best-effort log dump
+        slug = slugify(req.input)[:60]
+        log_path = write_pipeline_log(slug, logs + [f"[ERROR] {e!r}"])
+        raise HTTPException(500, f"Pipeline error: {e}. See {Path(log_path).name}")
+
 # end of app.py
