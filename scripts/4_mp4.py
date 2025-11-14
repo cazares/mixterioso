@@ -1,5 +1,6 @@
-#!/usr/bin/env python3
 # scripts/4_mp4.py
+#!/usr/bin/env python3
+# scripts/4_mp4.py  —  MP4 renderer with vocal-window gating (instrumental suppression)
 import argparse
 import csv
 import json
@@ -8,9 +9,6 @@ import sys
 import time
 from pathlib import Path
 import os
-
-# --- NEW: normalized timings loader ---
-from scripts.timings_io import load_timings_any  # returns (line_index, time_secs, text) triplets
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -72,12 +70,14 @@ DEFAULT_UI_FONT_SIZE = 120
 ASS_FONT_MULTIPLIER = 1.5  # UI points -> ASS "Fontsize"
 
 # Global lyrics timing offset in seconds.
-# Negative => lyrics earlier (sooner); Positive => lyrics later.
-# Default from env; can be overridden by --offset argument.
 LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0") or "0")
 
 MUSIC_NOTE_CHARS = "♪♫♬♩♭♯"
 MUSIC_NOTE_KEYWORDS = {"instrumental", "solo", "guitar solo", "piano solo"}
+
+# Gating controls
+MIN_LINE_VISIBLE_SECS = 0.90      # enforce minimum on-screen time per line
+MIN_KEEP_AFTER_CLAMP_SECS = 0.20  # discard tiny slivers after gating
 
 
 def log(prefix: str, msg: str, color: str = RESET) -> None:
@@ -87,7 +87,6 @@ def log(prefix: str, msg: str, color: str = RESET) -> None:
 
 def slugify(text: str) -> str:
     import re
-
     base = text.strip().lower()
     base = re.sub(r"\s+", "_", base)
     base = re.sub(r"[^\w\-]+", "", base)
@@ -146,28 +145,72 @@ def read_meta(slug: str) -> tuple[str, str]:
 def read_timings(slug: str):
     """
     Return list of (time_secs, text, line_index).
-    Normalizes whatever CSV we have to the 3-tuple format expected
-    elsewhere in this script.
+    Preferred CSV format: line_index,time_secs,text
+    Fallback 2-column   : time_secs,text
     """
-    timing_csv = TIMINGS_DIR / f"{slug}.csv"
-    if not timing_csv.exists():
-        print(f"Timing CSV not found for slug={slug}: {timing_csv}")
+    timing_path = TIMINGS_DIR / f"{slug}.csv"
+    if not timing_path.exists():
+        print(f"Timing CSV not found for slug={slug}: {timing_path}")
         sys.exit(1)
 
-    # load_timings_any returns (line_index, time_secs, text)
-    try:
-        triples = load_timings_any(timing_csv)
-    except Exception as e:
-        log("TIMINGS", f"Failed to load timings via timings_io: {e}", YELLOW)
-        triples = []
+    rows = []
+    with timing_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
 
-    # Normalize to (time_secs, text, line_index) for build_ass()
-    rows = [(ts, tx, li) for (li, ts, tx) in triples if isinstance(ts, (int, float))]
+        if header and any(h.strip() == "time_secs" for h in header):
+            # Normalize header indices
+            def find_idx(name: str, default: int | None = None):
+                try:
+                    return header.index(name)
+                except ValueError:
+                    return default
+
+            idx_time = find_idx("time_secs", 1)
+            idx_li   = find_idx("line_index", None)
+            idx_text = find_idx("text", None)
+
+            for row in reader:
+                if not row or len(row) <= idx_time:
+                    continue
+                t_str = row[idx_time].strip()
+                if not t_str:
+                    continue
+                try:
+                    t = float(t_str)
+                except ValueError:
+                    continue
+
+                if idx_li is not None and len(row) > idx_li:
+                    try:
+                        line_index = int(row[idx_li])
+                    except ValueError:
+                        line_index = 0
+                else:
+                    line_index = 0
+
+                text = ""
+                if idx_text is not None and len(row) > idx_text:
+                    text = row[idx_text]
+
+                rows.append((t, text, line_index))
+        else:
+            # Fallback: 2-column time_secs,text
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                t_str = row[0].strip()
+                if not t_str:
+                    continue
+                try:
+                    t = float(t_str)
+                except ValueError:
+                    continue
+                text = row[1]
+                rows.append((t, text, 0))
+
     rows.sort(key=lambda x: x[0])
-    log("TIMINGS", f"Loaded {len(rows)} timing rows from {timing_csv}", CYAN)
-    # Debug first few
-    if rows:
-        log("TIMINGS", f"first 3 rows (t, text, idx): {rows[:3]}", BLUE)
+    log("TIMINGS", f"Loaded {len(rows)} timing rows from {timing_path}", CYAN)
     return rows
 
 
@@ -195,6 +238,46 @@ def offset_tag(val: float) -> str:
     return f"_offset_{s}s"
 
 
+# ---------- Vocal window helpers ----------
+def load_vocal_windows_for(slug: str):
+    p = META_DIR / f"{slug}_vocal_windows.json"
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        ws = data.get("windows") or []
+        out = []
+        for w in ws:
+            if isinstance(w, (list, tuple)) and len(w) == 2:
+                s, e = float(w[0]), float(w[1])
+                if e > s:
+                    out.append((s, e))
+        out.sort()
+        return out
+    except Exception as e:
+        log("GATE", f"Failed reading {p}: {e}", YELLOW)
+        return []
+
+
+def clamp_to_window(start: float, end: float, windows: list[tuple[float, float]]):
+    """
+    If [start,end] isn’t inside a vocal window, try shifting/clamping into the next window.
+    Returns (s, e, ok).
+    """
+    for (ws, we) in windows:
+        # Entirely before this window → keep scanning
+        if end <= ws:
+            continue
+        # Overlaps the window tail or starts before it → clamp into it
+        if start < we and end > ws:
+            s = max(start, ws)
+            e = min(end, we)
+            if e > s:
+                return s, e, True
+    return start, end, False
+# ------------------------------------------
+
+
 def build_ass(
     slug: str,
     profile: str,
@@ -205,6 +288,7 @@ def build_ass(
     font_name: str,
     font_size_script: int,
     offset_applied: float,
+    vocal_windows: list[tuple[float, float]],
 ) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ass_path = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(offset_applied)}.ass"
@@ -279,7 +363,7 @@ def build_ass(
 
     events = []
 
-    # Normalize timings and filter.
+    # Normalize timings and filter empties.
     unified = []
     for t, text, line_index in timings:
         if t < 0 or (audio_duration and t > audio_duration):
@@ -362,6 +446,20 @@ def build_ass(
             end = audio_duration
         if end <= start:
             continue
+
+        # Minimum on-screen time guard
+        if (end - start) < MIN_LINE_VISIBLE_SECS:
+            end = min(audio_duration, start + MIN_LINE_VISIBLE_SECS)
+
+        # Vocal gating — only show within detected vocal windows
+        if vocal_windows:
+            s2, e2, ok = clamp_to_window(start, end, vocal_windows)
+            if not ok:
+                # Entirely instrumental here; skip this line instance
+                continue
+            start, end = s2, e2
+            if (end - start) < MIN_KEEP_AFTER_CLAMP_SECS:
+                continue
 
         text_stripped = raw_text.strip()
         music_only = is_music_only(text_stripped)
@@ -534,7 +632,7 @@ def main(argv=None):
     # Output path reflects profile + offset so multiple variants can co-exist.
     out_mp4 = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(LYRICS_OFFSET_SECS)}.mp4"
 
-    # Skip all work if target exists and not forcing.
+    # Skip if target exists and not forcing.
     if out_mp4.exists() and not args.force:
         log("MP4", f"Exists, skipping render: {out_mp4.name}", YELLOW)
         print()
@@ -556,14 +654,11 @@ def main(argv=None):
         elif choice == "3":
             open_path(OUTPUT_DIR); open_path(out_mp4)
         elif choice == "4":
-            # Lightweight upload entrypoint; defaults handled in 5_upload.py
             artist, title = read_meta(slug)
-            # Default title: "Artist - Title (profile, offset +X.XXXs)"
             default_title = None
             if artist or title:
                 display = f"{artist} - {title}" if artist and title else (title or artist or slug)
                 default_title = f"{display} ({profile}, offset {LYRICS_OFFSET_SECS:+.3f}s)"
-            # Ask for title override
             try:
                 resp = input(f'YouTube title [ENTER for default{" ("+default_title+")" if default_title else ""}]: ').strip()
             except EOFError:
@@ -576,7 +671,6 @@ def main(argv=None):
                 str(out_mp4),
                 "--title",
                 final_title,
-                # privacy default is private; omit flag to keep default
             ]
             log("UPLOAD", " ".join(cmd), BLUE)
             try:
@@ -624,12 +718,21 @@ def main(argv=None):
     if audio_duration <= 0:
         log("DUR", f"Audio duration unknown or zero for {audio_path}", YELLOW)
 
+    # Load optional vocal windows (from scripts/vocal_windows.py)
+    vocal_windows = load_vocal_windows_for(slug)
+    if vocal_windows:
+        log("GATE", f"Loaded {len(vocal_windows)} vocal windows for gating.", CYAN)
+    else:
+        log("GATE", "No vocal windows present; rendering without gating.", YELLOW)
+
     artist, title = read_meta(slug)
-    timings = read_timings(slug)  # normalized to (time_secs, text, line_index)
+    timings = read_timings(slug)
     log("META", f'Artist="{artist}", Title="{title}", entries={len(timings)}', CYAN)
 
     ass_path = build_ass(
-        slug, profile, artist, title, timings, audio_duration, args.font_name, ass_font_size, LYRICS_OFFSET_SECS
+        slug, profile, artist, title, timings, audio_duration,
+        args.font_name, ass_font_size, LYRICS_OFFSET_SECS,
+        vocal_windows,
     )
 
     cmd = [
@@ -676,7 +779,6 @@ def main(argv=None):
         open_path(OUTPUT_DIR)
         open_path(out_mp4)
     elif choice == "4":
-        # Lightweight upload entrypoint; defaults handled in 5_upload.py
         artist, title = read_meta(slug)
         default_title = None
         if artist or title:
@@ -694,7 +796,6 @@ def main(argv=None):
             str(out_mp4),
             "--title",
             final_title,
-            # privacy default is private
         ]
         log("UPLOAD", " ".join(cmd_up), BLUE)
         try:
@@ -707,4 +808,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-# end of 4_mp4.py
+# end of scripts/4_mp4.py
