@@ -1,285 +1,403 @@
 #!/usr/bin/env python3
-# app.py — Mixterioso Step-1 API (YouTube URL/Query → MP3) with Genius→Musixmatch→YouTube + lyrics
-
+# app.py — Mixterioso Step-1 API (unified /search + compat routes)
+# - Download MP3 from YouTube URL/ID or free-form query
+# - Optional lyrics lookup (Genius + Musixmatch)
+# - Writes meta/<slug>.json and txts/<slug>.txt when available
+# - Serves MP3s via /files/{video_id}.mp3  (Range supported by FileResponse)
 from __future__ import annotations
 
-import logging, os, re, shutil
+import os
+import re
+import json
+import logging
+import urllib.parse
 from pathlib import Path
 from typing import Optional, Dict, Any
 
 import requests
-import yt_dlp
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Path as FPath
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
-APP_NAME = "Mixterioso — Step-1 MP3 API"
-MP3_DIR = Path("mp3s"); MP3_DIR.mkdir(parents=True, exist_ok=True)
-META_DIR = Path("meta"); META_DIR.mkdir(parents=True, exist_ok=True)
-TXT_DIR  = Path("txts"); TXT_DIR.mkdir(parents=True, exist_ok=True)
+# ---------- App & CORS ----------
+app = FastAPI(title="Mixterioso — Step-1 MP3 API", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten later as needed
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-log = logging.getLogger("mixterioso")
+# ---------- Config / Paths ----------
+BASE_DIR = Path(__file__).resolve().parent
+MP3_DIR = BASE_DIR / "mp3s"
+TXT_DIR = BASE_DIR / "txts"
+META_DIR = BASE_DIR / "meta"
 
-SAFE_MP3_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}\.mp3$")
+for d in (MP3_DIR, TXT_DIR, META_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
-# ---------- helpers ----------
-def _ffmpeg_location() -> Optional[str]:
-    ff = shutil.which("ffmpeg")
-    return os.path.dirname(ff) if ff else None
+GENIUS_TOKEN = os.getenv("GENIUS_API_TOKEN") or os.getenv("GENIUS_TOKEN")
+MUSIXMATCH_KEY = os.getenv("MUSIXMATCH_API_KEY")
 
-def _looks_like_mp3(p: Path) -> bool:
-    try:
-        with p.open("rb") as f:
-            head = f.read(3)
-        return head.startswith(b"ID3") or head.startswith(b"\xff")
-    except Exception:
-        return False
+# ---------- Logging ----------
+log = logging.getLogger("mixterioso.app")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-def _validate_mp3(path: Path) -> None:
-    if not path.exists():
-        raise HTTPException(status_code=500, detail="MP3 file missing after processing.")
-    if path.stat().st_size < 32_000:
-        raise HTTPException(status_code=500, detail="MP3 too small; ffmpeg likely failed.")
-    if not _looks_like_mp3(path):
-        raise HTTPException(status_code=500, detail="Generated file is not a valid MP3.")
+# ---------- Utils ----------
+_youtube_id_re = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
-def slugify(s: str) -> str:
-    s = re.sub(r"\s+", "_", s.strip().lower())
-    s = re.sub(r"[^\w\-]+", "", s)
+
+def slugify(text: str) -> str:
+    import unicodedata
+
+    s = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^\w\s-]", "", s, flags=re.U)
+    s = re.sub(r"[\s\-]+", "_", s).strip("_").lower()
     return s or "song"
 
-def _download_mp3_from_url(youtube_url: str, bitrate_kbps: int) -> Dict[str, Any]:
-    ff_loc = _ffmpeg_location()
-    if not ff_loc:
-        raise HTTPException(status_code=500, detail="ffmpeg not found on PATH. Install ffmpeg and retry.")
 
-    ydl_opts = {
+def youtube_id_from_url(url: str) -> Optional[str]:
+    try:
+        u = urllib.parse.urlparse(url)
+        if u.netloc.endswith("youtube.com"):
+            vid = urllib.parse.parse_qs(u.query).get("v", [None])[0]
+            if vid and _youtube_id_re.match(vid):
+                return vid
+        if u.netloc.endswith("youtu.be"):
+            vid = u.path.lstrip("/").split("/")[0]
+            if vid and _youtube_id_re.match(vid):
+                return vid
+    except Exception:
+        pass
+    return None
+
+
+def kind_of_input(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return "empty"
+    if s.startswith(("http://", "https://")):
+        return "youtube_url" if youtube_id_from_url(s) else "url_maybe_yt"
+    if _youtube_id_re.match(s):
+        return "youtube_id"
+    return "query"
+
+
+# ---------- yt-dlp helpers ----------
+def _ydl_opts(bitrate_kbps: int) -> Dict[str, Any]:
+    # Convert/encode to MP3 at requested bitrate
+    return {
         "format": "bestaudio/best",
-        "outtmpl": str(MP3_DIR / "%(id)s.%(ext)s"),
-        "noplaylist": True,
         "quiet": True,
-        "no_warnings": True,
+        "noplaylist": True,
+        "outtmpl": str(MP3_DIR / "%(id)s.%(ext)s"),
         "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": str(bitrate_kbps)}
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": str(int(bitrate_kbps)),
+            }
         ],
-        "overwrites": True,
-        "ffmpeg_location": ff_loc,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(str(youtube_url), download=True)
+
+
+def download_mp3_from_url(youtube_url: str, bitrate_kbps: int = 192) -> Dict[str, Any]:
+    """
+    Returns dict: { video_id, title, mp3_path, download_url, webpage_url }
+    """
+    try:
+        import yt_dlp  # local runtime dep
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp not installed: {e}")
+
+    opts = _ydl_opts(bitrate_kbps)
+    info: Dict[str, Any]
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(youtube_url, download=True)
     vid = info.get("id")
-    title = info.get("title") or vid or "audio"
+    title = info.get("title") or vid or "unknown"
     mp3_path = MP3_DIR / f"{vid}.mp3"
     if not mp3_path.exists():
-        matches = list(MP3_DIR.glob(f"{vid}*.mp3"))
-        if matches:
-            mp3_path = matches[0]
-    _validate_mp3(mp3_path)
-    filename = mp3_path.name
-    if not SAFE_MP3_RE.match(filename):
-        try:
-            fixed = MP3_DIR / f"{vid}.mp3"
-            mp3_path.rename(fixed)
-            filename = fixed.name
-            mp3_path = fixed
-        except Exception:
-            pass
+        # Some extractors produce .m4a without ffmpeg; guard with helpful error
+        raise HTTPException(status_code=500, detail="Expected MP3 not found; is ffmpeg installed?")
     return {
         "video_id": vid,
         "title": title,
-        "mp3_path": str(mp3_path.resolve()),
-        "download_url": f"/files/{filename}",
+        "mp3_path": str(mp3_path),
+        "download_url": f"/files/{vid}.mp3",
         "webpage_url": info.get("webpage_url"),
     }
 
-def _genius_search(query: str) -> Optional[Dict[str, Any]]:
-    token = os.getenv("GENIUS_TOKEN")
-    if not token:
+
+def yt_search_best_url(artist: str, title: str, raw_query: str) -> Dict[str, str]:
+    """
+    Use yt-dlp's ytsearch to find a good candidate.
+    """
+    try:
+        import yt_dlp
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"yt-dlp not installed: {e}")
+
+    query = f"{artist} - {title}" if artist and title else raw_query
+    yq = f"ytsearch1:{query}"
+    with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+        res = ydl.extract_info(yq, download=False)
+    entry = (res or {}).get("entries") or []
+    if not entry:
+        raise HTTPException(status_code=404, detail="No YouTube results for query.")
+    e0 = entry[0]
+    return {"url": e0.get("webpage_url") or e0.get("url") or ""}
+
+
+# ---------- Lyrics helpers ----------
+def genius_search(q: str) -> Optional[Dict[str, Any]]:
+    if not GENIUS_TOKEN:
         return None
     try:
         r = requests.get(
             "https://api.genius.com/search",
-            params={"q": query},
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15,
+            params={"q": q},
+            headers={"Authorization": f"Bearer {GENIUS_TOKEN}"},
+            timeout=10,
         )
-        j = r.json()
-        hits = (j.get("response", {}) or {}).get("hits", []) or []
+        r.raise_for_status()
+        hits = r.json().get("response", {}).get("hits", [])
         if not hits:
             return None
-        res = hits[0]["result"]
-        artist = ((res.get("primary_artist") or {}).get("name") or "").strip()
-        title = (res.get("title") or "").strip()
-        song_id = res.get("id")
-        full_title = res.get("full_title") or f"{artist} - {title}"
-        return {"artist": artist, "title": title, "song_id": song_id, "full_title": full_title}
+        song = hits[0]["result"]
+        return {
+            "song_id": song.get("id"),
+            "full_title": song.get("full_title"),
+            "title": song.get("title"),
+            "artist": (song.get("primary_artist") or {}).get("name"),
+        }
     except Exception as e:
         log.warning("Genius lookup failed: %s", e)
         return None
 
-def _musixmatch_track(artist: str, title: str) -> Optional[int]:
-    key = os.getenv("MUSIXMATCH_API_KEY")
-    if not key or not artist or not title:
+
+def musixmatch_track(artist: str, title: str) -> Optional[int]:
+    if not MUSIXMATCH_KEY or not (artist and title):
         return None
     try:
         r = requests.get(
             "https://api.musixmatch.com/ws/1.1/track.search",
-            params={"q_track": title, "q_artist": artist, "s_track_rating": "desc", "page_size": 1, "apikey": key},
-            timeout=15,
+            params={
+                "q_artist": artist,
+                "q_track": title,
+                "s_track_rating": "desc",
+                "page_size": 1,
+                "apikey": MUSIXMATCH_KEY,
+            },
+            timeout=10,
         )
-        j = r.json()
-        lst = ((j.get("message") or {}).get("body") or {}).get("track_list", []) or []
-        if not lst:
+        r.raise_for_status()
+        ls = r.json().get("message", {}).get("body", {}).get("track_list", [])
+        if not ls:
             return None
-        return lst[0]["track"]["track_id"]
+        return ls[0]["track"]["track_id"]
     except Exception as e:
-        log.warning("Musixmatch track.search failed: %s", e)
+        log.warning("Musixmatch track search failed: %s", e)
         return None
 
-def _musixmatch_lyrics(track_id: int) -> Optional[str]:
-    key = os.getenv("MUSIXMATCH_API_KEY")
-    if not key or not track_id:
+
+def musixmatch_lyrics(track_id: int) -> Optional[str]:
+    if not MUSIXMATCH_KEY or not track_id:
         return None
     try:
         r = requests.get(
             "https://api.musixmatch.com/ws/1.1/track.lyrics.get",
-            params={"track_id": track_id, "apikey": key},
-            timeout=15,
+            params={"track_id": track_id, "apikey": MUSIXMATCH_KEY},
+            timeout=10,
         )
-        j = r.json()
-        lyr = ((j.get("message") or {}).get("body") or {}).get("lyrics", {}) or {}
-        text = (lyr.get("lyrics_body") or "").strip()
-        if not text:
+        r.raise_for_status()
+        lyr = (
+            r.json()
+            .get("message", {})
+            .get("body", {})
+            .get("lyrics", {})
+            .get("lyrics_body")
+        )
+        if not lyr:
             return None
-        # Strip Musixmatch boilerplate if present
-        cutoff = "*****"
-        if cutoff in text:
-            text = text.split(cutoff, 1)[0].rstrip()
-        return text
+        # Musixmatch appends a disclaimer; keep it simple for now
+        return lyr.strip()
     except Exception as e:
-        log.warning("Musixmatch track.lyrics.get failed: %s", e)
+        log.warning("Musixmatch lyrics get failed: %s", e)
         return None
 
-def _yt_search_url(artist: str, title: str, fallback_query: str) -> Dict[str, str]:
-    queries = []
-    if artist and title:
-        queries.append(f"ytsearch1:{artist} - {title} audio")
-        queries.append(f"ytsearch1:{artist} {title} audio")
-    queries.append(f"ytsearch1:{fallback_query}")
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-        for q in queries:
-            info = ydl.extract_info(q, download=False)
-            entries = info.get("entries") or []
-            if entries:
-                e = entries[0]
-                return {"id": e.get("id"), "url": e.get("webpage_url")}
-    raise HTTPException(status_code=404, detail="No YouTube result found for query.")
 
-# ---------- API ----------
-app = FastAPI(title=APP_NAME)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
+# ---------- API Schemas ----------
 class MP3Request(BaseModel):
-    youtube_url: HttpUrl
+    youtube_url: str
     bitrate_kbps: Optional[int] = 192
 
-class QueryRequest(BaseModel):
-    query: str
+
+class FlexRequest(BaseModel):
+    input: str
     bitrate_kbps: Optional[int] = 192
 
+
+# ---------- Routes ----------
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP_NAME}
+    return {"ok": True, "mp3_dir": str(MP3_DIR), "txt_dir": str(TXT_DIR), "meta_dir": str(META_DIR)}
+
 
 @app.head("/files/{filename}")
-def head_file(filename: str):
-    if not SAFE_MP3_RE.match(filename):
-        raise HTTPException(status_code=400, detail="Invalid filename.")
-    path = MP3_DIR / filename
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
-    return Response(status_code=200)
+def head_file(filename: str = FPath(..., description="File name under mp3s/")):
+    p = (MP3_DIR / filename).resolve()
+    if MP3_DIR not in p.parents or not p.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    # Fast path: HEAD returns headers only
+    return FileResponse(str(p), media_type="audio/mpeg")
+
 
 @app.get("/files/{filename}")
-def serve_file(filename: str):
-    if not SAFE_MP3_RE.match(filename):
-        raise HTTPException(status_code=400, detail="Invalid filename.")
-    path = MP3_DIR / filename
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
-    return FileResponse(path, media_type="audio/mpeg", filename=filename)
+def serve_file(filename: str = FPath(..., description="File name under mp3s/")):
+    p = (MP3_DIR / filename).resolve()
+    if MP3_DIR not in p.parents or not p.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(str(p), media_type="audio/mpeg")
 
+
+# --- Compatibility: POST /mp3 (URL only) ---
 @app.post("/mp3")
-def create_mp3(body: MP3Request):
-    try:
-        result = _download_mp3_from_url(str(body.youtube_url), int(body.bitrate_kbps or 192))
-        return {
-            "video_id": result["video_id"],
-            "title": result["title"],
-            "bitrate_kbps": body.bitrate_kbps or 192,
-            "mp3_path": result["mp3_path"],
-            "download_url": result["download_url"],
-        }
-    except yt_dlp.utils.DownloadError as e:
-        log.warning("yt-dlp download error: %s", e)
-        raise HTTPException(status_code=400, detail=f"Download failed: {e}")
+def mp3_from_url(body: MP3Request):
+    url = (body.youtube_url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="youtube_url is required")
+    dl = download_mp3_from_url(url, int(body.bitrate_kbps or 192))
+    return {
+        "video_id": dl["video_id"],
+        "title": dl["title"],
+        "bitrate_kbps": int(body.bitrate_kbps or 192),
+        "mp3_path": dl["mp3_path"],
+        "download_url": dl["download_url"],
+        "webpage_url": dl.get("webpage_url"),
+    }
 
+
+# --- Compatibility: POST /mp3_from_query (query only, returns lyrics too) ---
 @app.post("/mp3_from_query")
-def create_mp3_from_query(body: QueryRequest):
-    q = body.query.strip()
+def mp3_from_query(body: Dict[str, Any]):
+    q = (body.get("query") or "").strip()
+    kbps = int(body.get("bitrate_kbps") or 192)
     if not q:
         raise HTTPException(status_code=400, detail="query is required")
-
-    # 1) Genius → metadata
-    meta = _genius_search(q) or {}
+    meta = genius_search(q) or {}
     artist, title = meta.get("artist", ""), meta.get("title", "")
-    full_title = meta.get("full_title") or (f"{artist} - {title}".strip(" -") or q)
+    mm_id = musixmatch_track(artist, title) if (artist and title) else None
+    lyrics_text = musixmatch_lyrics(mm_id) if mm_id else None
+    yt = yt_search_best_url(artist, title, q)
+    dl = download_mp3_from_url(yt["url"], kbps)
 
-    # 2) Musixmatch (track id + lyrics)
-    mm_track_id = _musixmatch_track(artist, title)
-    lyrics_text = _musixmatch_lyrics(mm_track_id) if mm_track_id else None
+    slug_src = f"{artist}_{title}" if artist and title else q
+    slug = slugify(slug_src)
+    META_DIR.joinpath(f"{slug}.json").write_text(
+        json.dumps(
+            {
+                "artist": artist,
+                "title": title,
+                "full_title": meta.get("full_title"),
+                "genius_song_id": meta.get("song_id"),
+                "musixmatch_track_id": mm_id,
+                "youtube_id": dl["video_id"],
+                "youtube_url": dl.get("webpage_url"),
+                "input": q,
+                "lyrics_source": "musixmatch" if lyrics_text else None,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    if lyrics_text:
+        TXT_DIR.joinpath(f"{slug}.txt").write_text(lyrics_text, encoding="utf-8")
 
-    # 3) YouTube → pick best candidate
-    yt = _yt_search_url(artist, title, q)
+    return {
+        "video_id": dl["video_id"],
+        "title": dl["title"],
+        "bitrate_kbps": kbps,
+        "mp3_path": dl["mp3_path"],
+        "download_url": dl["download_url"],
+        "slug": slug,
+        "search_metadata": meta,
+        "lyrics_text": lyrics_text,
+    }
 
-    # 4) Download MP3
-    dl = _download_mp3_from_url(yt["url"], int(body.bitrate_kbps or 192))
 
-    # 5) Persist metadata + lyrics for pipeline
-    slug = slugify(f"{artist}_{title}") if artist and title else slugify(q)
-    meta_path = META_DIR / (slug + ".json")
+# --- Unified: POST /search (URL/ID/query) ---
+@app.post("/search")
+def search_flex(body: FlexRequest):
+    raw = (body.input or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="input is required")
+    kbps = int(body.bitrate_kbps or 192)
+    kind = kind_of_input(raw)
+
+    if kind == "youtube_id":
+        yt_url = f"https://www.youtube.com/watch?v={raw}"
+        dl = download_mp3_from_url(yt_url, kbps)
+        title_guess = dl.get("title") or raw
+        meta = genius_search(title_guess) or {}
+        artist, title = meta.get("artist", ""), meta.get("title", "")
+        mm_id = musixmatch_track(artist, title) if (artist and title) else None
+        lyrics_text = musixmatch_lyrics(mm_id) if mm_id else None
+
+    elif kind in ("youtube_url", "url_maybe_yt"):
+        dl = download_mp3_from_url(raw, kbps)
+        title_guess = dl.get("title") or raw
+        meta = genius_search(title_guess) or {}
+        artist, title = meta.get("artist", ""), meta.get("title", "")
+        mm_id = musixmatch_track(artist, title) if (artist and title) else None
+        lyrics_text = musixmatch_lyrics(mm_id) if mm_id else None
+
+    else:  # query
+        meta = genius_search(raw) or {}
+        artist, title = meta.get("artist", ""), meta.get("title", "")
+        full_title = meta.get("full_title") or (f"{artist} - {title}".strip(" -") or raw)
+        mm_id = musixmatch_track(artist, title) if (artist and title) else None
+        lyrics_text = musixmatch_lyrics(mm_id) if mm_id else None
+        yt = yt_search_best_url(artist, title, raw)
+        dl = download_mp3_from_url(yt["url"], kbps)
+        dl["webpage_url"] = yt.get("url") or dl.get("webpage_url")
+        meta.setdefault("full_title", full_title)
+
+    # persist artifacts for downstream steps
+    slug_src = f"{artist}_{title}" if (locals().get("artist") and locals().get("title")) else raw
+    slug = slugify(slug_src)
     meta_payload = {
-        "artist": artist or None,
-        "title": title or None,
-        "full_title": full_title,
-        "genius_song_id": meta.get("song_id"),
-        "musixmatch_track_id": mm_track_id,
-        "youtube_id": dl["video_id"],
-        "youtube_url": yt.get("url") or dl.get("webpage_url"),
-        "query": q,
-        "lyrics_source": "musixmatch" if lyrics_text else None,
+        "artist": locals().get("artist"),
+        "title": locals().get("title"),
+        "full_title": locals().get("meta", {}).get("full_title"),
+        "genius_song_id": locals().get("meta", {}).get("song_id"),
+        "musixmatch_track_id": locals().get("mm_id"),
+        "youtube_id": dl.get("video_id"),
+        "youtube_url": dl.get("webpage_url"),
+        "input": raw,
+        "lyrics_source": "musixmatch" if locals().get("lyrics_text") else None,
     }
     try:
-        meta_path.write_text(__import__("json").dumps(meta_payload, indent=2), encoding="utf-8")
+        META_DIR.joinpath(f"{slug}.json").write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
     except Exception as e:
         log.warning("Failed to write meta JSON: %s", e)
-
-    if lyrics_text:
+    if locals().get("lyrics_text"):
         try:
-            (TXT_DIR / f"{slug}.txt").write_text(lyrics_text, encoding="utf-8")
+            TXT_DIR.joinpath(f"{slug}.txt").write_text(locals()["lyrics_text"], encoding="utf-8")
         except Exception as e:
             log.warning("Failed to write lyrics TXT: %s", e)
 
     return {
         "video_id": dl["video_id"],
         "title": dl["title"],
-        "bitrate_kbps": body.bitrate_kbps or 192,
+        "bitrate_kbps": kbps,
         "mp3_path": dl["mp3_path"],
         "download_url": dl["download_url"],
         "slug": slug,
         "search_metadata": meta_payload,
-        "lyrics_text": lyrics_text,  # <= included for the app
+        "lyrics_text": locals().get("lyrics_text"),
     }
 # end of app.py
