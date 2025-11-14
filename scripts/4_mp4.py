@@ -9,6 +9,9 @@ import time
 from pathlib import Path
 import os
 
+# --- NEW: normalized timings loader ---
+from scripts.timings_io import load_timings_any  # returns (line_index, time_secs, text) triplets
+
 RESET = "\033[0m"
 BOLD = "\033[1m"
 CYAN = "\033[36m"
@@ -143,70 +146,28 @@ def read_meta(slug: str) -> tuple[str, str]:
 def read_timings(slug: str):
     """
     Return list of (time_secs, text, line_index).
-    Preferred CSV format: line_index,time_secs,text
-    Fallback 2-column   : time_secs,text
+    Normalizes whatever CSV we have to the 3-tuple format expected
+    elsewhere in this script.
     """
-    timing_path = TIMINGS_DIR / f"{slug}.csv"
-    if not timing_path.exists():
-        print(f"Timing CSV not found for slug={slug}: {timing_path}")
+    timing_csv = TIMINGS_DIR / f"{slug}.csv"
+    if not timing_csv.exists():
+        print(f"Timing CSV not found for slug={slug}: {timing_csv}")
         sys.exit(1)
 
-    rows = []
-    with timing_path.open(newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
+    # load_timings_any returns (line_index, time_secs, text)
+    try:
+        triples = load_timings_any(timing_csv)
+    except Exception as e:
+        log("TIMINGS", f"Failed to load timings via timings_io: {e}", YELLOW)
+        triples = []
 
-        if header and "time_secs" in header:
-            try:
-                idx_time = header.index("time_secs")
-            except ValueError:
-                idx_time = 1
-            try:
-                idx_li = header.index("line_index")
-            except ValueError:
-                idx_li = None
-            idx_text = header.index("text") if "text" in header else None
-
-            for row in reader:
-                if not row or len(row) <= idx_time:
-                    continue
-                t_str = row[idx_time].strip()
-                if not t_str:
-                    continue
-                try:
-                    t = float(t_str)
-                except ValueError:
-                    continue
-
-                if idx_li is not None and len(row) > idx_li:
-                    try:
-                        line_index = int(row[idx_li])
-                    except ValueError:
-                        line_index = 0
-                else:
-                    line_index = 0
-
-                text = ""
-                if idx_text is not None and len(row) > idx_text:
-                    text = row[idx_text]
-
-                rows.append((t, text, line_index))
-        else:
-            for row in reader:
-                if len(row) < 2:
-                    continue
-                t_str = row[0].strip()
-                if not t_str:
-                    continue
-                try:
-                    t = float(t_str)
-                except ValueError:
-                    continue
-                text = row[1]
-                rows.append((t, text, 0))
-
+    # Normalize to (time_secs, text, line_index) for build_ass()
+    rows = [(ts, tx, li) for (li, ts, tx) in triples if isinstance(ts, (int, float))]
     rows.sort(key=lambda x: x[0])
-    log("TIMINGS", f"Loaded {len(rows)} timing rows from {timing_path}", CYAN)
+    log("TIMINGS", f"Loaded {len(rows)} timing rows from {timing_csv}", CYAN)
+    # Debug first few
+    if rows:
+        log("TIMINGS", f"first 3 rows (t, text, idx): {rows[:3]}", BLUE)
     return rows
 
 
@@ -664,7 +625,7 @@ def main(argv=None):
         log("DUR", f"Audio duration unknown or zero for {audio_path}", YELLOW)
 
     artist, title = read_meta(slug)
-    timings = read_timings(slug)
+    timings = read_timings(slug)  # normalized to (time_secs, text, line_index)
     log("META", f'Artist="{artist}", Title="{title}", entries={len(timings)}', CYAN)
 
     ass_path = build_ass(
