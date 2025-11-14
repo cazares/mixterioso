@@ -39,3 +39,4 @@ mix_done/
 covers/
 !requirements.txt
 !devcontainer.json
+*.webm
