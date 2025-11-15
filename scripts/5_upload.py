@@ -5,9 +5,9 @@
 #
 # - Requires OAuth client secrets (NOT just an API key).
 # - Looks for client secrets at:
-#       $YOUTUBE_CLIENT_SECRETS_JSON   (if set)
+#       $YOUTUBE_CLIENT_SECRETS_JSON   (if set; can be file OR directory)
 #       ./client_secret.json           (fallback)
-# - Stores OAuth tokens in youtube_token.json next to client_secret.json
+# - Stores OAuth tokens in youtube_token.json next to the client secrets file.
 #
 # CLI:
 #   --file          MP4 path (required)
@@ -67,8 +67,8 @@ except ImportError as e:
                 "error": "MissingDependencies",
                 "message": (
                     "Missing YouTube upload dependencies. "
-                    "Install: google-api-python-client google-auth-oauthlib google-auth-httplib2 "
-                    "inside demucs_env."
+                    "Install: google-api-python-client google-auth-oauthlib "
+                    "google-auth-httplib2 inside demucs_env."
                 ),
                 "detail": str(e),
             }
@@ -84,11 +84,21 @@ def get_creds() -> Credentials:
     """
     Load or create OAuth credentials.
 
-    Looks for env YOUTUBE_CLIENT_SECRETS_JSON first, then ./client_secret.json.
-    Stores tokens in youtube_token.json next to the client secrets file.
+    Resolution order:
+      1) If YOUTUBE_CLIENT_SECRETS_JSON is set:
+         - If it points to a *directory*, use <dir>/client_secret.json
+         - If it points to a *file*, use that file
+      2) Else, default to ./client_secret.json
     """
-    client_secrets = os.getenv("YOUTUBE_CLIENT_SECRETS_JSON", "client_secret.json")
-    secrets_path = Path(client_secrets).resolve()
+    env_val = os.getenv("YOUTUBE_CLIENT_SECRETS_JSON")
+    if env_val:
+        base_path = Path(env_val).expanduser().resolve()
+        if base_path.is_dir():
+            secrets_path = base_path / "client_secret.json"
+        else:
+            secrets_path = base_path
+    else:
+        secrets_path = (BASE_DIR / "client_secret.json").resolve()
 
     if not secrets_path.exists():
         print(
@@ -99,9 +109,11 @@ def get_creds() -> Credentials:
                     "message": (
                         "Missing OAuth client secrets JSON. "
                         "Set env YOUTUBE_CLIENT_SECRETS_JSON to your Google OAuth client file "
+                        "or to a directory containing client_secret.json, "
                         "or place client_secret.json in the project root. "
                         "API keys (YOUTUBE_API_KEY) are NOT sufficient for uploads."
                     ),
+                    "expected_path": str(secrets_path),
                 }
             )
         )
@@ -120,7 +132,32 @@ def get_creds() -> Credentials:
         else:
             log("auth", f"Launching OAuth flow using {secrets_path.name}...", CYAN)
             flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
-            creds = flow.run_console()
+
+            # Prefer local server flow (opens browser, copies code automatically)
+            # Handle older versions that may not accept all kwargs.
+            try:
+                creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+            except TypeError:
+                # Older versions might not support prompt/access_type kwargs
+                try:
+                    creds = flow.run_local_server(port=0)
+                except AttributeError as e:
+                    # Extremely old version — tell user to upgrade.
+                    print(
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": "OAuthFlowUnsupported",
+                                "message": (
+                                    "Your google-auth-oauthlib version does not support "
+                                    "run_local_server(). Please upgrade it inside demucs_env:\n"
+                                    "  pip3 install --upgrade google-auth-oauthlib"
+                                ),
+                                "detail": str(e),
+                            }
+                        )
+                    )
+                    sys.exit(1)
 
         token_path.write_text(creds.to_json(), encoding="utf-8")
         log("auth", f"Stored credentials in {token_path}", GREEN)
@@ -336,7 +373,7 @@ def main():
         sys.exit(1)
 
     # Thumbnail (optional)
-    if not args.no-thumbnail:
+    if not args.no_thumbnail:
         thumb_png = mp4.with_suffix(".mp4.thumb.png")
         try:
             extract_thumbnail_frame(mp4, thumb_png, args.thumb_from_sec)
