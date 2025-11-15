@@ -1,469 +1,749 @@
 #!/usr/bin/env python3
+# scripts/4_mp4.py
+# Generate a karaoke MP4 from an MP3/WAV + timings CSV.
+# CSV is expected as (line_index, time_secs, text). We reorder to (time_secs, text, line_index) internally.
+
 import argparse
 import csv
 import json
-import os
 import subprocess
 import sys
-import tempfile
-from dataclasses import dataclass
+import time
 from pathlib import Path
-from typing import List, Optional
+import os
+import random  # NEW: for random music-note groupings
+
+# --- Make sure `scripts/` is importable whether we run as `python3 scripts/4_mp4.py` or via a module ---
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# Pull in our unified CSV loader: returns list of (line_index, time_secs, text)
+from scripts.timings_io import load_timings_any  # type: ignore
 
 RESET = "\033[0m"
+BOLD = "\033[1m"
 CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
+BLUE = "\033[34m"
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-TIMINGS_DIR = BASE_DIR / "timings"
-META_DIR = BASE_DIR / "meta"
+BASE_DIR = REPO_ROOT
+TXT_DIR = BASE_DIR / "txts"
 MP3_DIR = BASE_DIR / "mp3s"
 MIXES_DIR = BASE_DIR / "mixes"
+TIMINGS_DIR = BASE_DIR / "timings"
 OUTPUT_DIR = BASE_DIR / "output"
+META_DIR = BASE_DIR / "meta"
 
-WIDTH = 1920
-HEIGHT = 1080
-FPS = 30
+VIDEO_WIDTH = 1920
+VIDEO_HEIGHT = 1080
 
-LYRIC_MIN_DURATION = 1.0  # seconds
-LYRIC_FUDGE_BEFORE_NEXT = 0.25  # seconds
-NOTE_GAP_THRESHOLD = 6.0  # seconds: if gap >= this, insert a note
-NOTE_INSET = 1.0  # seconds: start note 1s after prev_end, end 1s before next_start
+# =============================================================================
+# LAYOUT CONSTANTS
+# =============================================================================
+BOTTOM_BOX_HEIGHT_FRACTION = 0.20  # 20% of screen height
+TOP_BAND_FRACTION = 1.0 - BOTTOM_BOX_HEIGHT_FRACTION
+NEXT_LYRIC_TOP_MARGIN_PX = 50
+NEXT_LYRIC_BOTTOM_MARGIN_PX = 50
+DIVIDER_LINE_OFFSET_UP_PX = 0
+DIVIDER_HEIGHT_PX = 0.25
+DIVIDER_LEFT_MARGIN_PX = VIDEO_WIDTH * 0.035
+DIVIDER_RIGHT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX
+VERTICAL_OFFSET_FRACTION = 0.0
+TITLE_EXTRA_OFFSET_FRACTION = -0.20
+NEXT_LINE_FONT_SCALE = 0.35
+NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.45
+NEXT_LABEL_TOP_MARGIN_PX = 10
+NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX + NEXT_LABEL_TOP_MARGIN_PX
+FADE_IN_MS = 50
+FADE_OUT_MS = 50
 
-DEFAULT_FONT_NAME = "Arial"
-DEFAULT_FONT_SIZE = 120
+# =============================================================================
+# COLOR AND OPACITY CONSTANTS
+# =============================================================================
+GLOBAL_NEXT_COLOR_RGB = "FFFFFF"
+GLOBAL_NEXT_ALPHA_HEX = "4D"
+DIVIDER_COLOR_RGB = "FFFFFF"
+DIVIDER_ALPHA_HEX = "80"
+TOP_LYRIC_TEXT_COLOR_RGB = "FFFFFF"
+TOP_LYRIC_TEXT_ALPHA_HEX = "00"
+BOTTOM_BOX_BG_COLOR_RGB = "000000"
+BOTTOM_BOX_BG_ALPHA_HEX = "00"
+TOP_BOX_BG_COLOR_RGB = "000000"
+TOP_BOX_BG_ALPHA_HEX = "00"
+NEXT_LABEL_COLOR_RGB = "FFFFFF"
+NEXT_LABEL_ALPHA_HEX = GLOBAL_NEXT_ALPHA_HEX
+
+# Font sizing
+DEFAULT_UI_FONT_SIZE = 120
+ASS_FONT_MULTIPLIER = 1.5  # UI points -> ASS "Fontsize"
+
+# Global lyrics timing offset in seconds.
+# Negative => lyrics earlier (sooner); Positive => lyrics later.
+# Default from env; can be overridden by --offset argument.
+LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0") or "0")
+
+MUSIC_NOTE_CHARS = "♪♫♬♩♭♯"
+MUSIC_NOTE_KEYWORDS = {"instrumental", "solo", "guitar solo", "piano solo"}
+
+# NEW: Threshold + helper for random note groups between lyrics
+NOTE_GAP_THRESHOLD_SECS = 6.0  # min gap between timing rows to add notes
+NOTE_INSET_SEC = 1.0          # start note 1s after current line start, end 1s before next line start
 
 
-def log(section: str, msg: str, color: str = CYAN) -> None:
-    print(f"{color}[{section}]{RESET} {msg}")
+def log(prefix: str, msg: str, color: str = RESET) -> None:
+    ts = time.strftime("%H:%M:%S")
+    print(f"{color}[{ts}] [{prefix}] {msg}{RESET}")
 
 
-@dataclass
-class Event:
-    start: float
-    end: float
-    text: str
-    kind: str = "lyric"  # "lyric" or "note"
+def slugify(text: str) -> str:
+    import re
+    base = text.strip().lower()
+    base = re.sub(r"\s+", "_", base)
+    base = re.sub(r"[^\w\-]+", "", base)
+    return base or "song"
+
+
+def seconds_to_ass_time(sec: float) -> str:
+    # ASS format: H:MM:SS.cs
+    if sec < 0:
+        sec = 0.0
+    total_cs = int(round(sec * 100))
+    total_seconds, cs = divmod(total_cs, 100)
+    h, rem = divmod(total_seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def rgb_to_bgr(rrggbb: str) -> str:
+    s = (rrggbb or "").strip().lstrip("#")
+    s = s.zfill(6)[-6:]
+    rr = s[0:2]; gg = s[2:4]; bb = s[4:6]
+    return f"{bb}{gg}{rr}"
+
+
+def is_music_only(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if any(ch in MUSIC_NOTE_CHARS for ch in stripped):
+        return True
+    if not any(ch.isalnum() for ch in stripped):
+        return True
+    lower = stripped.lower()
+    for kw in MUSIC_NOTE_KEYWORDS:
+        if kw in lower:
+            return True
+    return False
+
+
+def random_note_group() -> str:
+    """
+    Build a randomized note cluster:
+      - length: 1–4 characters
+      - chars: from MUSIC_NOTE_CHARS
+    """
+    length = random.randint(1, 4)
+    return "".join(random.choice(MUSIC_NOTE_CHARS) for _ in range(length))
+
+
+def read_meta(slug: str) -> tuple[str, str]:
+    meta_path = META_DIR / f"{slug}.json"
+    artist = ""
+    title = slug
+    if meta_path.exists():
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            artist = data.get("artist") or ""
+            title = data.get("title") or title
+        except Exception as e:
+            log("META", f"Failed to read meta {meta_path}: {e}", YELLOW)
+    return artist, title
+
+
+def read_timings(slug: str):
+    """
+    Load timings via scripts/timings_io.load_timings_any which returns
+    triplets as (line_index, time_secs, text).
+
+    We convert to the internal order expected by the renderer:
+        (time_secs, text, line_index)
+    """
+    csv_path = TIMINGS_DIR / f"{slug}.csv"
+    if not csv_path.exists():
+        print(f"Timing CSV not found for slug={slug}: {csv_path}")
+        sys.exit(1)
+
+    triples = load_timings_any(csv_path)  # (li, ts, text)
+    rows = [(ts, text, li) for (li, ts, text) in triples]
+    rows.sort(key=lambda x: x[0])
+    log("TIMINGS", f"Loaded {len(rows)} timing rows from {csv_path}", CYAN)
+    return rows
+
+
+def probe_audio_duration(path: Path) -> float:
+    if not path.exists():
+        return 0.0
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    log("FFPROBE", f"Probing duration of {path}", BLUE)
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        return float(out.strip())
+    except Exception as e:
+        log("FFPROBE", f"Failed to probe duration: {e}", YELLOW)
+        return 0.0
+
+
+def offset_tag(val: float) -> str:
+    s = f"{val:+.3f}".replace("-", "m").replace("+", "p").replace(".", "p")
+    return f"_offset_{s}s"
+
+
+def build_ass(
+    slug: str,
+    profile: str,
+    artist: str,
+    title: str,
+    timings,
+    audio_duration: float,
+    font_name: str,
+    font_size_script: int,
+    offset_applied: float,
+) -> Path:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ass_path = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(offset_applied)}.ass"
+
+    if audio_duration <= 0.0 and timings:
+        audio_duration = max(t for t, _, _ in timings) + 5.0
+    if audio_duration <= 0.0:
+        audio_duration = 5.0
+
+    playresx = VIDEO_WIDTH
+    playresy = VIDEO_HEIGHT
+
+    # Geometry for top/bottom regions.
+    top_band_height = int(playresy * TOP_BAND_FRACTION)
+    y_divider_nominal = top_band_height
+    bottom_band_height = playresy - y_divider_nominal
+
+    center_top = top_band_height // 2
+    offset_px = int(top_band_height * VERTICAL_OFFSET_FRACTION)
+    y_main_top = center_top + offset_px
+    y_title = y_main_top + int(top_band_height * TITLE_EXTRA_OFFSET_FRACTION)
+
+    x_center = playresx // 2
+    y_center_full = playresy // 2
+
+    line_y = max(0, y_divider_nominal - DIVIDER_LINE_OFFSET_UP_PX)
+
+    inner_bottom_box_height = max(1, bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX)
+    y_next = y_divider_nominal + NEXT_LYRIC_TOP_MARGIN_PX + inner_bottom_box_height // 2
+
+    preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
+    next_label_font = max(1, int(font_size_script * NEXT_LABEL_FONT_SCALE))
+    margin_v = 0
+
+    # ASS color strings for top band.
+    top_primary_ass = f"&H{TOP_LYRIC_TEXT_ALPHA_HEX}{rgb_to_bgr(TOP_LYRIC_TEXT_COLOR_RGB)}"
+    top_back_ass = f"&H{TOP_BOX_BG_ALPHA_HEX}{rgb_to_bgr(TOP_BOX_BG_COLOR_RGB)}"
+    secondary_ass = "&H000000FF"
+    outline_ass = "&H00000000"
+    back_ass = top_back_ass
+
+    header_lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "Collisions: Normal",
+        f"PlayResX: {playresx}",
+        f"PlayResY: {playresy}",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        (
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+            "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding"
+        ),
+        (
+            f"Style: Default,{font_name},{font_size_script},"
+            f"{top_primary_ass},{secondary_ass},{outline_ass},{back_ass},"
+            "0,0,0,0,100,100,0,0,1,4,0,5,50,50,"
+            f"{margin_v},0"
+        ),
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    def ass_escape(text: str) -> str:
+        text = text.replace("{", "(").replace("}", ")")
+        text = text.replace("\\N", "\\N").replace("\n", r"\N")
+        return text
+
+    events = []
+
+    # Normalize timings and filter.
+    unified = []
+    for t, text, line_index in timings:
+        if t < 0 or (audio_duration and t > audio_duration):
+            continue
+        text = (text or "").strip()
+        if not text:
+            continue
+        unified.append((t, text, line_index))
+
+    unified.sort(key=lambda x: x[0])
+
+    offset = offset_applied
+
+    # If no timings, show center title card for entire duration.
+    if not unified:
+        title_lines = [line for line in (title, f"by {artist}" if artist else "") if line]
+        if not title_lines:
+            title_lines = ["No lyrics"]
+        intro_block = "\\N".join(title_lines)
+        events.append(
+            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(0.0),
+                end=seconds_to_ass_time(audio_duration),
+                text=f"{{\\an5\\pos({x_center},{y_center_full})}}{ass_escape(intro_block)}",
+            )
+        )
+        ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
+        log("ASS", f"Wrote ASS subtitles (title only) to {ass_path}", GREEN)
+        return ass_path
+
+    first_lyric_time = max(0.0, unified[0][0] + offset)
+
+    # Intro title / artist card.
+    title_lines = []
+    if title:
+        title_lines.append(title)
+    if artist:
+        title_lines.append(f"by {artist}")
+    if title_lines:
+        title_end = min(first_lyric_time, 5.0) if first_lyric_time > 0.1 else first_lyric_time
+        intro_block = "\\N".join(title_lines)
+        events.append(
+            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(0.0),
+                end=seconds_to_ass_time(title_end),
+                text=f"{{\\an5\\pos({x_center},{y_title})}}{ass_escape(intro_block)}",
+            )
+        )
+
+    fade_tag_main = ""
+    if FADE_IN_MS > 0 or FADE_OUT_MS > 0:
+        fade_tag_main = f"\\fad({int(FADE_IN_MS)},{int(FADE_OUT_MS)})"
+
+    n = len(unified)
+    next_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
+    divider_color_bgr = rgb_to_bgr(DIVIDER_COLOR_RGB)
+    next_label_color_bgr = rgb_to_bgr(NEXT_LABEL_COLOR_RGB)
+
+    divider_height = max(0.5, float(DIVIDER_HEIGHT_PX))
+    left_margin = float(DIVIDER_LEFT_MARGIN_PX)
+    right_margin = float(DIVIDER_RIGHT_MARGIN_PX)
+    x_left = left_margin
+    x_right = playresx - right_margin
+    if x_right <= x_left:
+        x_left = 0.0
+        x_right = float(playresx)
+
+    label_x = NEXT_LABEL_LEFT_MARGIN_PX
+    label_y = y_divider_nominal + NEXT_LABEL_TOP_MARGIN_PX
+
+    # Per-line events.
+    for i, (t, raw_text, _line_index) in enumerate(unified):
+        start = max(0.0, t + offset)
+        if i < n - 1:
+            end = max(start, unified[i + 1][0] + offset)
+        else:
+            end = audio_duration or (start + 5.0)
+
+        if end > audio_duration:
+            end = audio_duration
+        if end <= start:
+            continue
+
+        text_stripped = raw_text.strip()
+        music_only = is_music_only(text_stripped)
+
+        # Main lyric line (with fade).
+        main_text = ass_escape(text_stripped)
+        y_for_line = (VIDEO_HEIGHT // 2) if music_only else y_main_top
+        main_tag = f"{{\\an5\\pos({playresx // 2},{y_for_line}){fade_tag_main}}}"
+        events.append(
+            "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(start),
+                end=seconds_to_ass_time(end),
+                text=main_tag + main_text,
+            )
+        )
+
+        # Do not show next UI on last line, or when music-only lines are involved.
+        if i >= n - 1:
+            continue
+        next_raw = unified[i + 1][1]
+        if not next_raw:
+            continue
+        if music_only or is_music_only(next_raw):
+            # If either side is music-only, we also skip the random-gap note, since
+            # the line itself is already acting as a musical indicator.
+            continue
+
+        # Divider line (no fade).
+        divider_tag = (
+            f"{{\\an7\\pos(0,{line_y})"
+            f"\\1c&H{divider_color_bgr}&"
+            f"\\1a&H{DIVIDER_ALPHA_HEX}&"
+            f"\\bord0\\shad0\\p1}}"
+        )
+        divider_shape = (
+            f"m {x_left} 0 l {x_right} 0 "
+            f"l {x_right} {divider_height} l {x_left} {divider_height}{{\\p0}}"
+        )
+        events.append(
+            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(start),
+                end=seconds_to_ass_time(end),
+                text=divider_tag + divider_shape,
+            )
+        )
+
+        # "Next:" label (no fade).
+        label_tag = (
+            f"{{\\an7\\pos({label_x},{label_y})"
+            f"\\fs{next_label_font}"
+            f"\\1c&H{next_label_color_bgr}&"
+            f"\\1a&H{NEXT_LABEL_ALPHA_HEX}&}}"
+        )
+        events.append(
+            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(start),
+                end=seconds_to_ass_time(end),
+                text=label_tag + "Next:",
+            )
+        )
+
+        # Next-lyric preview text (with fade).
+        preview_text = ass_escape(next_raw)
+        preview_tag = (
+            f"{{\\an5\\pos({playresx // 2},{y_next})"
+            f"\\fs{preview_font}"
+            f"\\1c&H{next_color_bgr}&"
+            f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
+            f"{fade_tag_main}}}"
+        )
+        events.append(
+            "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
+                start=seconds_to_ass_time(start),
+                end=seconds_to_ass_time(end),
+                text=preview_tag + preview_text,
+            )
+        )
+
+        # NEW: Random music-note overlay in long gaps between *lyric* lines.
+        # Use the original (un-offset) times to measure the gap.
+        gap = unified[i + 1][0] - t
+        if gap >= NOTE_GAP_THRESHOLD_SECS:
+            note_start = start + NOTE_INSET_SEC
+            note_end = (unified[i + 1][0] + offset) - NOTE_INSET_SEC
+            if note_end > audio_duration:
+                note_end = audio_duration
+            # Make sure there is still a meaningful window
+            if note_end > note_start + 0.25:
+                note_text = ass_escape(random_note_group())
+                note_tag = (
+                    f"{{\\an5\\pos({playresx // 2},{y_center_full})"
+                    f"\\fs{preview_font}{fade_tag_main}}}"
+                )
+                events.append(
+                    "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
+                        start=seconds_to_ass_time(note_start),
+                        end=seconds_to_ass_time(note_end),
+                        text=note_tag + note_text,
+                    )
+                )
+
+    ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
+    log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
+    return ass_path
+
+
+def choose_audio(slug: str, profile: str) -> Path:
+    mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
+    mix_mp3 = MIXES_DIR / f"{slug}_{profile}.mp3"
+    mp3_path = MP3_DIR / f"{slug}.mp3"
+
+    if profile == "lyrics":
+        audio_path = mp3_path
+        if not audio_path.exists():
+            print(f"Audio mp3 not found for slug={slug}: {audio_path}")
+            sys.exit(1)
+        print(f"[AUDIO] Using original mp3 for profile=lyrics: {audio_path}")
+        return audio_path
+
+    if mix_wav.exists():
+        print(f"[AUDIO] Using mixed WAV for profile={profile}: {mix_wav}")
+        return mix_wav
+
+    if mix_mp3.exists():
+        print(f"[AUDIO] Using mixed MP3 for profile={profile}: {mix_mp3}")
+        return mix_mp3
+
+    if mp3_path.exists():
+        print(
+            f"[AUDIO] Mixed WAV/MP3 for profile={profile} not found.\n"
+            f"        Falling back to original mp3: {mp3_path}"
+        )
+        return mp3_path
+
+    print(
+        f"Audio not found for slug={slug}, profile={profile}.\n"
+        f"Tried:\n"
+        f"  mix wav: {mix_wav}\n"
+        f"  mix mp3: {mix_mp3}\n"
+        f"  mp3: {mp3_path}"
+    )
+    sys.exit(1)
+
+
+def open_path(path: Path) -> None:
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(path)])
+        elif sys.platform.startswith("win"):
+            subprocess.run(["start", str(path)], shell=True)
+        else:
+            subprocess.run(["xdg-open", str(path)])
+    except Exception as e:
+        log("OPEN", f"Failed to open {path}: {e}", YELLOW)
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Render karaoke MP4 with ASS overlay.")
-    p.add_argument("--slug", required=True, help="Song slug, e.g. 'ascension'")
-    p.add_argument("--profile", default="karaoke", help="Mix profile, e.g. 'karaoke'")
+    p = argparse.ArgumentParser(description="Generate karaoke MP4 from slug/profile.")
+    p.add_argument("--slug", required=True, help="Song slug, e.g. californication")
+    p.add_argument(
+        "--profile",
+        required=True,
+        choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
+        help="Mix profile name (matches WAV/MP3 name in mixes/).",
+    )
+    p.add_argument("--font-size", type=int, help="Subtitle font size (20–200). Default 120.")
+    p.add_argument("--font-name", type=str, default="Helvetica", help="Subtitle font name. Default Helvetica.")
     p.add_argument(
         "--offset",
         type=float,
-        default=0.0,
-        help="Global lyrics offset in seconds (neg=sooner, pos=later)",
-    )
-    p.add_argument(
-        "--font-size",
-        type=int,
-        default=DEFAULT_FONT_SIZE,
-        help="Base font size for lyrics",
-    )
-    p.add_argument(
-        "--font-name",
-        default=DEFAULT_FONT_NAME,
-        help="Font name for lyrics (must be installed on system)",
+        default=None,
+        help="Global lyrics/text offset in seconds. Negative=sooner, Positive=later. Overrides KARAOKE_OFFSET_SECS.",
     )
     p.add_argument(
         "--force",
         action="store_true",
-        help="Force re-render even if MP4 already exists",
-    )
-    p.add_argument(
-        "--no-post-ui",
-        action="store_true",
-        help="Skip interactive post-render UI (for 0_master)",
+        help="Re-render even if the exact output MP4 already exists.",
     )
     return p.parse_args(argv)
 
 
-def format_offset_tag(offset: float) -> str:
-    sign = "p" if offset >= 0 else "m"
-    value = abs(offset)
-    return f"{sign}{value:0.3f}s".replace(".", "p")
+def main(argv=None):
+    global LYRICS_OFFSET_SECS
 
+    args = parse_args(argv or sys.argv[1:])
+    slug = slugify(args.slug)
+    profile = args.profile
 
-def resolve_offset(cli_offset: float) -> float:
-    env_val = os.getenv("KARAOKE_OFFSET_SECS")
-    if env_val:
+    # Resolve effective offset: CLI flag wins; fallback to env.
+    if args.offset is not None:
+        LYRICS_OFFSET_SECS = float(args.offset)
+
+    log("OFFSET", f"Applying global lyrics offset {LYRICS_OFFSET_SECS:+.3f}s (neg=sooner, pos=later)", CYAN)
+
+    # Output path reflects profile + offset so multiple variants can co-exist.
+    out_mp4 = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(LYRICS_OFFSET_SECS)}.mp4"
+
+    # Skip all work if target exists and not forcing.
+    if out_mp4.exists() and not args.force:
+        log("MP4", f"Exists, skipping render: {out_mp4.name}", YELLOW)
+        print()
+        print(f"{BOLD}{BLUE}MP4 already present:{RESET} {out_mp4}")
+        print("What would you like to open?")
+        print("  1 = output directory")
+        print("  2 = MP4 file")
+        print("  3 = both (dir then MP4)")
+        print("  4 = upload to YouTube (private)")
+        print("  0 = none")
         try:
-            env_off = float(env_val)
-            # If CLI explicitly passes non-zero, honor CLI; else env
-            if abs(cli_offset) < 1e-6:
-                cli_offset = env_off
-        except ValueError:
-            log("OFFSET", f"Invalid KARAOKE_OFFSET_SECS={env_val!r}, ignoring.", YELLOW)
-    log(
-        "OFFSET",
-        f"Applying global lyrics offset {cli_offset:+.3f}s (neg=sooner, pos=later)",
-        CYAN,
-    )
-    return cli_offset
-
-
-def find_audio(slug: str, profile: str) -> Path:
-    # Prefer rendered mix
-    candidates = [
-        MIXES_DIR / f"{slug}_{profile}.wav",
-        MIXES_DIR / f"{slug}_{profile}.mp3",
-        MP3_DIR / f"{slug}.mp3",
-    ]
-    for c in candidates:
-        if c.exists():
-            log("AUDIO", f"Using audio: {c}", GREEN)
-            return c
-    raise SystemExit(
-        f"No audio found. Tried: {', '.join(str(c) for c in candidates)}"
-    )
-
-
-def find_timings_csv(slug: str, profile: str) -> Path:
-    # First try slug_profile.csv, then slug.csv
-    candidates = [
-        TIMINGS_DIR / f"{slug}_{profile}.csv",
-        TIMINGS_DIR / f"{slug}.csv",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    raise SystemExit(
-        f"No timings CSV found. Tried: {', '.join(str(c) for c in candidates)}"
-    )
-
-
-def load_meta(slug: str) -> dict:
-    meta_path = META_DIR / f"{slug}.json"
-    if not meta_path.exists():
-        return {}
-    try:
-        return json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        log("META", f"Failed to read {meta_path}: {e}", YELLOW)
-        return {}
-
-
-def load_timings(csv_path: Path) -> List[dict]:
-    rows: List[dict] = []
-    with csv_path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        # Expect at least: line_index, time_secs, text
-        if "time_secs" not in reader.fieldnames or "text" not in reader.fieldnames:
-            raise SystemExit(
-                f"Timings CSV {csv_path} missing required columns 'time_secs'/'text'"
-            )
-        for row in reader:
+            choice = input("Choice [0–4]: ").strip()
+        except EOFError:
+            choice = "0"
+        if choice == "1":
+            open_path(OUTPUT_DIR)
+        elif choice == "2":
+            open_path(out_mp4)
+        elif choice == "3":
+            open_path(OUTPUT_DIR); open_path(out_mp4)
+        elif choice == "4":
+            # Lightweight upload entrypoint; defaults handled in 5_upload.py
+            artist, title = read_meta(slug)
+            # Default title: "Artist - Title (profile, offset +X.XXXs)"
+            default_title = None
+            if artist or title:
+                display = f"{artist} - {title}" if artist and title else (title or artist or slug)
+                default_title = f"{display} ({profile}, offset {LYRICS_OFFSET_SECS:+.3f}s)"
+            # Ask for title override
             try:
-                t = float(row["time_secs"])
-            except ValueError:
-                continue
-            text = row["text"].strip()
-            rows.append({"time_secs": t, "text": text})
-    rows.sort(key=lambda r: r["time_secs"])
-    return rows
-
-
-def build_events(rows: List[dict], offset: float) -> List[Event]:
-    if not rows:
-        raise SystemExit("No timing rows loaded.")
-
-    # Build lyric events from start times
-    lyric_events: List[Event] = []
-    n = len(rows)
-    for i, row in enumerate(rows):
-        start = rows[i]["time_secs"] + offset
-        if i < n - 1:
-            next_start = rows[i + 1]["time_secs"] + offset
-            end = next_start - LYRIC_FUDGE_BEFORE_NEXT
+                resp = input(f'YouTube title [ENTER for default{" ("+default_title+")" if default_title else ""}]: ').strip()
+            except EOFError:
+                resp = ""
+            final_title = resp or (default_title or out_mp4.stem)
+            cmd = [
+                sys.executable,
+                str(BASE_DIR / "scripts" / "5_upload.py"),
+                "--file",
+                str(out_mp4),
+                "--title",
+                final_title,
+                # privacy default is private; omit flag to keep default
+            ]
+            log("UPLOAD", " ".join(cmd), BLUE)
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                log("UPLOAD", f"Upload failed (exit {e.returncode}).", RED)
         else:
-            # Last line: give it a default tail
-            end = rows[i]["time_secs"] + offset + 3.0
-
-        # Ensure minimum duration
-        if end < start + LYRIC_MIN_DURATION:
-            end = start + LYRIC_MIN_DURATION
-
-        # Clamp to >= 0
-        if end < 0:
-            continue
-        if start < 0:
-            start = 0.0
-
-        lyric_events.append(
-            Event(
-                start=start,
-                end=end,
-                text=row["text"],
-                kind="lyric",
-            )
-        )
-
-    # Insert note events in big gaps between lyric events
-    all_events: List[Event] = []
-    for i, ev in enumerate(lyric_events):
-        all_events.append(ev)
-        if i < len(lyric_events) - 1:
-            cur = ev
-            nxt = lyric_events[i + 1]
-            gap = nxt.start - cur.end
-            if gap >= NOTE_GAP_THRESHOLD:
-                ns = cur.end + NOTE_INSET
-                ne = nxt.start - NOTE_INSET
-                if ne > ns + 0.5:
-                    # Use a small variety of note glyphs so it's not boring
-                    # (we just pick one deterministically based on index)
-                    note_choices = ["♪", "♫", "♬"]
-                    note_char = note_choices[i % len(note_choices)]
-                    all_events.append(
-                        Event(
-                            start=ns,
-                            end=ne,
-                            text=note_char,
-                            kind="note",
-                        )
-                    )
-
-    all_events.sort(key=lambda e: e.start)
-    return all_events
-
-
-def ass_time(t: float) -> str:
-    if t < 0:
-        t = 0.0
-    total_cs = int(round(t * 100))
-    cs = total_cs % 100
-    total_s = total_cs // 100
-    s = total_s % 60
-    total_m = total_s // 60
-    m = total_m % 60
-    h = total_m // 60
-    return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
-
-
-def escape_ass_text(text: str) -> str:
-    # Minimal escaping: newlines and curly braces
-    return (
-        text.replace("\\", "\\\\")
-        .replace("{", "\\{")
-        .replace("}", "\\}")
-        .replace("\n", r"\N")
-    )
-
-
-def write_ass(
-    ass_path: Path,
-    events: List[Event],
-    font_name: str,
-    font_size: int,
-    slug: str,
-) -> None:
-    meta = load_meta(slug)
-    artist = meta.get("artist", "") or ""
-    title = meta.get("title", "") or slug
-    full_title = f"{artist} - {title}" if artist else title
-
-    with ass_path.open("w", encoding="utf-8") as f:
-        f.write(
-            "[Script Info]\n"
-            f"Title: {escape_ass_text(full_title)}\n"
-            "ScriptType: v4.00+\n"
-            f"PlayResX: {WIDTH}\n"
-            f"PlayResY: {HEIGHT}\n"
-            "WrapStyle: 2\n"
-            "ScaledBorderAndShadow: yes\n"
-            "\n"
-            "[V4+ Styles]\n"
-            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
-            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
-            "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-            "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            # Title centered near top
-            f"Style: Title,{font_name},{int(font_size*0.7)},&H00FFFFFF,&H000000FF,"
-            f"&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,0,8,60,60,120,1\n"
-            # Main lyric big, centered low
-            f"Style: MainLyric,{font_name},{font_size},&H00FFFFFF,&H000000FF,"
-            f"&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,0,2,60,60,200,1\n"
-            # Next lyric smaller, bottom band
-            f"Style: NextLyric,{font_name},{int(font_size*0.6)},&H00CCCCCC,&H000000FF,"
-            f"&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,0,2,60,60,60,1\n"
-            # Music note in the middle
-            f"Style: Note,{font_name},{int(font_size*0.8)},&H0000FFFF,&H000000FF,"
-            f"&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,0,5,60,60,40,1\n"
-            "\n"
-            "[Events]\n"
-            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-        )
-
-        # Title card before first event (simple: 0 to min(5s, first_start))
-        if events:
-            first_start = max(0.0, events[0].start)
-            title_end = min(first_start, 5.0) if first_start > 0 else 3.0
-            if title_end > 0.5:
-                f.write(
-                    "Dialogue: 0,"
-                    f"{ass_time(0.0)},"
-                    f"{ass_time(title_end)},"
-                    "Title,,0000,0000,0000,,"
-                    f"{escape_ass_text(full_title)}\n"
-                )
-
-        # Build a list of lyric-only events for "Next:" previews
-        lyric_events = [e for e in events if e.kind == "lyric"]
-
-        for idx, ev in enumerate(events):
-            if ev.kind == "lyric":
-                # Current line
-                f.write(
-                    "Dialogue: 0,"
-                    f"{ass_time(ev.start)},"
-                    f"{ass_time(ev.end)},"
-                    "MainLyric,,0000,0000,0000,,"
-                    f"{escape_ass_text(ev.text)}\n"
-                )
-
-                # Next lyric preview (ignore notes)
-                next_lyric_text: Optional[str] = None
-                for future in lyric_events:
-                    if future.start > ev.start:
-                        next_lyric_text = future.text
-                        break
-                if next_lyric_text:
-                    preview = f"Next: {next_lyric_text}"
-                    f.write(
-                        "Dialogue: 0,"
-                        f"{ass_time(ev.start)},"
-                        f"{ass_time(ev.end)},"
-                        "NextLyric,,0000,0000,0000,,"
-                        f"{escape_ass_text(preview)}\n"
-                    )
-
-            elif ev.kind == "note":
-                f.write(
-                    "Dialogue: 0,"
-                    f"{ass_time(ev.start)},"
-                    f"{ass_time(ev.end)},"
-                    "Note,,0000,0000,0000,,"
-                    f"{escape_ass_text(ev.text)}\n"
-                )
-
-    log("ASS", f"Wrote ASS to {ass_path}", GREEN)
-
-
-def render_ffmpeg(
-    audio_path: Path,
-    ass_path: Path,
-    out_path: Path,
-    force: bool,
-    font_name: str,
-) -> None:
-    if out_path.exists() and not force:
-        log("MP4", f"Exists, skipping render: {out_path.name}", YELLOW)
-        print(f"\nMP4 already present: {out_path}\n")
+            log("OPEN", "No open action selected.", YELLOW)
         return
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Continue with full render path.
+    default_font_size = DEFAULT_UI_FONT_SIZE
+    font_size_value = args.font_size
+    if font_size_value is None:
+        if sys.stdin.isatty():
+            try:
+                resp = input(f"Subtitle font size [20–200, default {default_font_size}]: ").strip()
+            except EOFError:
+                resp = ""
+            if not resp:
+                font_size_value = default_font_size
+            else:
+                try:
+                    v = int(resp)
+                    if 20 <= v <= 200:
+                        font_size_value = v
+                    else:
+                        print(f"Value {v} out of range; using default {default_font_size}")
+                        font_size_value = default_font_size
+                except ValueError:
+                    print(f"Invalid integer; using default font size {default_font_size}")
+                    font_size_value = default_font_size
+        else:
+            font_size_value = default_font_size
 
-    # ffmpeg: black background video + audio + ASS subtitles
-    vf = f"subtitles={ass_path.as_posix()}:force_style='FontName={font_name}'"
+    ui_font_size = max(20, min(200, font_size_value))
+    ass_font_size = int(ui_font_size * ASS_FONT_MULTIPLIER)
+    log("FONT", f"Using UI font size {ui_font_size} (ASS Fontsize={ass_font_size})", CYAN)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    log("MP4GEN", f"Slug={slug}, profile={profile}", CYAN)
+
+    audio_path = choose_audio(slug, profile)
+    audio_duration = probe_audio_duration(audio_path)
+    if audio_duration <= 0:
+        log("DUR", f"Audio duration unknown or zero for {audio_path}", YELLOW)
+
+    artist, title = read_meta(slug)
+    timings = read_timings(slug)  # <- uses timings_io and reorders to (time_secs, text, line_index)
+    log("META", f'Artist="{artist}", Title="{title}", entries={len(timings)}', CYAN)
+
+    ass_path = build_ass(
+        slug, profile, artist, title, timings, audio_duration, args.font_name, ass_font_size, LYRICS_OFFSET_SECS
+    )
+
     cmd = [
         "ffmpeg",
         "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        f"color=size={WIDTH}x{HEIGHT}:rate={FPS}:color=black",
-        "-i",
-        str(audio_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "slow",
-        "-crf",
-        "18",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
+        "-f", "lavfi",
+        "-i", f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30:d={max(audio_duration, 1.0)}",
+        "-i", str(audio_path),
+        "-vf", f"subtitles={ass_path}",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-c:a", "aac",
+        "-b:a", "192k",
         "-shortest",
-        "-vf",
-        vf,
-        str(out_path),
+        str(out_mp4),
     ]
 
-    log("MP4", " ".join(cmd), CYAN)
+    log("FFMPEG", " ".join(cmd), BLUE)
+    t0 = time.perf_counter()
     subprocess.run(cmd, check=True)
-    log("MP4", f"Rendered MP4: {out_path}", GREEN)
+    t1 = time.perf_counter()
+    log("MP4", f"Wrote MP4 to {out_mp4} in {t1 - t0:6.2f} s", GREEN)
 
-
-def post_ui(out_path: Path) -> None:
-    print(f"\nMP4 is at: {out_path}")
+    print()
+    print(f"{BOLD}{BLUE}MP4 generation complete:{RESET} {out_mp4}")
     print("What would you like to open?")
     print("  1 = output directory")
     print("  2 = MP4 file")
     print("  3 = both (dir then MP4)")
+    print("  4 = upload to YouTube (private)")
     print("  0 = none")
+
     try:
-        choice = input("Choice [0–3]: ").strip() or "0"
+        choice = input("Choice [0–4]: ").strip()
     except EOFError:
-        return
+        choice = "0"
 
-    if choice not in {"0", "1", "2", "3"}:
-        return
-
-    if choice in {"1", "3"}:
-        if sys.platform == "darwin":
-            subprocess.run(["open", str(OUTPUT_DIR)], check=False)
-        elif sys.platform.startswith("linux"):
-            subprocess.run(["xdg-open", str(OUTPUT_DIR)], check=False)
-    if choice in {"2", "3"}:
-        if sys.platform == "darwin":
-            subprocess.run(["open", str(out_path)], check=False)
-        elif sys.platform.startswith("linux"):
-            subprocess.run(["xdg-open", str(out_path)], check=False)
-
-
-def main(argv=None):
-    args = parse_args(argv or sys.argv[1:])
-
-    slug = args.slug
-    profile = args.profile
-    offset = resolve_offset(args.offset)
-
-    audio_path = find_audio(slug, profile)
-    timings_csv = find_timings_csv(slug, profile)
-    rows = load_timings(timings_csv)
-    events = build_events(rows, offset)
-    log("TIMINGS", f"Loaded {len(events)} timing events (lyrics + notes)", GREEN)
-
-    offset_tag = format_offset_tag(offset)
-    out_path = OUTPUT_DIR / f"{slug}_{profile}_offset_{offset_tag}.mp4"
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ass_path = Path(tmpdir) / f"{slug}_{profile}.ass"
-        write_ass(
-            ass_path=ass_path,
-            events=events,
-            font_name=args.font_name,
-            font_size=args.font_size,
-            slug=slug,
-        )
-        render_ffmpeg(
-            audio_path=audio_path,
-            ass_path=ass_path,
-            out_path=out_path,
-            force=args.force,
-            font_name=args.font_name,
-        )
-
-    if not args.no_post_ui:
-        post_ui(out_path)
+    if choice == "1":
+        open_path(OUTPUT_DIR)
+    elif choice == "2":
+        open_path(out_mp4)
+    elif choice == "3":
+        open_path(OUTPUT_DIR)
+        open_path(out_mp4)
+    elif choice == "4":
+        # Lightweight upload entrypoint; defaults handled in 5_upload.py
+        artist, title = read_meta(slug)
+        default_title = None
+        if artist or title:
+            display = f"{artist} - {title}" if artist and title else (title or artist or slug)
+            default_title = f"{display} ({profile}, offset {LYRICS_OFFSET_SECS:+.3f}s)"
+        try:
+            resp = input(f'YouTube title [ENTER for default{" ("+default_title+")" if default_title else ""}]: ').strip()
+        except EOFError:
+            resp = ""
+        final_title = resp or (default_title or out_mp4.stem)
+        cmd_up = [
+            sys.executable,
+            str(BASE_DIR / "scripts" / "5_upload.py"),
+            "--file",
+            str(out_mp4),
+            "--title",
+            final_title,
+            # privacy default is private
+        ]
+        log("UPLOAD", " ".join(cmd_up), BLUE)
+        try:
+            subprocess.run(cmd_up, check=True)
+        except subprocess.CalledProcessError as e:
+            log("UPLOAD", f"Upload failed (exit {e.returncode}).", RED)
+    else:
+        log("OPEN", "No open action selected.", YELLOW)
 
 
 if __name__ == "__main__":
     main()
-
 # end of 4_mp4.py
