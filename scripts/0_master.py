@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 # scripts/0_master.py
-# HYBRID MODE:
-#   - Interactive pipeline by default
-#   - Headless pipeline when --no-ui is passed by user
-#   - Only then does master forward --no-ui to Step1/Step2/etc.
 
 import argparse
 import json
@@ -12,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 
+# ----- COLORS -----
 RESET = "\033[0m"
 BOLD = "\033[1m"
 CYAN = "\033[36m"
@@ -19,6 +16,8 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+WHITE = "\033[97m"   # bright white — excellent on black backgrounds
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
@@ -55,6 +54,12 @@ def fmt_secs(sec: float) -> str:
 
 
 def format_offset_tag(offset: float) -> str:
+    """
+    Convert numeric offset (seconds) into tag like:
+      +0.000 -> p0p000s
+      +1.500 -> p1p500s
+      -0.500 -> m0p500s
+    """
     sign = "p" if offset >= 0 else "m"
     val = abs(offset)
     sec_int = int(val)
@@ -65,33 +70,50 @@ def format_offset_tag(offset: float) -> str:
 def detect_latest_slug() -> str | None:
     if not META_DIR.exists():
         return None
-    files = sorted(META_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = sorted(META_DIR.glob("*.json"),
+                   key=lambda p: p.stat().st_mtime,
+                   reverse=True)
     return files[0].stem if files else None
+
+
+def load_meta_fields(slug: str) -> tuple[str | None, str | None]:
+    """
+    Returns (title, artist) or (None, None).
+    """
+    meta_path = META_DIR / f"{slug}.json"
+    if not meta_path.exists():
+        return None, None
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        title = (data.get("title") or "").strip() or None
+        artist = (data.get("artist") or "").strip() or None
+        return title, artist
+    except:
+        return None, None
 
 
 def detect_step_status(slug: str, profile: str) -> dict[str, str]:
     status = {"slug": slug, "profile": profile}
 
     # Step 1: txt/mp3/meta
-    if (MP3_DIR / f"{slug}.mp3").exists() and (TXT_DIR / f"{slug}.txt").exists() and (META_DIR / f"{slug}.json").exists():
-        status["1"] = "DONE"
-    else:
-        status["1"] = "MISSING"
+    mp3 = MP3_DIR / f"{slug}.mp3"
+    txt = TXT_DIR / f"{slug}.txt"
+    meta = META_DIR / f"{slug}.json"
+    status["1"] = "DONE" if (mp3.exists() and txt.exists() and meta.exists()) else "MISSING"
 
     # Step 2: mix wav
-    if (MIXES_DIR / f"{slug}_{profile}.wav").exists():
-        status["2"] = "DONE"
-    else:
-        status["2"] = "MISSING"
+    mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
+    status["2"] = "DONE" if mix_wav.exists() else "MISSING"
 
     # Step 3: timings
-    status["3"] = "DONE" if (TIMINGS_DIR / f"{slug}.csv").exists() else "MISSING"
+    csv = TIMINGS_DIR / f"{slug}.csv"
+    status["3"] = "DONE" if csv.exists() else "MISSING"
 
     # Step 4: mp4
     mp4s = list(OUTPUT_DIR.glob(f"{slug}_{profile}_offset_*.mp4"))
     status["4"] = "DONE" if mp4s else "MISSING"
 
-    # Step 5: upload receipts
+    # Step 5: upload
     if UPLOAD_LOG.exists() and any(UPLOAD_LOG.glob(f"{slug}_{profile}_offset_*.json")):
         status["5"] = "DONE"
     else:
@@ -103,14 +125,14 @@ def detect_step_status(slug: str, profile: str) -> dict[str, str]:
 def prompt_yes_no(msg: str, default_yes=True) -> bool:
     default = "Y/n" if default_yes else "y/N"
     while True:
-        ans = input(f"{msg} [{default}]: ").strip().lower()
+        ans = input(f"{WHITE}{msg}{RESET} [{default}]: ").strip().lower()
         if not ans:
             return default_yes
         if ans in ("y", "yes"):
             return True
         if ans in ("n", "no"):
             return False
-        print("Please answer y or n.")
+        print(f"{YELLOW}Please answer y or n.{RESET}")
 
 
 def run(cmd: list[str], section: str) -> float:
@@ -145,11 +167,7 @@ def write_offset(slug: str, offset: float) -> None:
 # ---------------------------------------------------------
 # Step 1
 # ---------------------------------------------------------
-def run_step1(slug: str, query: str | None, headless: bool) -> float:
-    """
-    Step1 should run interactive by default.
-    Only when the *user* runs `0_master.py --no-ui` do we forward "--no-ui".
-    """
+def run_step1(slug: str, query: str | None, no_ui: bool) -> float:
     mp3 = MP3_DIR / f"{slug}.mp3"
     txt = TXT_DIR / f"{slug}.txt"
     meta = META_DIR / f"{slug}.json"
@@ -158,46 +176,44 @@ def run_step1(slug: str, query: str | None, headless: bool) -> float:
         log("STEP1", "Already have txt/mp3/meta — skipping.", GREEN)
         return 0.0
 
-    cmd = [sys.executable, str(SCRIPTS_DIR / "1_txt_mp3.py")]
+    # Build command
+    cmd = [sys.executable, str(SCRIPTS_DIR / "1_txt_mp3.py"), "--slug", slug]
 
-    if headless:
+    # Add --no-ui if master is running in no-ui mode
+    if no_ui:
         cmd.append("--no-ui")
-        cmd += ["--slug", slug]
-        if query:
-            cmd += ["--query"] + query.split()
-        else:
-            raise SystemExit(f"{RED}--no-ui was used but no query provided.{RESET}")
-    else:
-        # interactive mode → positional query words
-        if not query:
-            raise SystemExit(f"{RED}Interactive Step1 requires a query string.{RESET}")
-        cmd += query.split()
+
+    # Append query *as positional arguments* (not --query)
+    if query:
+        cmd += query.split()   # ← correct expected format
 
     return run(cmd, "STEP1")
-
-
 # ---------------------------------------------------------
 # Step 2  (Demucs → mix UI → render)
 # ---------------------------------------------------------
-def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
+def run_step2(slug: str, profile: str, model: str, interactive: bool, no_ui: bool) -> float:
     mp3 = MP3_DIR / f"{slug}.mp3"
     mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
 
-    # Bypass?
+    # If UI disabled globally:
+    if no_ui:
+        interactive = False
+
+    # Ask user about bypassing separation
     if interactive:
-        bypass = prompt_yes_no("Use original mix (skip Demucs)?", False)
+        bypass = prompt_yes_no("Use original mix (100% all tracks, skip Demucs)?", False)
     else:
         bypass = False
 
     if bypass:
         MIXES_DIR.mkdir(parents=True, exist_ok=True)
         if mix_wav.exists():
-            log("STEP2", f"Bypass: mix at {mix_wav}", GREEN)
+            log("STEP2", f"Bypass: mix already exists at {mix_wav}", GREEN)
             return 0.0
         cmd = ["ffmpeg", "-y", "-i", str(mp3), str(mix_wav)]
         return run(cmd, "STEP2-BYPASS")
 
-    # Model selection
+    # Demucs model rules
     if profile == "karaoke":
         effective_model = "htdemucs_6s"
         two_stems = False
@@ -205,12 +221,12 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
         effective_model = model
         two_stems = True
 
-    # Demucs separation
-    stems_dir = BASE_DIR / "separated" / effective_model / slug
+    stems_root = BASE_DIR / "separated" / effective_model
+    stems_dir = stems_root / slug
     stems_exist = stems_dir.exists() and any(stems_dir.glob("*.wav"))
 
-    if stems_exist:
-        reuse = prompt_yes_no("Stems exist. Reuse?", True) if interactive else True
+    if stems_exist and interactive:
+        reuse = prompt_yes_no("Stems exist. Reuse?", True)
         if not reuse:
             for p in stems_dir.glob("*.wav"):
                 try:
@@ -219,7 +235,7 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
                     pass
             stems_exist = False
 
-    t_sep = 0.0
+    # If stems missing, run Demucs
     if not stems_exist:
         cmd = [sys.executable, "-m", "demucs", "-n", effective_model, str(mp3)]
         if two_stems:
@@ -230,7 +246,8 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
             section = "STEP2-6STEM"
         t_sep = run(cmd, section)
     else:
-        log("STEP2", "Reusing existing stems", GREEN)
+        log("STEP2", "Reusing existing stems.", GREEN)
+        t_sep = 0.0
 
     # Mix UI
     cmd = [
@@ -245,7 +262,7 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
         cmd.append("--non-interactive")
     t_ui = run(cmd, "STEP2-MIXUI")
 
-    # Render final mix WAV
+    # Render WAV
     MIXES_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable,
@@ -262,22 +279,27 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
 
 
 # ---------------------------------------------------------
-# Step 3
+# Step 3  (auto-timing or manual timing)
 # ---------------------------------------------------------
-def run_step3(slug: str) -> float:
+def run_step3(slug: str, no_ui: bool) -> float:
     mp3 = MP3_DIR / f"{slug}.mp3"
     txt = TXT_DIR / f"{slug}.txt"
     auto_script = SCRIPTS_DIR / "3_auto_timing.py"
 
+    # auto timing
     if auto_script.exists():
         cmd = [
-            sys.executable, str(auto_script),
+            sys.executable,
+            str(auto_script),
             "--slug", slug,
             "--mp3", str(mp3),
             "--txt", str(txt),
         ]
+        if no_ui:
+            cmd.append("--no-ui")
         return run(cmd, "STEP3-AUTO")
 
+    # manual timing
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "3_timing.py"),
@@ -285,35 +307,37 @@ def run_step3(slug: str) -> float:
         "--audio", str(mp3),
         "--timings", str(TIMINGS_DIR / f"{slug}.csv"),
     ]
+    if no_ui:
+        cmd.append("--no-ui")
     return run(cmd, "STEP3")
 
 
 # ---------------------------------------------------------
-# Step 4
+# Step 4  (mp4 rendering)
 # ---------------------------------------------------------
-def run_step4(slug: str, profile: str, offset: float, force: bool, called_from_master=True) -> float:
+def run_step4(slug: str, profile: str, offset: float, force: bool, no_ui: bool) -> float:
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "4_mp4.py"),
         "--slug", slug,
         "--profile", profile,
         "--offset", str(offset),
+        "--no-post-ui",    # master handles uploads
     ]
     if force:
         cmd.append("--force")
-    if called_from_master:
-        cmd.append("--no-post-ui")
+    if no_ui:
+        cmd.append("--no-ui")
 
     return run(cmd, "STEP4")
 
 
 # ---------------------------------------------------------
-# Step 5
+# Step 5  (YouTube upload)
 # ---------------------------------------------------------
-def run_step5(slug: str, profile: str, offset: float) -> float:
-    # Already uploaded?
+def run_step5(slug: str, profile: str, offset: float, no_ui: bool) -> float:
     if UPLOAD_LOG.exists() and any(UPLOAD_LOG.glob(f"{slug}_{profile}_offset_*.json")):
-        log("STEP5", "Already uploaded; skipping.", GREEN)
+        log("STEP5", "Upload already recorded in uploaded/; skipping.", GREEN)
         return 0.0
 
     tag = format_offset_tag(offset)
@@ -326,30 +350,41 @@ def run_step5(slug: str, profile: str, offset: float) -> float:
             reverse=True,
         )
         if not candidates:
-            raise SystemExit(f"No MP4 found for upload: {slug}")
+            raise SystemExit(
+                f"{RED}No MP4 found for upload for slug={slug}, profile={profile}, "
+                f"offset={offset:+.3f}s{RESET}"
+            )
         mp4_path = candidates[0]
-        log("STEP5", f"Using latest MP4: {mp4_path.name}", YELLOW)
+        log("STEP5", f"No exact-offset MP4; using latest {mp4_path.name}", YELLOW)
     else:
-        log("STEP5", f"Using MP4: {mp4_path.name}", CYAN)
+        log("STEP5", f"Using MP4 {mp4_path.name} for upload", CYAN)
 
-    # Build title
+    # --------------------------
+    # Title construction
+    # --------------------------
     meta_path = META_DIR / f"{slug}.json"
-    artist, title = "", slug.replace("_", " ")
+    artist = ""
+    title = slug.replace("_", " ")
     if meta_path.exists():
         try:
-            meta = json.loads(meta_path.read_text())
-            artist = meta.get("artist") or ""
-            title = meta.get("title") or title
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            artist = (data.get("artist") or "").strip()
+            title = (data.get("title") or title).strip()
         except:
             pass
 
     base = f"{artist} - {title}".strip(" -")
-    base_with_space = (base + " ") if base else ""
+    base_space = base + " " if base else ""
 
-    suffix = input(
-        f'Additional title text to append to "{base_with_space}" (ENTER none): '
-    ).strip()
-    final_title = (base_with_space + suffix).strip() if suffix else base
+    if not no_ui:
+        suffix = input(
+            f'{WHITE}Additional title text to append to "{base_space}" '
+            f'(e.g. "(35% Vocals)") [ENTER for none]: {RESET}'
+        ).strip()
+    else:
+        suffix = ""
+
+    final_title = (base_space + suffix).strip() if suffix else base
     if not final_title:
         final_title = mp4_path.stem
 
@@ -363,11 +398,12 @@ def run_step5(slug: str, profile: str, offset: float) -> float:
         "--title", final_title,
         "--privacy", "private",
     ]
+    if no_ui:
+        cmd.append("--no-ui")
+
     return run(cmd, "STEP5")
-
-
 # ---------------------------------------------------------
-# Parse args
+# Parse CLI arguments
 # ---------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Master orchestrator for Karaoke Time pipeline.")
@@ -378,8 +414,11 @@ def parse_args():
     p.add_argument("--model", type=str, default="htdemucs")
     p.add_argument("--offset", type=float, default=None)
     p.add_argument("--steps", type=str, help="E.g. 12345 or 45")
-    p.add_argument("--skip-ui", action="store_true")
-    p.add_argument("--no-ui", action="store_true", help="Run fully headless (master & Step1)")
+
+    # Hybrid UI flag
+    p.add_argument("--no-ui", action="store_true",
+                   help="Disable all interactive prompts in master + sub-steps.")
+
     p.add_argument("--no-upload", action="store_true")
     p.add_argument("--force-mp4", action="store_true")
 
@@ -387,22 +426,109 @@ def parse_args():
 
 
 # ---------------------------------------------------------
-# Choose steps
+# Slug/Query Menu
 # ---------------------------------------------------------
-def choose_steps(status: dict[str, str]) -> list[int]:
+def slug_selection_menu(args) -> tuple[str, str | None]:
+    """
+    Runs only when user provided NO --slug and NO --query.
+    Offers:
+      1. Reuse previous slug "foo" (Title by Artist) with confirmation
+      2. Search for a new song
+      3. Pipeline menu  (jump to step selection screen)
+      4. Exit
+    """
+    while True:
+        last_slug = detect_latest_slug()
+
+        print()
+        print(f"{BOLD}{CYAN}=== Slug / Query Menu ==={RESET}")
+
+        # Build option 1 text
+        if last_slug:
+            title, artist = load_meta_fields(last_slug)
+            if title and artist:
+                opt1 = f'Reuse slug for {WHITE}{title}{RESET} by {WHITE}{artist}{RESET}'
+            else:
+                opt1 = f'Reuse slug "{WHITE}{last_slug}{RESET}"'
+        else:
+            opt1 = None
+
+        # Print menu
+        if opt1:
+            print(f"{WHITE}1.{RESET} {opt1}")
+        else:
+            print(f"{WHITE}1.{RESET} (No previous slug available)")
+
+        print(f"{WHITE}2.{RESET} Search for a new song")
+        print(f"{WHITE}3.{RESET} Pipeline menu")
+        print(f"{WHITE}4.{RESET} Exit")
+
+        choice = input(f"{MAGENTA}Choose an option [1-4]: {RESET}").strip()
+
+        # 1) Reuse previous slug
+        if choice == "1":
+            if not last_slug:
+                print(f"{YELLOW}No previous slug available.{RESET}")
+                continue
+
+            confirm = prompt_yes_no(
+                f'Proceed with slug "{last_slug}"?',
+                default_yes=True
+            )
+            if confirm:
+                return last_slug, None
+            else:
+                continue  # redisplay menu
+
+        # 2) Enter new query
+        elif choice == "2":
+            raw = input(
+                f"{WHITE}Enter new search query (e.g. 'nirvana come as you are'): {RESET}"
+            ).strip()
+            if not raw:
+                print(f"{YELLOW}Empty query not allowed.{RESET}")
+                continue
+            return slugify(raw), raw
+
+        # 3) Go directly to pipeline menu (no change to slug)
+        elif choice == "3":
+            if not last_slug:
+                print(f"{YELLOW}No previous slug found; cannot enter pipeline menu.{RESET}")
+                continue
+            return last_slug, "__PIPELINE_ONLY__"
+
+        # 4) Exit
+        elif choice == "4":
+            print(f"{BLUE}Exiting.{RESET}")
+            sys.exit(0)
+
+        else:
+            print(f"{YELLOW}Invalid choice.{RESET}")
+
+
+# ---------------------------------------------------------
+# Pipeline Steps Selection
+# ---------------------------------------------------------
+def choose_steps(status: dict[str, str], no_ui: bool) -> list[int]:
     slug = status["slug"]
     profile = status["profile"]
 
     print()
-    print(f"{BOLD}Pipeline status for slug={slug}, profile={profile}{RESET}")
-    print(f"[1] txt+mp3           -> {status['1']}")
-    print(f"[2] stems/mix         -> {status['2']}")
-    print(f"[3] timings           -> {status['3']}")
-    print(f"[4] mp4               -> {status['4']}")
-    print(f"[5] upload            -> {status['5']}")
+    print(f"{BOLD}{CYAN}Pipeline status for slug={WHITE}{slug}{RESET}{CYAN}, profile={WHITE}{profile}{RESET}")
+    print(f"{WHITE}[1]{RESET} txt+mp3           -> {status['1']}")
+    print(f"{WHITE}[2]{RESET} stems/mix         -> {status['2']}")
+    print(f"{WHITE}[3]{RESET} timings           -> {status['3']}")
+    print(f"{WHITE}[4]{RESET} mp4               -> {status['4']}")
+    print(f"{WHITE}[5]{RESET} upload            -> {status['5']}")
     print()
 
-    # Defaults
+    if no_ui:
+        # Default: run everything missing
+        default = "".join([k for k, v in status.items() if k.isdigit() and v == "MISSING"])
+        default = default or ""
+        return [int(x) for x in default] if default else []
+
+    # Suggest defaults:
     if status["1"] == "DONE" and status["2"] == "DONE" and status["3"] == "DONE":
         default = "45"
     elif status["1"] != "DONE":
@@ -410,23 +536,22 @@ def choose_steps(status: dict[str, str]) -> list[int]:
     else:
         default = "234"
 
-    s = input(
-        "Steps to run (1=txt/mp3,2=stems,3=timing,4=mp4,5=upload,0=none, "
-        f"ENTER for suggested={default}): "
+    raw = input(
+        f"{WHITE}Steps to run (1=txt/mp3,2=stems,3=timing,4=mp4,5=upload,0=none){RESET} "
+        f"{CYAN}[ENTER for {default}]{RESET}: "
     ).strip()
 
-    if not s:
-        s = default
-    if s == "0":
+    if not raw:
+        raw = default
+    if raw == "0":
         return []
 
     out = []
-    for ch in s:
+    for ch in raw:
         if ch.isdigit():
             i = int(ch)
             if 1 <= i <= 5 and i not in out:
                 out.append(i)
-
     return out
 
 
@@ -436,35 +561,35 @@ def choose_steps(status: dict[str, str]) -> list[int]:
 def main():
     args = parse_args()
 
-    # Should steps run interactive?
-    headless = args.no_ui
-    interactive_steps = not headless
-
-    # SLUG SELECTION
-    if args.slug:
-        slug = slugify(args.slug)
-    elif args.query:
-        new_slug = slugify(args.query)
-        old_slug = detect_latest_slug()
-        if old_slug and old_slug != new_slug and interactive_steps:
-            ans = input(
-                f'Previous slug "{old_slug}" found. Use that instead of "{new_slug}"? [y/N]: '
-            ).strip().lower()
-            slug = old_slug if ans == "y" else new_slug
-        else:
-            slug = new_slug
-    else:
-        slug = detect_latest_slug()
-        if not slug:
-            print(f"{RED}No slug, no query, and no previous metadata. Exiting.{RESET}")
-            sys.exit(1)
-
-    log("SLUG", f'Using slug="{slug}"', CYAN)
-
+    no_ui = args.no_ui
     profile = args.profile
-    query = args.query
+    query_from_cli = args.query
+    slug_from_cli = args.slug
 
+    # -----------------------------------------
+    # Determine slug + query using menu logic
+    # -----------------------------------------
+    if slug_from_cli:
+        slug = slugify(slug_from_cli)
+        query = query_from_cli
+        log("SLUG", f'Using slug="{WHITE}{slug}{RESET}"', CYAN)
+
+    elif query_from_cli:
+        slug = slugify(query_from_cli)
+        query = query_from_cli
+        log("SLUG", f'Using slug="{WHITE}{slug}{RESET}" (from query)', CYAN)
+
+    else:
+        # No slug + no query → show the menu
+        slug, query = slug_selection_menu(args)
+
+        if query == "__PIPELINE_ONLY__":
+            # Only jump to pipeline menu; do NOT run Step1
+            query = None
+
+    # -----------------------------------------
     # OFFSET
+    # -----------------------------------------
     if args.offset is not None:
         offset = args.offset
         write_offset(slug, offset)
@@ -473,53 +598,67 @@ def main():
         offset = read_offset(slug)
         log("OFFSET", f"Using stored offset={offset:+.3f}s", CYAN)
 
-    # STATUS
+    # -----------------------------------------
+    # Detect pipeline status
+    # -----------------------------------------
     status = detect_step_status(slug, profile)
 
-    # Step selection
+    # -----------------------------------------
+    # Step choice (Pipeline menu)
+    # -----------------------------------------
     if args.steps:
-        steps = sorted({int(ch) for ch in args.steps if ch.isdigit() and 1 <= int(ch) <= 5})
+        steps = []
+        for ch in args.steps:
+            if ch.isdigit():
+                i = int(ch)
+                if 1 <= i <= 5 and i not in steps:
+                    steps.append(i)
+        log("MASTER", f"Running requested steps: {WHITE}{steps}{RESET}", BLUE)
     else:
-        steps = choose_steps(status)
-    log("MASTER", f"Running steps: {steps}")
+        steps = choose_steps(status, no_ui)
+        log("MASTER", f"Running steps: {WHITE}{steps}{RESET}", BLUE)
 
-    # RUN STEPS
+    # -----------------------------------------
+    # Run steps
+    # -----------------------------------------
     t1 = t2 = t3 = t4 = t5 = 0.0
 
-    if 1 in steps:
-        t1 = run_step1(slug, query, headless=headless)
+    if 1 in steps and query is not None:
+        t1 = run_step1(slug, query, no_ui)
 
     if 2 in steps:
-        t2 = run_step2(slug, profile, args.model, interactive=interactive_steps)
+        t2 = run_step2(slug, profile, args.model, interactive=not no_ui, no_ui=no_ui)
 
     if 3 in steps:
-        t3 = run_step3(slug)
+        t3 = run_step3(slug, no_ui)
 
     if 4 in steps:
-        t4 = run_step4(slug, profile, offset, force=args.force_mp4, called_from_master=True)
+        t4 = run_step4(slug, profile, offset, force=args.force_mp4, no_ui=no_ui)
 
     if 5 in steps and not args.no_upload:
-        t5 = run_step5(slug, profile, offset)
+        t5 = run_step5(slug, profile, offset, no_ui)
     elif 5 in steps and args.no_upload:
-        log("STEP5", "Upload requested but --no-upload was used; skipping.", YELLOW)
+        log("STEP5", "Upload requested but --no-upload was set; skipping.", YELLOW)
 
-    # SUMMARY
+    # -----------------------------------------
+    # Summary
+    # -----------------------------------------
     total = t1 + t2 + t3 + t4 + t5
     if total > 0:
         print()
         print(f"{BOLD}{BLUE}======== PIPELINE SUMMARY ========{RESET}")
         if t1:
-            print(f"Step1 txt/mp3:  {fmt_secs(t1)}")
+            print(f"{WHITE}Step1 txt/mp3:{RESET}  {fmt_secs(t1)}")
         if t2:
-            print(f"Step2 stems:    {fmt_secs(t2)}")
+            print(f"{WHITE}Step2 stems:{RESET}    {fmt_secs(t2)}")
         if t3:
-            print(f"Step3 timing:   {fmt_secs(t3)}")
+            print(f"{WHITE}Step3 timing:{RESET}   {fmt_secs(t3)}")
         if t4:
-            print(f"Step4 mp4:      {fmt_secs(t4)}")
+            print(f"{WHITE}Step4 mp4:{RESET}      {fmt_secs(t4)}")
         if t5:
-            print(f"Step5 upload:   {fmt_secs(t5)}")
+            print(f"{WHITE}Step5 upload:{RESET}   {fmt_secs(t5)}")
         print(f"{GREEN}Total time:     {fmt_secs(total)}{RESET}")
-        print(f"{BOLD}{BLUE}=================================={RESET}")
+        print(f"{BOLD}{BLUE}===============================\n{RESET}")
 
 
 if __name__ == "__main__":
