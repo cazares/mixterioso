@@ -22,8 +22,8 @@ def log(section: str, msg: str, color: str = CYAN) -> None:
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = BASE_DIR / "scripts"
-MP3_DIR = BASE_DIR / "mp3s"
 TXT_DIR = BASE_DIR / "txts"
+MP3_DIR = BASE_DIR / "mp3s"
 TIMINGS_DIR = BASE_DIR / "timings"
 OFFSETS_DIR = BASE_DIR / "offsets"
 MIXES_DIR = BASE_DIR / "mixes"
@@ -31,92 +31,76 @@ META_DIR = BASE_DIR / "meta"
 OUTPUT_DIR = BASE_DIR / "output"
 
 
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
 def slugify(text: str) -> str:
     import re
-
     base = text.strip().lower()
     base = re.sub(r"\s+", "_", base)
     base = re.sub(r"[^\w\-]+", "", base)
     return base or "song"
 
 
-def fmt_secs_mmss(sec: float) -> str:
+def fmt_secs(sec: float) -> str:
     m = int(sec // 60)
-    s = int(round(sec - m * 60))
+    s = int(sec - m * 60)
     return f"{m:02d}:{s:02d}"
 
 
 def detect_latest_slug() -> str | None:
-    """
-    Try to infer latest slug by looking at meta/*.json files.
-    """
     if not META_DIR.exists():
         return None
-    json_files = sorted(META_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not json_files:
-        return None
-    newest = json_files[0]
-    return newest.stem
+    files = sorted(META_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0].stem if files else None
 
 
 def detect_step_status(slug: str, profile: str) -> dict[str, str]:
-    """
-    Look at the filesystem and infer which steps are done/missing.
-    """
-    status: dict[str, str] = {}
+    status = {
+        "slug": slug,
+        "profile": profile,
+    }
 
-    # Step 1: txt+mp3
-    mp3_path = MP3_DIR / f"{slug}.mp3"
-    txt_path = TXT_DIR / f"{slug}.txt"
-    meta_path = META_DIR / f"{slug}.json"
-    if mp3_path.exists() and txt_path.exists() and meta_path.exists():
+    # Step 1: txt/mp3/meta
+    mp3 = MP3_DIR / f"{slug}.mp3"
+    txt = TXT_DIR / f"{slug}.txt"
+    meta = META_DIR / f"{slug}.json"
+    if mp3.exists() and txt.exists() and meta.exists():
         status["1"] = "DONE"
     else:
         status["1"] = "MISSING"
 
-    # Step 2: stems/mix
-    mix_config = MIXES_DIR / f"{slug}_{profile}.json"
-    mix_audio = MIXES_DIR / f"{slug}_{profile}.wav"
-    if mix_audio.exists():
+    # Step 2: mix wav
+    mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
+    if mix_wav.exists():
         status["2"] = "DONE"
-    elif mix_config.exists():
-        status["2"] = "CONFIG_ONLY"
     else:
         status["2"] = "MISSING"
 
     # Step 3: timings
-    timing_path = TIMINGS_DIR / f"{slug}.csv"
-    if timing_path.exists():
-        status["3"] = "DONE"
-    else:
-        status["3"] = "MISSING"
+    csv = TIMINGS_DIR / f"{slug}.csv"
+    status["3"] = "DONE" if csv.exists() else "MISSING"
 
     # Step 4: mp4
-    mp4_candidates = list(OUTPUT_DIR.glob(f"{slug}_{profile}_offset_*.mp4"))
-    if mp4_candidates:
-        status["4"] = "DONE"
-    else:
-        status["4"] = "MISSING"
+    mp4s = list(OUTPUT_DIR.glob(f"{slug}_{profile}_offset_*.mp4"))
+    status["4"] = "DONE" if mp4s else "MISSING"
 
     # Step 5: upload
-    upload_meta = META_DIR / f"{slug}_{profile}_upload.json"
-    if upload_meta.exists():
-        status["5"] = "DONE"
-    else:
-        status["5"] = "MISSING"
+    uploaded = META_DIR / f"{slug}_{profile}_uploaded.json"
+    status["5"] = "DONE" if uploaded.exists() else "MISSING"
 
     return status
 
 
-def prompt_yes_no(prompt: str, default_yes: bool = True) -> bool:
+def prompt_yes_no(msg: str, default_yes=True) -> bool:
     default = "Y/n" if default_yes else "y/N"
     while True:
-        ans = input(f"{prompt} [{default}]: ").strip().lower()
+        ans = input(f"{msg} [{default}]: ").strip().lower()
         if not ans:
             return default_yes
-        if ans in {"y", "yes"}:
+        if ans in ("y", "yes"):
             return True
-        if ans in {"n", "no"}:
+        if ans in ("n", "no"):
             return False
         print("Please answer y or n.")
 
@@ -125,207 +109,151 @@ def run(cmd: list[str], section: str) -> float:
     log(section, " ".join(cmd), BLUE)
     t0 = time.perf_counter()
     subprocess.run(cmd, check=True)
-    t1 = time.perf_counter()
-    return t1 - t0
+    return time.perf_counter() - t0
 
 
 def run_capture(cmd: list[str], section: str) -> tuple[float, str]:
-    """
-    Like run(), but captures stdout (for JSON from 5_upload.py).
-    """
     log(section, " ".join(cmd), BLUE)
     t0 = time.perf_counter()
     cp = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    t1 = time.perf_counter()
-    return t1 - t0, cp.stdout
+    return (time.perf_counter() - t0, cp.stdout)
 
 
 def read_offset(slug: str) -> float:
-    """
-    Read offset seconds from offsets/<slug>.txt if present, else 0.0
-    """
-    offset_file = OFFSETS_DIR / f"{slug}.txt"
-    if not offset_file.exists():
+    path = OFFSETS_DIR / f"{slug}.txt"
+    if not path.exists():
         return 0.0
     try:
-        value = float(offset_file.read_text().strip())
-        return value
-    except Exception:
+        return float(path.read_text().strip())
+    except:
         return 0.0
 
 
 def write_offset(slug: str, offset: float) -> None:
     OFFSETS_DIR.mkdir(parents=True, exist_ok=True)
-    (OFFSETS_DIR / f"{slug}.txt").write_text(f"{offset:.3f}\n")
+    (OFFSETS_DIR / f"{slug}.txt").write_text(f"{offset:.3f}")
 
 
-def run_step1_txt_mp3(slug: str, query: str | None) -> float:
-    """
-    Step 1: ensure mp3 + txt + meta exist.
-    """
-    mp3_path = MP3_DIR / f"{slug}.mp3"
-    txt_path = TXT_DIR / f"{slug}.txt"
-    meta_path = META_DIR / f"{slug}.json"
+# ---------------------------------------------------------
+# Step 1
+# ---------------------------------------------------------
+def run_step1(slug: str, query: str | None) -> float:
+    mp3 = MP3_DIR / f"{slug}.mp3"
+    txt = TXT_DIR / f"{slug}.txt"
+    meta = META_DIR / f"{slug}.json"
 
-    have_all = mp3_path.exists() and txt_path.exists() and meta_path.exists()
-    if have_all:
-        log("STEP1", f"txt/mp3/meta already exist for slug={slug}, skipping.", GREEN)
+    if mp3.exists() and txt.exists() and meta.exists():
+        log("STEP1", "Already have txt/mp3/meta — skipping.", GREEN)
         return 0.0
 
-    SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        sys.executable,
-        str(SCRIPTS_DIR / "1_txt_mp3.py"),
-    ]
+    cmd = [sys.executable, str(SCRIPTS_DIR / "1_txt_mp3.py"), "--slug", slug]
     if query:
         cmd += ["--query", query]
-    cmd += ["--slug", slug]
 
-    t = run(cmd, "STEP1")
-    return t
+    return run(cmd, "STEP1")
 
 
-def run_step2_stems(slug: str, profile: str, model: str, interactive: bool = True) -> float:
-    """
-    Step 2: Run Demucs + mix UI + render mix.
+# ---------------------------------------------------------
+# Step 2  (Demucs → 2_stems mix → render)
+# ---------------------------------------------------------
+def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
+    mp3 = MP3_DIR / f"{slug}.mp3"
+    mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
 
-    IMPORTANT:
-    - Karaoke needs 6-stem Demucs (bass/drums/guitar/piano/other/vocals), so we
-      force model=htdemucs_6s for that profile to match 2_stems mix configs.
-    - Simple profiles can still use 2-stem for speed.
-    """
-    mp3_path = MP3_DIR / f"{slug}.mp3"
-    mix_config = MIXES_DIR / f"{slug}_{profile}.json"
-    mix_audio = MIXES_DIR / f"{slug}_{profile}.wav"
-
-    # ---- NEW: quick bypass if user wants 100% original full mix ----
-    # If they say yes, we just convert mp3 -> wav and skip Demucs + 2_stems.
+    # Ask if user wants to bypass full separation.
     if interactive:
-        use_bypass = prompt_yes_no(
-            "Use original full mix (100% all tracks, skip Demucs stem separation)?",
-            False,
-        )
+        bypass = prompt_yes_no("Use original mix (100% all tracks, skip Demucs)?", False)
     else:
-        use_bypass = False
+        bypass = False
 
-    if use_bypass:
+    if bypass:
         MIXES_DIR.mkdir(parents=True, exist_ok=True)
-        if mix_audio.exists():
-            log("STEP2", f"Bypass mix already exists at {mix_audio}", GREEN)
+        if mix_wav.exists():
+            log("STEP2", f"Bypass: mix already exists at {mix_wav}", GREEN)
             return 0.0
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(mp3_path),
-            str(mix_audio),
-        ]
-        t_bypass = run(ffmpeg_cmd, "STEP2-BYPASS")
-        return t_bypass
-    # ---- END NEW BYPASS BLOCK ----
+        cmd = ["ffmpeg", "-y", "-i", str(mp3), str(mix_wav)]
+        return run(cmd, "STEP2-BYPASS")
 
-    # Decide effective Demucs model + whether to use two-stems
-    effective_model = model
+    # Otherwise, full Demucs separation.
     if profile == "karaoke":
-        if model != "htdemucs_6s":
-            log(
-                "STEP2",
-                f"Profile 'karaoke' detected — overriding Demucs model "
-                f"from '{model}' to 'htdemucs_6s' for 6-stem output.",
-                YELLOW,
-            )
         effective_model = "htdemucs_6s"
-        demucs_two_stems = False
+        two_stems = False
     else:
-        demucs_two_stems = True
+        effective_model = model
+        two_stems = True
 
     stems_root = BASE_DIR / "separated" / effective_model
     stems_dir = stems_root / slug
-    stems_exist = stems_dir.exists() and any(stems_dir.glob("*.wav"))
 
+    stems_exist = stems_dir.exists() and any(stems_dir.glob("*.wav"))
     if stems_exist:
-        reuse = prompt_yes_no("Stems exist for this slug. Reuse and skip separation?", True)
+        reuse = prompt_yes_no("Stems exist. Reuse?", True)
         if not reuse:
-            log("STEP2", "Will regenerate stems.", YELLOW)
             for p in stems_dir.glob("*.wav"):
                 try:
                     p.unlink()
-                except OSError:
+                except:
                     pass
             stems_exist = False
 
     if not stems_exist:
         # Run Demucs
-        demucs_cmd = [
-            sys.executable,
-            "-m",
-            "demucs",
-            "-n",
-            effective_model,
-        ]
-        if demucs_two_stems:
-            demucs_cmd += ["--two-stems", "vocals"]
+        cmd = [sys.executable, "-m", "demucs", "-n", effective_model, str(mp3)]
+        if two_stems:
+            cmd.insert(-1, "--two-stems")
+            cmd.insert(-1, "vocals")
             section = "STEP2-2STEM"
         else:
             section = "STEP2-6STEM"
-
-        demucs_cmd.append(str(mp3_path))
-        t_sep = run(demucs_cmd, section)
+        t_sep = run(cmd, section)
     else:
-        t_sep = 0.0
         log("STEP2", "Reusing existing stems.", GREEN)
+        t_sep = 0.0
 
     # Mix UI
-    mix_ui_cmd = [
+    cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "2_stems.py"),
         "--mp3",
-        str(mp3_path),
+        str(mp3),
         "--profile",
         profile,
         "--model",
         effective_model,
         "--mix-ui-only",
     ]
-
     if not interactive:
-        mix_ui_cmd.append("--non-interactive")
+        cmd.append("--non-interactive")
+    t_ui = run(cmd, "STEP2-MIXUI")
 
-    t_ui = run(mix_ui_cmd, "STEP2-MIXUI")
-
-    # Render mix
+    # Render WAV
     MIXES_DIR.mkdir(parents=True, exist_ok=True)
-    output_mix = MIXES_DIR / f"{slug}_{profile}.wav"
-    mix_render_cmd = [
+    cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "2_stems.py"),
         "--mp3",
-        str(mp3_path),
+        str(mp3),
         "--profile",
         profile,
         "--model",
         effective_model,
         "--render-only",
         "--output",
-        str(output_mix),
+        str(mix_wav),
     ]
-    t_render = run(mix_render_cmd, "STEP2-RENDER")
+    t_render = run(cmd, "STEP2-RENDER")
 
     return t_sep + t_ui + t_render
 
 
-def run_step3_timing(slug: str) -> float:
-    """
-    Step 3: timings.
-    - Prefer 3_auto_timing.py if present.
-    - Otherwise fall back to 3_timing.py.
-    """
-    mp3_path = MP3_DIR / f"{slug}.mp3"
-    txt_path = TXT_DIR / f"{slug}.txt"
-    timing_path = TIMINGS_DIR / f"{slug}.csv"
-    timing_path.parent.mkdir(parents=True, exist_ok=True)
-
+# ---------------------------------------------------------
+# Step 3  (auto-timing or manual timing)
+# ---------------------------------------------------------
+def run_step3(slug: str) -> float:
+    mp3 = MP3_DIR / f"{slug}.mp3"
+    txt = TXT_DIR / f"{slug}.txt"
     auto_script = SCRIPTS_DIR / "3_auto_timing.py"
+
     if auto_script.exists():
         cmd = [
             sys.executable,
@@ -333,35 +261,32 @@ def run_step3_timing(slug: str) -> float:
             "--slug",
             slug,
             "--mp3",
-            str(mp3_path),
+            str(mp3),
             "--txt",
-            str(txt_path),
+            str(txt),
         ]
-        # 3_auto_timing writes timings/<slug>.csv itself with canonical header.
-        section = "STEP3-AUTO"
-    else:
-        cmd = [
-            sys.executable,
-            str(SCRIPTS_DIR / "3_timing.py"),
-            "--txt",
-            str(txt_path),
-            "--audio",
-            str(mp3_path),
-            "--timings",
-            str(timing_path),
-        ]
-        section = "STEP3"
+        return run(cmd, "STEP3-AUTO")
 
-    t = run(cmd, section)
-    return t
+    cmd = [
+        sys.executable,
+        str(SCRIPTS_DIR / "3_timing.py"),
+        "--txt",
+        str(txt),
+        "--audio",
+        str(mp3),
+        "--timings",
+        str(TIMINGS_DIR / f"{slug}.csv"),
+    ]
+    return run(cmd, "STEP3")
 
 
-def run_step4_mp4(slug: str, profile: str, offset: float, force_mp4: bool) -> float:
+# ---------------------------------------------------------
+# Step 4  (mp4)
+# ---------------------------------------------------------
+def run_step4(slug: str, profile: str, offset: float, force: bool, called_from_master=True) -> float:
     """
-    Step 4: generate mp4 via 4_mp4.py.
-
-    If force_mp4 is True, passes --force through so 4_mp4.py regenerates
-    even when an output mp4 already exists.
+    If called_from_master=True, pass --no-post-ui so 4_mp4 won't show the
+    upload menu or file-open menu. Master will handle upload.
     """
     cmd = [
         sys.executable,
@@ -373,29 +298,24 @@ def run_step4_mp4(slug: str, profile: str, offset: float, force_mp4: bool) -> fl
         "--offset",
         str(offset),
     ]
-    if force_mp4:
+    if force:
         cmd.append("--force")
+    if called_from_master:
+        cmd.append("--no-post-ui")
 
-    try:
-        t = run(cmd, "STEP4")
-        return t
-    except subprocess.CalledProcessError as e:
-        log(
-            "STEP4",
-            f"mp4 generation failed for slug={slug}, profile={profile} "
-            f"with return code {e.returncode}",
-            RED,
-        )
-        raise
+    return run(cmd, "STEP4")
 
 
-def run_step5_upload(slug: str, profile: str, offset: float) -> float:
-    """
-    Step 5: Upload to YouTube using scripts/5_upload.py.
+# ---------------------------------------------------------
+# Step 5  (upload)
+# ---------------------------------------------------------
+def run_step5(slug: str, profile: str, offset: float) -> float:
+    # If upload metadata already exists, skip
+    uploaded_json = META_DIR / f"{slug}_{profile}_uploaded.json"
+    if uploaded_json.exists():
+        log("STEP5", "Upload already done earlier — skipping.", GREEN)
+        return 0.0
 
-    This variant assumes 5_upload.py takes slug/profile/offset and
-    emits JSON on stdout with e.g. {"video_url": "..."}.
-    """
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "5_upload.py"),
@@ -405,226 +325,171 @@ def run_step5_upload(slug: str, profile: str, offset: float) -> float:
         profile,
         "--offset",
         str(offset),
+        "--privacy",
+        "private",
     ]
-    t, out = run_capture(cmd, "STEP5")
-    out = out.strip()
-    if out:
-        try:
-            data = json.loads(out)
-            video_url = data.get("video_url") or data.get("url")
-            if video_url:
-                log("STEP5", f"Uploaded to YouTube: {video_url}", GREEN)
-            else:
-                log("STEP5", f"Upload result: {data}", GREEN)
-        except json.JSONDecodeError:
-            log("STEP5", f"Non-JSON output:\n{out}", YELLOW)
-    return t
+    return run(cmd, "STEP5")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Master orchestrator for Karaoke Time pipeline.")
+# ---------------------------------------------------------
+# Parse args
+# ---------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Master orchestrator for Karaoke Time pipeline.")
 
-    parser.add_argument(
-        "--slug",
-        type=str,
-        help="Song slug (default: inferred or derived from query).",
-    )
-    parser.add_argument(
-        "--query",
-        type=str,
-        help="Search query for YouTube (used only if step 1 runs, and for slug suggestion).",
-    )
-    parser.add_argument(
-        "--profile",
-        type=str,
-        default="karaoke",
-        help="Mix profile (e.g., karaoke, vocals_only, no_vocals, ...).",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="htdemucs",
-        help="Demucs model name (e.g., htdemucs, htdemucs_ft, htdemucs_6s).",
-    )
-    parser.add_argument(
-        "--offset",
-        type=float,
-        default=None,
-        help="Override audio/video offset in seconds (default: use offsets/<slug>.txt or 0).",
-    )
-    parser.add_argument(
-        "--steps",
-        type=str,
-        default=None,
-        help="Steps to run (e.g., 1,2,3,4,5 or 45). If omitted, you will be prompted.",
-    )
-    parser.add_argument(
-        "--skip-ui",
-        action="store_true",
-        help="Skip interactive mix UI for stems (step 2).",
-    )
-    parser.add_argument(
-        "--no-upload",
-        action="store_true",
-        help="Skip upload step 5 even if selected.",
-    )
-    parser.add_argument(
-        "--force-mp4",
-        action="store_true",
-        help="Force mp4 regeneration even if output already exists (passes --force to 4_mp4.py).",
-    )
-    return parser.parse_args()
+    p.add_argument("--slug", type=str)
+    p.add_argument("--query", type=str)
+    p.add_argument("--profile", type=str, default="karaoke")
+    p.add_argument("--model", type=str, default="htdemucs")
+    p.add_argument("--offset", type=float, default=None)
+    p.add_argument("--steps", type=str, help="E.g. 12345 or 45")
+    p.add_argument("--skip-ui", action="store_true")
+    p.add_argument("--no-upload", action="store_true")
+    p.add_argument("--force-mp4", action="store_true")
+
+    return p.parse_args()
 
 
+# ---------------------------------------------------------
+# Choose steps
+# ---------------------------------------------------------
 def choose_steps(status: dict[str, str]) -> list[int]:
-    """
-    Show current status and prompt user for steps to run.
-    """
-    print()
-    print(f"{BOLD}Pipeline status for slug={status.get('slug')}, profile={status.get('profile')}{RESET}")
+    slug = status["slug"]
+    profile = status["profile"]
 
-    print(f"[1] txt+mp3 generation (1_txt_mp3)           -> {status.get('1', 'UNKNOWN')}")
-    print(f"[2] stems/mix (Demucs + mix UI)             -> {status.get('2', 'UNKNOWN')}")
-    print(f"[3] timings CSV (3_timing/3_auto_timing)    -> {status.get('3', 'UNKNOWN')}")
-    print(f"[4] mp4 generation (4_mp4)                  -> {status.get('4', 'UNKNOWN')}")
-    print(f"[5] YouTube upload (5_upload)               -> {status.get('5', 'UNKNOWN')}")
+    print()
+    print(f"{BOLD}Pipeline status for slug={slug}, profile={profile}{RESET}")
+    print(f"[1] txt+mp3           -> {status['1']}")
+    print(f"[2] stems/mix         -> {status['2']}")
+    print(f"[3] timings           -> {status['3']}")
+    print(f"[4] mp4               -> {status['4']}")
+    print(f"[5] upload            -> {status['5']}")
     print()
 
-    # Suggested default: if txt/mp3+stems+timings exist, suggest 45 (mp4 + upload)
-    if status.get("1") == "DONE" and status.get("2") == "DONE" and status.get("3") == "DONE":
+    # Suggest defaults:
+    if status["1"] == "DONE" and status["2"] == "DONE" and status["3"] == "DONE":
         default = "45"
-    elif status.get("1") != "DONE":
+    elif status["1"] != "DONE":
         default = "1234"
     else:
         default = "234"
 
-    steps_str = input(
-        "Steps to run (1=txt/mp3,2=stems,3=timing,4=mp4,5=upload, 0=none, "
+    s = input(
+        "Steps to run (1=txt/mp3,2=stems,3=timing,4=mp4,5=upload,0=none, "
         f"ENTER for suggested={default}): "
     ).strip()
 
-    if not steps_str:
-        steps_str = default
+    if not s:
+        s = default
 
-    if steps_str == "0":
+    if s == "0":
         return []
 
-    steps: list[int] = []
-    for ch in steps_str:
+    out = []
+    for ch in s:
         if ch.isdigit():
-            step = int(ch)
-            if 1 <= step <= 5 and step not in steps:
-                steps.append(step)
-    return steps
+            i = int(ch)
+            if 1 <= i <= 5 and i not in out:
+                out.append(i)
+
+    return out
 
 
-def main() -> None:
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+def main():
     args = parse_args()
 
-    # ----- Slug selection (with "reuse previous slug?" behavior) -----
+    # SLUG SELECTION
     if args.slug:
         slug = slugify(args.slug)
-        log("SLUG", f'Using explicit slug: "{slug}"', CYAN)
+        log("SLUG", f'Using slug="{slug}"', CYAN)
     elif args.query:
-        # New slug suggestion from query
-        suggested_slug = slugify(args.query)
-        latest_slug = detect_latest_slug()
-
-        if latest_slug and latest_slug != suggested_slug:
+        new_slug = slugify(args.query)
+        old_slug = detect_latest_slug()
+        if old_slug and old_slug != new_slug:
             ans = input(
-                f'Previous slug "{latest_slug}" found. '
-                f'Use that instead of new slug "{suggested_slug}" from query? [y/N]: '
+                f'Previous slug "{old_slug}" found. Use that instead of new "{new_slug}"? [y/N]: '
             ).strip().lower()
-            if ans in {"y", "yes"}:
-                slug = latest_slug
-                log("SLUG", f'Using previous slug: "{slug}"', CYAN)
-            else:
-                slug = suggested_slug
-                log("SLUG", f'Using new slug from query: "{slug}"', CYAN)
+            slug = old_slug if ans == "y" else new_slug
         else:
-            slug = suggested_slug
-            log("SLUG", f'Using slug from query: "{slug}"', CYAN)
+            slug = new_slug
+        log("SLUG", f'Using slug="{slug}"', CYAN)
     else:
         slug = detect_latest_slug()
         if not slug:
-            print(f"{RED}No slug provided, no query, and could not infer latest from meta/.{RESET}")
+            print(f"{RED}No slug provided, no query, no prior metadata. Exiting.{RESET}")
             sys.exit(1)
-        log("SLUG", f'Inferred latest slug: "{slug}"', CYAN)
+        log("SLUG", f'Inferred slug="{slug}"', CYAN)
 
     profile = args.profile
-    model = args.model
-
-    # Step 1 may use a YouTube search query to fetch txt/mp3/meta
     query = args.query
 
-    # Offset: CLI overrides stored offset
+    # OFFSET
     if args.offset is not None:
         offset = args.offset
-        log("OFFSET", f"Using CLI override offset={offset:+.3f}s", YELLOW)
         write_offset(slug, offset)
+        log("OFFSET", f"Using CLI offset={offset:+.3f}s", YELLOW)
     else:
         offset = read_offset(slug)
         log("OFFSET", f"Using stored offset={offset:+.3f}s", CYAN)
 
-    # Build status and choose steps
+    # STATUS + STEP SELECTION
     status = detect_step_status(slug, profile)
-    status["slug"] = slug
-    status["profile"] = profile
 
     if args.steps:
         steps = []
         for ch in args.steps:
             if ch.isdigit():
-                step = int(ch)
-                if 1 <= step <= 5 and step not in steps:
-                    steps.append(step)
-        log("MASTER", f"Running requested steps: {steps}", CYAN)
+                i = int(ch)
+                if 1 <= i <= 5 and i not in steps:
+                    steps.append(i)
+        log("MASTER", f"Running requested steps: {steps}")
     else:
         steps = choose_steps(status)
-        log("MASTER", f"Running steps: {steps}", CYAN)
+        log("MASTER", f"Running steps: {steps}")
 
-    total_t = 0.0
+    # RUN
     t1 = t2 = t3 = t4 = t5 = 0.0
 
     if 1 in steps:
-        t1 = run_step1_txt_mp3(slug, query)
-        total_t += t1
+        t1 = run_step1(slug, query)
 
     if 2 in steps:
-        t2 = run_step2_stems(slug, profile, model, interactive=not args.skip_ui)
-        total_t += t2
+        t2 = run_step2(slug, profile, args.model, interactive=not args.skip_ui)
 
     if 3 in steps:
-        t3 = run_step3_timing(slug)
-        total_t += t3
+        t3 = run_step3(slug)
 
     if 4 in steps:
-        t4 = run_step4_mp4(slug, profile, offset, force_mp4=args.force_mp4)
-        total_t += t4
+        t4 = run_step4(slug, profile, offset, force=args.force_mp4, called_from_master=True)
 
     if 5 in steps and not args.no_upload:
-        t5 = run_step5_upload(slug, profile, offset)
-        total_t += t5
+        t5 = run_step5(slug, profile, offset)
     elif 5 in steps and args.no_upload:
-        log("STEP5", "Upload step requested but --no-upload is set; skipping.", YELLOW)
+        log("STEP5", "Upload requested but --no-upload was set; skipping.", YELLOW)
 
-    if total_t > 0:
+    # SUMMARY
+    total = t1 + t2 + t3 + t4 + t5
+    if total > 0:
         print()
-        print(f"{BOLD}{BLUE}================= PIPELINE TIMINGS ================={RESET}")
+        print(f"{BOLD}{BLUE}======== PIPELINE SUMMARY ========{RESET}")
         if t1:
-            print(f"{CYAN}Step 1 txt/mp3:  {fmt_secs_mmss(t1)}{RESET}")
+            print(f"Step1 txt/mp3:  {fmt_secs(t1)}")
         if t2:
-            print(f"{CYAN}Step 2 stems:    {fmt_secs_mmss(t2)}{RESET}")
+            print(f"Step2 stems:    {fmt_secs(t2)}")
         if t3:
-            print(f"{CYAN}Step 3 timing:   {fmt_secs_mmss(t3)}{RESET}")
+            print(f"Step3 timing:   {fmt_secs(t3)}")
         if t4:
-            print(f"{CYAN}Step 4 mp4:      {fmt_secs_mmss(t4)}{RESET}")
+            print(f"Step4 mp4:      {fmt_secs(t4)}")
         if t5:
-            print(f"{CYAN}Step 5 upload:   {fmt_secs_mmss(t5)}{RESET}")
-        print(f"{BOLD}{GREEN}Total pipeline: {fmt_secs_mmss(total_t)}{RESET}")
-        print(f"{BOLD}{BLUE}====================================================={RESET}")
+            print(f"Step5 upload:   {fmt_secs(t5)}")
+        print(f"{GREEN}Total time:     {fmt_secs(total)}{RESET}")
+        print(f"{BOLD}{BLUE}===============================\n{RESET}")
 
 
 if __name__ == "__main__":
     main()
+
 # end of 0_master.py
