@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# scripts/1_txt_mp3.py
+# Hybrid Mode:
+#   - Interactive UI by default
+#   - Headless mode when --no-ui is provided
+#   - Intended to work cleanly with 0_master.py in both modes
+
 import argparse
 import json
 import os
@@ -6,10 +12,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
 
+# ----- Colors -----
 RESET = "\033[0m"
 BOLD = "\033[1m"
 CYAN = "\033[36m"
@@ -17,77 +25,65 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 BLUE = "\033[34m"
+MAGENTA = "\033[35m"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = BASE_DIR / "scripts"
 TXT_DIR = BASE_DIR / "txts"
 MP3_DIR = BASE_DIR / "mp3s"
 META_DIR = BASE_DIR / "meta"
 
 PLACEHOLDER_LYRICS = """Lyrics not found
-We tried Genius, 
-Musixmatch, 
-and Youtube
+We tried Genius,
+Musixmatch,
+and YouTube
 But we still found
 0 results for lyrics
 Sorry, try again
-But with a different query"""
+But with a different query
+"""
 
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
-    print(f"{color}[{section}]{RESET} {msg}")
+    ts = time.strftime("%H:%M:%S")
+    print(f"{color}[{ts}] [{section}]{RESET} {msg}")
 
 
 def slugify(text: str) -> str:
     import re
-
     base = text.strip().lower()
     base = re.sub(r"\s+", "_", base)
     base = re.sub(r"[^\w\-]+", "", base)
     return base or "song"
 
 
-# ---------------------------------------------------------------------
-# ENV + API KEY LOADING
-# ---------------------------------------------------------------------
-def load_env() -> tuple[str, str]:
+# -------- ENV LOADING (Genius / Musixmatch) --------
+def load_env() -> Tuple[str, str]:
     env_path = BASE_DIR / ".env"
     if env_path.exists():
-        log("ENV", f"Loading .env from {env_path}", CYAN)
         load_dotenv(env_path)
-    else:
-        log("ENV", ".env not found, relying on process environment", YELLOW)
-
     genius_token = os.getenv("GENIUS_ACCESS_TOKEN") or os.getenv("GENIUS_TOKEN")
     mm_api_key = os.getenv("MUSIXMATCH_API_KEY") or os.getenv("MM_API")
-
-    if not genius_token:
-        log("ENV", "GENIUS_ACCESS_TOKEN (or GENIUS_TOKEN) is not set.", RED)
-    if not mm_api_key:
-        log("ENV", "MUSIXMATCH_API_KEY (or MM_API) is not set.", RED)
-
     if not genius_token or not mm_api_key:
-        raise SystemExit("Missing required API keys in environment.")
-
+        raise SystemExit(
+            f"{RED}Missing GENIUS_ACCESS_TOKEN or MUSIXMATCH_API_KEY in env.{RESET}"
+        )
     return genius_token, mm_api_key
 
 
-# ---------------------------------------------------------------------
-# GENIUS SEARCH
-# ---------------------------------------------------------------------
-def search_genius(query: str, token: str) -> tuple[str | None, str | None, int | None]:
+# -------- GENIUS SEARCH --------
+def search_genius(query: str, token: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     url = "https://api.genius.com/search"
     headers = {"Authorization": f"Bearer {token}"}
     params = {"q": query}
-    t0 = time.perf_counter()
+
     try:
+        t0 = time.perf_counter()
         resp = requests.get(url, headers=headers, params=params, timeout=10)
         resp.raise_for_status()
-        data = resp.json()
-        hits = data.get("response", {}).get("hits", [])
+        hits = resp.json().get("response", {}).get("hits", [])
         if not hits:
-            log("GENIUS", f'No hits for "{query}"', YELLOW)
             return None, None, None
+
         result = hits[0]["result"]
         artist = result.get("primary_artist", {}).get("name")
         title = result.get("title")
@@ -95,17 +91,20 @@ def search_genius(query: str, token: str) -> tuple[str | None, str | None, int |
         t1 = time.perf_counter()
         log("GENIUS", f'Matched: "{artist} - {title}" in {t1 - t0:.2f}s', GREEN)
         return artist, title, gid
+
     except Exception as e:
-        t1 = time.perf_counter()
-        log("GENIUS", f"Search failed for \"{query}\" in {t1 - t0:.2f}s: {e}", RED)
+        log("GENIUS", f"Genius search failed: {e}", RED)
         return None, None, None
 
 
-# ---------------------------------------------------------------------
-# MUSIXMATCH
-# ---------------------------------------------------------------------
-def fetch_lyrics_musixmatch(query: str, artist: str | None, title: str | None, api_key: str) -> tuple[str | None, dict]:
-    base_params = {
+# -------- MUSIXMATCH SEARCH --------
+def fetch_lyrics_musixmatch(
+    query: str,
+    artist: Optional[str],
+    title: Optional[str],
+    api_key: str,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    params = {
         "apikey": api_key,
         "f_has_lyrics": 1,
         "s_track_rating": "desc",
@@ -114,255 +113,362 @@ def fetch_lyrics_musixmatch(query: str, artist: str | None, title: str | None, a
 
     if artist or title:
         if title:
-            base_params["q_track"] = title
+            params["q_track"] = title
         if artist:
-            base_params["q_artist"] = artist
-        log("MM", f'Searching Musixmatch for: "{artist or ""} - {title or ""}"', CYAN)
+            params["q_artist"] = artist
     else:
-        base_params["q"] = query
-        log("MM", f'Searching Musixmatch for: "{query}"', CYAN)
+        params["q"] = query
 
-    search_url = "https://api.musixmatch.com/ws/1.1/track.search"
+    # Search
     try:
-        r = requests.get(search_url, params=base_params, timeout=10)
+        search_url = "https://api.musixmatch.com/ws/1.1/track.search"
+        r = requests.get(search_url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        log("MM", f"track.search failed: {e}", RED)
         return None, {"musixmatch_error": str(e)}
 
-    body = data.get("message", {}).get("body", {})
-    track_list = body.get("track_list", [])
+    track_list = data.get("message", {}).get("body", {}).get("track_list", [])
     if not track_list:
-        log("MM", "track.search returned no results.", YELLOW)
         return None, {"musixmatch_status": "no_results"}
 
-    track = track_list[0].get("track", {})
+    track = track_list[0]["track"]
     track_id = track.get("track_id")
     mm_artist = track.get("artist_name")
     mm_title = track.get("track_name")
 
     if not track_id:
-        log("MM", "No track_id in first result.", YELLOW)
         return None, {"musixmatch_status": "no_track_id"}
 
-    log("MM", f'Chosen track: "{mm_artist} - {mm_title}" (track_id={track_id})', GREEN)
-
-    lyrics_url = "https://api.musixmatch.com/ws/1.1/track.lyrics.get"
+    # Fetch lyrics
     try:
+        lyrics_url = "https://api.musixmatch.com/ws/1.1/track.lyrics.get"
         lr = requests.get(lyrics_url, params={"track_id": track_id, "apikey": api_key}, timeout=10)
         lr.raise_for_status()
-        ldata = lr.json()
+        lyrics_data = lr.json()
     except Exception as e:
-        log("MM", f"track.lyrics.get failed: {e}", RED)
-        return None, {"musixmatch_status": "lyrics_error", "musixmatch_error": str(e)}
+        return None, {"musixmatch_status": "lyrics_error", "error": str(e)}
 
-    lbody = ldata.get("message", {}).get("body", {})
-    lyrics_obj = lbody.get("lyrics", {})
+    lyrics_obj = lyrics_data.get("message", {}).get("body", {}).get("lyrics", {})
     lyrics_text = lyrics_obj.get("lyrics_body")
     if not lyrics_text:
-        log("MM", "Lyrics body missing in response.", YELLOW)
         return None, {"musixmatch_status": "no_lyrics"}
 
-    # Clean Musixmatch footer
-    if "******* This Lyrics is NOT for Commercial use *******" in lyrics_text:
-        lyrics_text = lyrics_text.split("*******", 1)[0].strip()
+    footer = "******* This Lyrics is NOT for Commercial use *******"
+    if footer in lyrics_text:
+        lyrics_text = lyrics_text.split(footer)[0].strip()
 
-    meta = {
-        "artist": mm_artist or artist or "",
-        "title": mm_title or title or query,
+    return lyrics_text, {
+        "artist": mm_artist,
+        "title": mm_title,
         "musixmatch_track_id": track_id,
     }
-    return lyrics_text, meta
 
 
-# ---------------------------------------------------------------------
-# YouTube helpers
-# ---------------------------------------------------------------------
-def youtube_search_first(query: str) -> tuple[str | None, str | None, str | None]:
+# -------- YOUTUBE SEARCH --------
+def youtube_search_top(query: str, limit: int = 10) -> List[Dict[str, Any]]:
     try:
-        out = subprocess.check_output(["yt-dlp", "-j", f"ytsearch1:{query}"], text=True)
-        lines = [ln for ln in out.splitlines() if ln.strip()]
-        if not lines:
-            return None, None, None
-        data = json.loads(lines[-1])
-        title = data.get("title")
-        uploader = data.get("uploader")
-        url = data.get("webpage_url")
-        return title, uploader, url
-    except Exception as e:
-        log("YT", f"YouTube search failed for \"{query}\": {e}", RED)
-        return None, None, None
+        cmd = ["yt-dlp", "-j", f"ytsearch{limit}:{query}"]
+        out = subprocess.check_output(cmd, text=True)
+    except Exception:
+        return []
+    results = []
+    for line in out.splitlines():
+        try:
+            data = json.loads(line)
+            if "title" in data and "webpage_url" in data:
+                results.append(data)
+        except:
+            pass
+    return results[:limit]
 
 
-def youtube_download_mp3(search_str: str, slug: str) -> tuple[str | None, str | None]:
+def fmt_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "?"
+    seconds = int(seconds)
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
+
+
+def choose_youtube_result(results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not results:
+        return None
+
+    print(f"\n{BOLD}{CYAN}Top YouTube results:{RESET}")
+    for idx, it in enumerate(results, 1):
+        title = it.get("title") or "(no title)"
+        uploader = it.get("uploader") or "unknown"
+        dur = fmt_duration(it.get("duration"))
+        print(f"  {BOLD}{idx}. {GREEN}{title}{RESET} {YELLOW}({uploader}, {dur}){RESET}")
+
+    raw = input(f"{BOLD}{MAGENTA}Pick result # [1–{len(results)}, ENTER=1]: {RESET}").strip()
+    if not raw:
+        choice = 1
+    else:
+        try:
+            choice = int(raw)
+            if not (1 <= choice <= len(results)):
+                choice = 1
+        except:
+            choice = 1
+
+    selected = results[choice - 1]
+    log("YT", f'Selected: "{selected.get("title")}"', GREEN)
+    return selected
+
+
+def youtube_download_mp3_from_url(url: str, slug: str) -> Tuple[Optional[str], Optional[str]]:
     MP3_DIR.mkdir(parents=True, exist_ok=True)
     out_template = str(MP3_DIR / f"{slug}.%(ext)s")
 
-    log("YT", f'Searching/downloading audio for "{search_str}" as slug "{slug}"', CYAN)
     try:
-        cmd = [
-            "yt-dlp",
-            "-x",
-            "--audio-format",
-            "mp3",
-            "-o",
-            out_template,
-            f"ytsearch1:{search_str}",
-        ]
+        cmd = ["yt-dlp", "-x", "--audio-format", "mp3", "-o", out_template, url]
         subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        log("YT", f"yt-dlp audio download failed (exit {e.returncode}).", RED)
+    except subprocess.CalledProcessError:
         return None, None
 
-    yt_title, yt_uploader, _ = youtube_search_first(search_str)
-    return yt_title, yt_uploader
+    try:
+        meta_out = subprocess.check_output(["yt-dlp", "-j", url], text=True)
+        data = json.loads([ln for ln in meta_out.splitlines() if ln.strip()][-1])
+        return data.get("title"), data.get("uploader")
+    except:
+        return None, None
 
 
-# ---------------------------------------------------------------------
-# Fallback chain
-# ---------------------------------------------------------------------
-def fetch_lyrics_with_fallbacks(query: str, genius_artist: str | None, genius_title: str | None, mm_api_key: str):
+# -------- LYRICS FALLBACK --------
+def fetch_lyrics_with_fallbacks(
+    query: str,
+    genius_artist: Optional[str],
+    genius_title: Optional[str],
+    mm_api_key: str,
+    yt_title: Optional[str],
+    yt_uploader: Optional[str],
+    yt_url: Optional[str],
+) -> Tuple[str, Dict[str, Any]]:
+
+    # 1) Musixmatch with Genius hints
     lyrics, meta = fetch_lyrics_musixmatch(query, genius_artist, genius_title, mm_api_key)
     if lyrics and lyrics.strip():
-        meta.setdefault("artist", genius_artist or meta.get("artist") or "")
-        meta.setdefault("title", genius_title or meta.get("title") or query)
-        meta["lyrics_source"] = "musixmatch_genius"
-        return lyrics, meta
+        return lyrics, {
+            **meta,
+            "lyrics_source": "musixmatch_genius",
+            "youtube_title": yt_title,
+            "youtube_uploader": yt_uploader,
+            "youtube_url": yt_url,
+        }
 
-    yt_title, yt_uploader, yt_url = youtube_search_first(query)
-    yt_meta = {
+    # 2) YouTube-based hints
+    candidates: List[Tuple[Optional[str], Optional[str]]] = []
+    if yt_title and " - " in yt_title:
+        a, b = yt_title.split(" - ", 1)
+        candidates.append((a.strip(), b.strip()))
+    elif yt_title:
+        candidates.append((yt_uploader, yt_title))
+
+    for a, t in candidates:
+        lyrics2, meta2 = fetch_lyrics_musixmatch(query, a, t, mm_api_key)
+        if lyrics2 and lyrics2.strip():
+            return lyrics2, {
+                **meta2,
+                "lyrics_source": "musixmatch_youtube",
+                "youtube_title": yt_title,
+                "youtube_uploader": yt_uploader,
+                "youtube_url": yt_url,
+            }
+
+    # 3) Placeholder
+    return PLACEHOLDER_LYRICS, {
+        "artist": genius_artist or yt_uploader or "",
+        "title": genius_title or yt_title or query,
+        "lyrics_source": "placeholder",
         "youtube_title": yt_title,
         "youtube_uploader": yt_uploader,
         "youtube_url": yt_url,
     }
 
-    candidates = []
-    if yt_title:
-        if " - " in yt_title:
-            a, b = yt_title.split(" - ", 1)
-            candidates.append((a.strip(), b.strip()))
-            candidates.append((b.strip(), a.strip()))
-        else:
-            candidates.append((yt_uploader or None, yt_title))
-    elif yt_uploader:
-        candidates.append((yt_uploader, query))
 
-    for cand_artist, cand_title in candidates:
-        lyrics2, meta2 = fetch_lyrics_musixmatch(query, cand_artist, cand_title, mm_api_key)
-        if lyrics2 and lyrics2.strip():
-            meta2.update(yt_meta)
-            meta2.setdefault("artist", cand_artist or meta2.get("artist") or "")
-            meta2.setdefault("title", cand_title or meta2.get("title") or query)
-            meta2["lyrics_source"] = "musixmatch_youtube"
-            return lyrics2, meta2
+# -------- CLI ARGUMENTS --------
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Hybrid txt+mp3 generator")
 
-    final_artist = genius_artist or yt_uploader or ""
-    final_title = genius_title or yt_title or query
-
-    meta = {
-        "artist": final_artist,
-        "title": final_title,
-        "lyrics_source": "placeholder",
-        "query": query,
-    }
-    meta.update(yt_meta)
-
-    return PLACEHOLDER_LYRICS, meta
+    # Hybrid mode:
+    #   * positional query triggers interactive mode
+    #   * flags allow headless mode
+    p.add_argument("query", nargs="*", help="Search query words (interactive mode)")
+    p.add_argument("--query", dest="flag_query", nargs="+", help="Search query (headless)")
+    p.add_argument("--slug", help="Slug (headless only)")
+    p.add_argument("--no-ui", action="store_true", help="Run in headless mode")
+    return p.parse_args(argv)
 
 
-# ---------------------------------------------------------------------
-# UPDATED ARGPARSE (supports --slug and --query)
-# ---------------------------------------------------------------------
-def parse_args():
-    p = argparse.ArgumentParser(description="Generate txt+mp3 from query via Genius/Musixmatch/YouTube.")
+# -------- MAIN --------
+def main(argv=None):
+    args = parse_args(argv or sys.argv[1:])
 
-    p.add_argument("--slug", type=str, help="Manual slug override")
-    p.add_argument("--query", type=str, help="Song search query (YouTube + lyrics APIs)")
+    # Determine mode
+    headless = args.no_ui
 
-    # Legacy compatibility: if user runs:
-    # python3 1_txt_mp3.py foo bar baz
-    # we absorb those tokens as query.
-    p.add_argument("query_tokens", nargs="*", help="Legacy positional query words")
+    # HEADLESS MODE REQUIRES BOTH --slug AND --query
+    if headless:
+        if not args.slug or not args.flag_query:
+            raise SystemExit(
+                f"{RED}--no-ui requires --slug and --query flags.{RESET}"
+            )
 
-    return p.parse_args()
-
-
-# ---------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------
-def main():
-    args = parse_args()
-
-    # Resolve final query
-    if args.query:
-        query = args.query.strip()
-    elif args.query_tokens:
-        query = " ".join(args.query_tokens).strip()
-    else:
-        print("ERROR: you must provide --query or positional query tokens.", file=sys.stderr)
-        sys.exit(1)
-
-    # Resolve slug
-    if args.slug:
         slug = slugify(args.slug)
-    else:
-        slug = slugify(query)
+        raw_query = " ".join(args.flag_query).strip()
 
-    log("MODE", f'txt+mp3 generation for "{query}"', CYAN)
-    log("SLUG", f'Using slug "{slug}"', GREEN)
+        TXT_DIR.mkdir(parents=True, exist_ok=True)
+        MP3_DIR.mkdir(parents=True, exist_ok=True)
+        META_DIR.mkdir(parents=True, exist_ok=True)
 
+        # Search YouTube non-interactively
+        results = youtube_search_top(raw_query, limit=5)
+        selected = results[0] if results else None
+
+        yt_title = selected.get("title") if selected else None
+        yt_uploader = selected.get("uploader") if selected else None
+        yt_url = selected.get("webpage_url") if selected else None
+
+        # Lyrics: still use Genius/Musixmatch
+        genius_token, mm_api_key = load_env()
+        g_artist, g_title, g_id = search_genius(raw_query, genius_token)
+
+        lyrics_text, lyrics_meta = fetch_lyrics_with_fallbacks(
+            raw_query,
+            g_artist,
+            g_title,
+            mm_api_key,
+            yt_title,
+            yt_uploader,
+            yt_url,
+        )
+
+        # Download MP3
+        if yt_url:
+            dl_title, dl_uploader = youtube_download_mp3_from_url(yt_url, slug)
+
+        # Write TXT
+        txt_path = TXT_DIR / f"{slug}.txt"
+        txt_path.write_text(lyrics_text, encoding="utf-8")
+
+        # Write META
+        meta = {
+            "slug": slug,
+            "query": raw_query,
+            "artist": lyrics_meta.get("artist") or "",
+            "title": lyrics_meta.get("title") or raw_query,
+            "lyrics_source": lyrics_meta.get("lyrics_source"),
+            "musixmatch_track_id": lyrics_meta.get("musixmatch_track_id"),
+            "genius_id": g_id,
+            "youtube_title": yt_title,
+            "youtube_uploader": yt_uploader,
+            "youtube_url": yt_url,
+        }
+        (META_DIR / f"{slug}.json").write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        return
+
+    # --------------------
+    # INTERACTIVE MODE
+    # --------------------
+    if not args.query:
+        raise SystemExit(f"{RED}Interactive mode requires a positional query.{RESET}")
+
+    raw_query = " ".join(args.query).strip()
     genius_token, mm_api_key = load_env()
 
     TXT_DIR.mkdir(parents=True, exist_ok=True)
     MP3_DIR.mkdir(parents=True, exist_ok=True)
     META_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Genius
-    g_artist, g_title, g_id = search_genius(query, genius_token)
+    # ---- YouTube top-10 + user selection ----
+    results = youtube_search_top(raw_query, limit=10)
+    selected = choose_youtube_result(results) if results else None
 
-    lyrics_text, lyrics_meta = fetch_lyrics_with_fallbacks(query, g_artist, g_title, mm_api_key)
+    yt_title = selected.get("title") if selected else None
+    yt_uploader = selected.get("uploader") if selected else None
+    yt_url = selected.get("webpage_url") if selected else None
 
-    final_artist = lyrics_meta.get("artist") or g_artist or ""
-    final_title = lyrics_meta.get("title") or g_title or query
+    # Summary
+    print(f"\n{BOLD}{GREEN}YouTube selection summary:{RESET}")
+    print(f"  Query:    {YELLOW}{raw_query}{RESET}")
+    print(f"  Title:    {CYAN}{yt_title}{RESET}")
+    print(f"  Uploader: {CYAN}{yt_uploader}{RESET}")
+    print(f"  URL:      {BLUE}{yt_url}{RESET}")
 
-    # ALWAYS compute slug = final_title for metadata consistency
-    # but do NOT override manual slug
-    title_slug = slugify(final_title)
-    if not args.slug:
-        slug = title_slug
+    # ---- Slug suggestion ----
+    suggested_slug = slugify(yt_title or raw_query)
+    user_slug = input(
+        f"{BOLD}{MAGENTA}Suggested slug{RESET} "
+        f"[{GREEN}{suggested_slug}{RESET}] "
+        f"(ENTER to accept): "
+    ).strip()
 
-    log("SLUG", f'Final resolved slug: "{slug}"', CYAN)
+    slug = slugify(user_slug) if user_slug else suggested_slug
 
     txt_path = TXT_DIR / f"{slug}.txt"
     meta_path = META_DIR / f"{slug}.json"
     mp3_path = MP3_DIR / f"{slug}.mp3"
 
-    search_str = f"{final_artist} {final_title}".strip() or query
-    yt_title, yt_uploader = youtube_download_mp3(search_str, slug)
+    # ---- Confirm ----
+    print(f"\n{BOLD}{CYAN}Final selection:{RESET}")
+    print(f"  Slug:  {MAGENTA}{slug}{RESET}")
+    ans = input(f"{BOLD}{YELLOW}Proceed? [Y/n]: {RESET}").strip().lower()
+    if ans not in ("", "y", "yes"):
+        log("ABORT", "User cancelled.", RED)
+        return
 
+    # ---- Genius ----
+    g_artist, g_title, g_id = search_genius(raw_query, genius_token)
+
+    # ---- Lyrics ----
+    lyrics_text, lyrics_meta = fetch_lyrics_with_fallbacks(
+        raw_query,
+        g_artist,
+        g_title,
+        mm_api_key,
+        yt_title,
+        yt_uploader,
+        yt_url,
+    )
+
+    # ---- Download mp3 ----
+    if yt_url:
+        dl_title, dl_uploader = youtube_download_mp3_from_url(yt_url, slug)
+
+    # ---- Write TXT ----
     txt_path.write_text(lyrics_text, encoding="utf-8")
-    log("TXT", f"Wrote {txt_path}", GREEN)
+    log("TXT", f"Saved lyrics to {txt_path}", GREEN)
 
+    # ---- Write META ----
     meta = {
         "slug": slug,
-        "query": query,
-        "artist": final_artist,
-        "title": final_title,
-        "genius_id": g_id,
-        "musixmatch_track_id": lyrics_meta.get("musixmatch_track_id"),
+        "query": raw_query,
+        "artist": lyrics_meta.get("artist"),
+        "title": lyrics_meta.get("title"),
         "lyrics_source": lyrics_meta.get("lyrics_source"),
-        "youtube_title": lyrics_meta.get("youtube_title") or yt_title,
-        "youtube_uploader": lyrics_meta.get("youtube_uploader") or yt_uploader,
+        "musixmatch_track_id": lyrics_meta.get("musixmatch_track_id"),
+        "genius_id": g_id,
+        "youtube_title": yt_title,
+        "youtube_uploader": yt_uploader,
+        "youtube_url": yt_url,
     }
+    meta_path.write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    log("META", f"Wrote metadata to {meta_path}", GREEN)
 
-    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-    log("META", f"Wrote {meta_path}", GREEN)
-
-    if mp3_path.exists():
-        log("MP3", f"Audio mp3 at {mp3_path}", GREEN)
-    else:
-        log("MP3", f"Expected mp3 at {mp3_path} not found", RED)
+    print(f"\n{BOLD}{GREEN}Done.{RESET}")
+    print(f"TXT:  {txt_path}")
+    print(f"MP3:  {mp3_path}")
+    print(f"META: {meta_path}")
 
 
 if __name__ == "__main__":
