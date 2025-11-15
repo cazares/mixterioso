@@ -1,20 +1,41 @@
 #!/usr/bin/env python3
 # scripts/5_upload.py
 #
-# Unified YouTube upload (private by default).
-# Used by both 0_master and 4_mp4 UI.
+# Upload a video to YouTube via the official YouTube Data API.
+#
+# - Requires OAuth client secrets (NOT just an API key).
+# - Looks for client secrets at:
+#       $YOUTUBE_CLIENT_SECRETS_JSON   (if set)
+#       ./client_secret.json           (fallback)
+# - Stores OAuth tokens in youtube_token.json next to client_secret.json
+#
+# CLI:
+#   --file          MP4 path (required)
+#   --title         Full YouTube title (optional; defaults to filename stem)
+#   --description   Description (optional; default "")
+#   --tags          Comma-separated tags (optional)
+#   --category-id   YouTube categoryId (default "10" = Music)
+#   --privacy       public|unlisted|private (default private)
+#   --made-for-kids mark video as made for kids (default False)
+#   --thumb-from-sec  time (sec) to capture thumbnail frame (default 0.5)
+#   --no-thumbnail    skip thumbnail upload
+#
+# Extra (for master receipts – OPTIONAL):
+#   --slug
+#   --profile
+#   --offset
 #
 import argparse
 import json
 import os
-import subprocess
 import sys
+import subprocess
 from pathlib import Path
+from typing import List, Optional
 from datetime import datetime
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = BASE_DIR / "output"
-META_DIR = BASE_DIR / "meta"
 UPLOAD_LOG = BASE_DIR / "uploaded"
 
 RESET = "\033[0m"
@@ -25,21 +46,185 @@ RED = "\033[31m"
 BLUE = "\033[34m"
 
 
-def log(section, msg, color=CYAN):
+def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
 
 
-def load_meta(slug: str) -> dict:
-    mp = META_DIR / f"{slug}.json"
-    if not mp.exists():
-        return {}
-    try:
-        return json.loads(mp.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+# ---- Google API imports ----
+try:
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaFileUpload
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+except ImportError as e:
+    # Emit machine-readable error so 0_master can surface it nicely
+    print(
+        json.dumps(
+            {
+                "ok": False,
+                "error": "MissingDependencies",
+                "message": (
+                    "Missing YouTube upload dependencies. "
+                    "Install: google-api-python-client google-auth-oauthlib google-auth-httplib2 "
+                    "inside demucs_env."
+                ),
+                "detail": str(e),
+            }
+        )
+    )
+    sys.exit(1)
 
 
-def write_upload_receipt(slug: str, profile: str, offset: float, video_id: str, title: str):
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+
+
+def get_creds() -> Credentials:
+    """
+    Load or create OAuth credentials.
+
+    Looks for env YOUTUBE_CLIENT_SECRETS_JSON first, then ./client_secret.json.
+    Stores tokens in youtube_token.json next to the client secrets file.
+    """
+    client_secrets = os.getenv("YOUTUBE_CLIENT_SECRETS_JSON", "client_secret.json")
+    secrets_path = Path(client_secrets).resolve()
+
+    if not secrets_path.exists():
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "MissingOAuthClientSecrets",
+                    "message": (
+                        "Missing OAuth client secrets JSON. "
+                        "Set env YOUTUBE_CLIENT_SECRETS_JSON to your Google OAuth client file "
+                        "or place client_secret.json in the project root. "
+                        "API keys (YOUTUBE_API_KEY) are NOT sufficient for uploads."
+                    ),
+                }
+            )
+        )
+        sys.exit(1)
+
+    token_path = secrets_path.with_name("youtube_token.json")
+    creds: Optional[Credentials] = None
+
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            log("auth", "Refreshing OAuth token...", CYAN)
+            creds.refresh(Request())
+        else:
+            log("auth", f"Launching OAuth flow using {secrets_path.name}...", CYAN)
+            flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
+            creds = flow.run_console()
+
+        token_path.write_text(creds.to_json(), encoding="utf-8")
+        log("auth", f"Stored credentials in {token_path}", GREEN)
+
+    return creds
+
+
+def build_youtube(creds: Credentials):
+    return build("youtube", "v3", credentials=creds)
+
+
+def upload_video(
+    youtube,
+    file_path: Path,
+    title: str,
+    description: str,
+    tags: List[str],
+    category_id: str,
+    privacy_status: str,
+    made_for_kids: bool,
+) -> str:
+    """
+    Upload a single video file. Returns videoId.
+    """
+    log("upload", f"Uploading: {file_path.name}", CYAN)
+
+    body = {
+        "snippet": {
+            "title": title,
+            "description": description,
+            "tags": tags if tags else None,
+            "categoryId": category_id,
+        },
+        "status": {
+            "privacyStatus": privacy_status,
+            "selfDeclaredMadeForKids": bool(made_for_kids),
+        },
+    }
+
+    media = MediaFileUpload(str(file_path), chunksize=-1, resumable=True)
+
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media,
+    )
+
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            pct = int(status.progress() * 100)
+            print(f"\r{pct}% uploaded", end="", flush=True)
+
+    print()  # newline after progress
+    if "id" not in response:
+        raise RuntimeError(f"Unexpected response from YouTube: {response!r}")
+
+    vid = response["id"]
+    log("upload", f"Upload complete. Video ID: {vid}", GREEN)
+    return vid
+
+
+def extract_thumbnail_frame(mp4_path: Path, thumb_png: Path, ts_sec: float) -> None:
+    """
+    Use ffmpeg to capture a frame as PNG at ts_sec seconds.
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        str(ts_sec),
+        "-i",
+        str(mp4_path),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=1280:-1",
+        str(thumb_png),
+    ]
+    log("thumb", " ".join(cmd), BLUE)
+    subprocess.run(cmd, check=True)
+
+
+def set_thumbnail(youtube, video_id: str, thumb_png: Path) -> None:
+    media = MediaFileUpload(str(thumb_png), mimetype="image/png")
+    request = youtube.thumbnails().set(videoId=video_id, media_body=media)
+    request.execute()
+    log("thumb", "Thumbnail set.", GREEN)
+
+
+def write_upload_receipt(
+    slug: Optional[str],
+    profile: Optional[str],
+    offset: Optional[float],
+    video_id: str,
+    title: str,
+) -> None:
+    """
+    Optional receipt for 0_master. Only writes if slug/profile/offset are all provided.
+    """
+    if slug is None or profile is None or offset is None:
+        return
+
     UPLOAD_LOG.mkdir(parents=True, exist_ok=True)
     receipt = {
         "slug": slug,
@@ -49,85 +234,128 @@ def write_upload_receipt(slug: str, profile: str, offset: float, video_id: str, 
         "title": title,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
-    out = UPLOAD_LOG / f"{slug}_{profile}_offset_{offset:+.3f}.json"
+    tag = f"{offset:+.3f}"
+    out = UPLOAD_LOG / f"{slug}_{profile}_offset_{tag}.json"
     out.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
-    return out
-
-
-def run_uploader(file_path: str, title: str, privacy: str):
-    """
-    Call yt-uploader-python as a subprocess:
-      --file, --title, --privacy
-    Returns (video_id, url)
-    """
-    cmd = [
-        sys.executable,
-        "-m",
-        "yt_uploader_python",
-        "--file",
-        file_path,
-        "--title",
-        title,
-        "--privacy",
-        privacy,
-        "--thumb",
-        f"{file_path}.thumb.png",
-    ]
-    log("upload", " ".join(cmd), BLUE)
-
-    cp = subprocess.run(cmd, capture_output=True, text=True)
-    if cp.returncode != 0:
-        raise SystemExit(
-            f"Upload failed with exit {cp.returncode}:\n{cp.stderr.strip()}"
-        )
-
-    # yt-uploader prints JSON
-    out = cp.stdout.strip()
-    try:
-        data = json.loads(out)
-    except Exception:
-        print(out)
-        raise SystemExit("Uploader returned non-JSON output")
-
-    if not data.get("ok"):
-        raise SystemExit(f"Uploader error: {data}")
-
-    return data["video_id"], data["watch_url"]
+    log("upload", f"Saved upload receipt to {out}", GREEN)
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Upload MP4 to YouTube privately")
-    p.add_argument("--file", required=True, help="MP4 path")
-    p.add_argument("--slug", required=True)
-    p.add_argument("--profile", required=True)
-    p.add_argument("--offset", type=float, required=True)
-    p.add_argument("--title", required=True)
-    p.add_argument("--privacy", default="private")
+    p = argparse.ArgumentParser(description="Upload a video to YouTube with OAuth.")
+    p.add_argument("--file", required=True, help="Path to the MP4 to upload")
+    p.add_argument("--title", help="Video title; defaults to filename stem")
+    p.add_argument("--description", default="", help="Video description")
+    p.add_argument("--tags", default="", help="Comma-separated tags")
+    p.add_argument(
+        "--category-id",
+        default="10",
+        help="YouTube categoryId (default=10 Music)",
+    )
+    # Default privacy is PRIVATE
+    p.add_argument(
+        "--privacy",
+        default="private",
+        choices=["public", "unlisted", "private"],
+        help="Privacy status",
+    )
+    # Default is NO: not made for kids unless explicitly passed
+    p.add_argument(
+        "--made-for-kids",
+        action="store_true",
+        help="Mark as made for kids",
+    )
+    p.add_argument(
+        "--thumb-from-sec",
+        type=float,
+        default=0.5,
+        help="Timestamp to capture thumbnail frame (sec)",
+    )
+    p.add_argument(
+        "--no-thumbnail",
+        action="store_true",
+        help="Skip setting a thumbnail",
+    )
+
+    # Extra args for 0_master receipts (optional)
+    p.add_argument("--slug", help="Song slug (for receipt naming)", default=None)
+    p.add_argument("--profile", help="Mix profile (for receipt naming)", default=None)
+    p.add_argument(
+        "--offset",
+        type=float,
+        help="Offset used for this render (for receipt naming)",
+        default=None,
+    )
+
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    file_path = Path(args.file)
-    if not file_path.exists():
-        raise SystemExit(f"File not found: {file_path}")
+    mp4 = Path(args.file).resolve()
+    if not mp4.exists():
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "FileNotFound",
+                    "message": f"File not found: {str(mp4)}",
+                }
+            )
+        )
+        sys.exit(1)
 
-    # Ensure privacy = private
-    privacy = args.privacy.lower().strip() or "private"
+    title = args.title or mp4.stem
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
 
-    log("upload", f"Uploading {file_path.name} as '{args.title}' [{privacy}]", CYAN)
+    # OAuth + service
+    creds = get_creds()
+    yt = build_youtube(creds)
 
-    video_id, url = run_uploader(str(file_path), args.title, privacy)
-    log("upload", f"Upload successful. Video ID: {video_id}", GREEN)
-    log("upload", f"Watch: {url}", GREEN)
+    try:
+        vid = upload_video(
+            yt,
+            mp4,
+            title=title,
+            description=args.description,
+            tags=tags,
+            category_id=args.category_id,
+            privacy_status=args.privacy,
+            made_for_kids=args.made_for_kids,
+        )
+    except HttpError as e:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "YouTubeUploadError",
+                    "message": str(e),
+                }
+            )
+        )
+        sys.exit(1)
 
-    receipt = write_upload_receipt(
-        args.slug, args.profile, args.offset, video_id, args.title
+    # Thumbnail (optional)
+    if not args.no-thumbnail:
+        thumb_png = mp4.with_suffix(".mp4.thumb.png")
+        try:
+            extract_thumbnail_frame(mp4, thumb_png, args.thumb_from_sec)
+            set_thumbnail(yt, vid, thumb_png)
+        except subprocess.CalledProcessError:
+            log("thumb", "ffmpeg failed to capture thumbnail; skipping.", YELLOW)
+        except HttpError as e:
+            log("thumb", f"Failed to set thumbnail: {e}", YELLOW)
+
+    # Receipt for 0_master (if info provided)
+    write_upload_receipt(args.slug, args.profile, args.offset, vid, title)
+
+    # Final JSON result
+    print(
+        json.dumps(
+            {"ok": True, "video_id": vid, "watch_url": f"https://youtu.be/{vid}"},
+            indent=2,
+        )
     )
-    log("upload", f"Saved upload receipt to {receipt}", GREEN)
-
-    print(json.dumps({"ok": True, "video_id": video_id, "watch_url": url}, indent=2))
 
 
 if __name__ == "__main__":

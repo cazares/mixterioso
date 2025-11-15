@@ -29,6 +29,7 @@ OFFSETS_DIR = BASE_DIR / "offsets"
 MIXES_DIR = BASE_DIR / "mixes"
 META_DIR = BASE_DIR / "meta"
 OUTPUT_DIR = BASE_DIR / "output"
+UPLOAD_LOG = BASE_DIR / "uploaded"
 
 
 # ---------------------------------------------------------
@@ -46,6 +47,20 @@ def fmt_secs(sec: float) -> str:
     m = int(sec // 60)
     s = int(sec - m * 60)
     return f"{m:02d}:{s:02d}"
+
+
+def format_offset_tag(offset: float) -> str:
+    """
+    Convert numeric offset (seconds) into tag like:
+      +0.000 -> p0p000s
+      +1.500 -> p1p500s
+      -0.500 -> m0p500s
+    """
+    sign = "p" if offset >= 0 else "m"
+    val = abs(offset)
+    sec_int = int(val)
+    ms_int = int(round((val - sec_int) * 1000))
+    return f"{sign}{sec_int}p{ms_int:03d}s"
 
 
 def detect_latest_slug() -> str | None:
@@ -85,9 +100,11 @@ def detect_step_status(slug: str, profile: str) -> dict[str, str]:
     mp4s = list(OUTPUT_DIR.glob(f"{slug}_{profile}_offset_*.mp4"))
     status["4"] = "DONE" if mp4s else "MISSING"
 
-    # Step 5: upload
-    uploaded = META_DIR / f"{slug}_{profile}_uploaded.json"
-    status["5"] = "DONE" if uploaded.exists() else "MISSING"
+    # Step 5: upload (check uploaded receipts)
+    if UPLOAD_LOG.exists() and any(UPLOAD_LOG.glob(f"{slug}_{profile}_offset_*.json")):
+        status["5"] = "DONE"
+    else:
+        status["5"] = "MISSING"
 
     return status
 
@@ -310,21 +327,78 @@ def run_step4(slug: str, profile: str, offset: float, force: bool, called_from_m
 # Step 5  (upload)
 # ---------------------------------------------------------
 def run_step5(slug: str, profile: str, offset: float) -> float:
-    # If upload metadata already exists, skip
-    uploaded_json = META_DIR / f"{slug}_{profile}_uploaded.json"
-    if uploaded_json.exists():
-        log("STEP5", "Upload already done earlier — skipping.", GREEN)
+    """
+    Upload step used by 0_master.
+
+    - Resolves the correct MP4 for (slug, profile, offset)
+    - Builds base title from meta: "{artist} - {title}"
+    - Prompts user for suffix, e.g. "(35% Vocals)"
+    - Calls 5_upload.py with --file/--title/--privacy private/etc.
+    - Skips if an upload receipt already exists in uploaded/.
+    """
+    # Check if already uploaded (via 4_mp4 UI or prior STEP5)
+    if UPLOAD_LOG.exists() and any(UPLOAD_LOG.glob(f"{slug}_{profile}_offset_*.json")):
+        log("STEP5", "Upload already recorded in uploaded/; skipping.", GREEN)
         return 0.0
+
+    # Resolve MP4 path
+    tag = format_offset_tag(offset)
+    mp4_path = OUTPUT_DIR / f"{slug}_{profile}_offset_{tag}.mp4"
+    if not mp4_path.exists():
+        # Fallback: pick the newest matching MP4 for this slug/profile
+        candidates = sorted(
+            OUTPUT_DIR.glob(f"{slug}_{profile}_offset_*.mp4"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not candidates:
+            raise SystemExit(
+                f"No MP4 found to upload for slug={slug}, profile={profile}, "
+                f"offset={offset:+.3f}s"
+            )
+        mp4_path = candidates[0]
+        log("STEP5", f"No exact-offset MP4; using latest {mp4_path.name}", YELLOW)
+    else:
+        log("STEP5", f"Using MP4 {mp4_path.name} for upload", CYAN)
+
+    # Load meta to build base title
+    meta_path = META_DIR / f"{slug}.json"
+    artist = ""
+    title = slug.replace("_", " ")
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            artist = (meta.get("artist") or "").strip()
+            title = (meta.get("title") or title).strip()
+        except Exception:
+            pass
+
+    base = f"{artist} - {title}".strip(" -")
+    base_with_space = base + " " if base else ""
+
+    # Prompt user for suffix; base + suffix pattern only
+    suffix = input(
+        f'Additional title text to append to "{base_with_space}" '
+        f'(e.g. "(35% Vocals)") [ENTER for none]: '
+    ).strip()
+    final_title = (base_with_space + suffix).strip() if suffix else base
+
+    if not final_title:
+        final_title = mp4_path.stem
 
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "5_upload.py"),
+        "--file",
+        str(mp4_path),
         "--slug",
         slug,
         "--profile",
         profile,
         "--offset",
         str(offset),
+        "--title",
+        final_title,
         "--privacy",
         "private",
     ]
