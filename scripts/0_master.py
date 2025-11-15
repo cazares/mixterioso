@@ -176,11 +176,10 @@ def run_step1_txt_mp3(slug: str, query: str | None) -> float:
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "1_txt_mp3.py"),
-        "--slug",
-        slug,
     ]
     if query:
         cmd += ["--query", query]
+    cmd += ["--slug", slug]
 
     t = run(cmd, "STEP1")
     return t
@@ -198,6 +197,32 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool = Tru
     mp3_path = MP3_DIR / f"{slug}.mp3"
     mix_config = MIXES_DIR / f"{slug}_{profile}.json"
     mix_audio = MIXES_DIR / f"{slug}_{profile}.wav"
+
+    # ---- NEW: quick bypass if user wants 100% original full mix ----
+    # If they say yes, we just convert mp3 -> wav and skip Demucs + 2_stems.
+    if interactive:
+        use_bypass = prompt_yes_no(
+            "Use original full mix (100% all tracks, skip Demucs stem separation)?",
+            False,
+        )
+    else:
+        use_bypass = False
+
+    if use_bypass:
+        MIXES_DIR.mkdir(parents=True, exist_ok=True)
+        if mix_audio.exists():
+            log("STEP2", f"Bypass mix already exists at {mix_audio}", GREEN)
+            return 0.0
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(mp3_path),
+            str(mix_audio),
+        ]
+        t_bypass = run(ffmpeg_cmd, "STEP2-BYPASS")
+        return t_bypass
+    # ---- END NEW BYPASS BLOCK ----
 
     # Decide effective Demucs model + whether to use two-stems
     effective_model = model
