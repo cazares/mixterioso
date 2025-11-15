@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 import os
-import random  # NEW: for random music-note groupings
+import random  # for random music-note groupings
 
 # --- Make sure `scripts/` is importable whether we run as `python3 scripts/4_mp4.py` or via a module ---
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -88,9 +88,9 @@ LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0") or "0")
 MUSIC_NOTE_CHARS = "♪♫♬♩♭♯"
 MUSIC_NOTE_KEYWORDS = {"instrumental", "solo", "guitar solo", "piano solo"}
 
-# NEW: Threshold + helper for random note groups between lyrics
-NOTE_GAP_THRESHOLD_SECS = 6.0  # min gap between timing rows to add notes
-NOTE_INSET_SEC = 1.0          # start note 1s after current line start, end 1s before next line start
+# Threshold + helper for random note groups between lyrics
+NOTE_GAP_THRESHOLD_SECS = 6.0  # min gap between *end* of current line and *start* of next line
+NOTE_INSET_SEC = 1.0          # start note 1s after current line ends, end 1s before next line starts
 
 
 def log(prefix: str, msg: str, color: str = RESET) -> None:
@@ -246,7 +246,9 @@ def build_ass(
 
     line_y = max(0, y_divider_nominal - DIVIDER_LINE_OFFSET_UP_PX)
 
-    inner_bottom_box_height = max(1, bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX)
+    inner_bottom_box_height = max(
+        1, bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX
+    )
     y_next = y_divider_nominal + NEXT_LYRIC_TOP_MARGIN_PX + inner_bottom_box_height // 2
 
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
@@ -392,15 +394,21 @@ def build_ass(
             )
         )
 
-        # Do not show next UI on last line, or when music-only lines are involved.
+        # No further work if this is the last timing row.
         if i >= n - 1:
             continue
-        next_raw = unified[i + 1][1]
+
+        next_t, next_raw, _next_li = unified[i + 1]
+        next_start_on_screen = max(0.0, next_t + offset)
+
         if not next_raw:
             continue
-        if music_only or is_music_only(next_raw):
-            # If either side is music-only, we also skip the random-gap note, since
-            # the line itself is already acting as a musical indicator.
+
+        next_music_only = is_music_only(next_raw)
+
+        # If either side is "music-only", skip preview UI and notes –
+        # the line itself is already acting as the indicator.
+        if music_only or next_music_only:
             continue
 
         # Divider line (no fade).
@@ -454,20 +462,22 @@ def build_ass(
             )
         )
 
-        # NEW: Random music-note overlay in long gaps between *lyric* lines.
-        # Use the original (un-offset) times to measure the gap.
-        gap = unified[i + 1][0] - t
+        # Random music-note overlay in *true* gaps between lyric lines.
+        # Gap is measured from the end of the current line to the start of the next line,
+        # so notes never show on top of active lyric text.
+        gap = next_start_on_screen - end
         if gap >= NOTE_GAP_THRESHOLD_SECS:
-            note_start = start + NOTE_INSET_SEC
-            note_end = (unified[i + 1][0] + offset) - NOTE_INSET_SEC
+            note_start = end + NOTE_INSET_SEC
+            note_end = next_start_on_screen - NOTE_INSET_SEC
             if note_end > audio_duration:
                 note_end = audio_duration
-            # Make sure there is still a meaningful window
+            # Make sure we still have a meaningful window.
             if note_end > note_start + 0.25:
                 note_text = ass_escape(random_note_group())
+                note_font = preview_font * 2  # twice as big as preview text
                 note_tag = (
                     f"{{\\an5\\pos({playresx // 2},{y_center_full})"
-                    f"\\fs{preview_font}{fade_tag_main}}}"
+                    f"\\fs{note_font}{fade_tag_main}}}"
                 )
                 events.append(
                     "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
