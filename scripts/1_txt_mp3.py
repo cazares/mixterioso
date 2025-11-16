@@ -13,27 +13,33 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 
-# ---------------------------------------------------------
-# Color constants
-# ---------------------------------------------------------
-RESET = "\033[0m"
-BOLD = "\033[1m"
-CYAN = "\033[36m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-RED = "\033[31m"
-BLUE = "\033[34m"
+# =====================================================================
+# Colors
+# =====================================================================
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+CYAN    = "\033[36m"
+GREEN   = "\033[32m"
+YELLOW  = "\033[33m"
+RED     = "\033[31m"
+BLUE    = "\033[34m"
 MAGENTA = "\033[35m"
-WHITE = "\033[97m"
+WHITE   = "\033[97m"
 
-# ---------------------------------------------------------
+def log(section: str, msg: str, color: str = CYAN) -> None:
+    ts = time.strftime("%H:%M:%S")
+    print(f"{color}[{ts}] [{section}]{RESET} {msg}")
+
+# =====================================================================
 # Paths
-# ---------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent.parent
+# =====================================================================
+BASE_DIR   = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = BASE_DIR / "scripts"
-TXT_DIR = BASE_DIR / "txts"
-MP3_DIR = BASE_DIR / "mp3s"
-META_DIR = BASE_DIR / "meta"
+TXT_DIR     = BASE_DIR / "txts"
+MP3_DIR     = BASE_DIR / "mp3s"
+META_DIR    = BASE_DIR / "meta"
+CACHE_DIR   = BASE_DIR / "cache"
+CACHE_FILE  = CACHE_DIR / "youtube_cache.json"
 
 PLACEHOLDER_LYRICS = """Lyrics not found
 We tried Genius,
@@ -44,18 +50,9 @@ But we still found
 Sorry, try again
 But with a different query"""
 
-
-# ---------------------------------------------------------
-# Logging
-# ---------------------------------------------------------
-def log(section: str, msg: str, color: str = CYAN) -> None:
-    ts = time.strftime("%H:%M:%S")
-    print(f"{color}[{ts}] [{section}]{RESET} {msg}")
-
-
-# ---------------------------------------------------------
-# Slugify
-# ---------------------------------------------------------
+# =====================================================================
+# slugify
+# =====================================================================
 def slugify(text: str) -> str:
     import re
     base = text.strip().lower()
@@ -63,461 +60,590 @@ def slugify(text: str) -> str:
     base = re.sub(r"[^\w\-]+", "", base)
     return base or "song"
 
-
-# ---------------------------------------------------------
-# Env loader
-# ---------------------------------------------------------
-def load_env() -> Tuple[str, str]:
+# =====================================================================
+# ENV loader
+# =====================================================================
+def load_env() -> Tuple[str, str, str]:
     env_path = BASE_DIR / ".env"
     if env_path.exists():
-        log("ENV", f"Loading .env from {env_path}", BLUE)
         load_dotenv(env_path)
-    else:
-        log("ENV", ".env not found, relying on process environment", YELLOW)
 
     genius_token = os.getenv("GENIUS_ACCESS_TOKEN") or os.getenv("GENIUS_TOKEN")
-    mm_api_key = os.getenv("MUSIXMATCH_API_KEY") or os.getenv("MM_API")
+    mm_api_key   = os.getenv("MUSIXMATCH_API_KEY") or os.getenv("MM_API")
+    yt_api_key   = os.getenv("YOUTUBE_API_KEY")
 
     if not genius_token:
-        log("ENV", "GENIUS_ACCESS_TOKEN (or GENIUS_TOKEN) is not set.", RED)
+        log("ENV", "Missing GENIUS_ACCESS_TOKEN", RED)
     if not mm_api_key:
-        log("ENV", "MUSIXMATCH_API_KEY (or MM_API) is not set.", RED)
+        log("ENV", "Missing MUSIXMATCH_API_KEY", RED)
+    if not yt_api_key:
+        log("ENV", "Missing YOUTUBE_API_KEY", RED)
 
-    if not genius_token or not mm_api_key:
-        raise SystemExit(
-            f"{RED}Missing required API keys. "
-            f"GENIUS_ACCESS_TOKEN and MUSIXMATCH_API_KEY are required.{RESET}"
-        )
+    if not (genius_token and mm_api_key and yt_api_key):
+        raise SystemExit(f"{RED}Missing required API keys.{RESET}")
 
-    return genius_token, mm_api_key
+    return genius_token, mm_api_key, yt_api_key
+
+# =====================================================================
+# Cache
+# =====================================================================
+def load_cache() -> Dict[str, Any]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if CACHE_FILE.exists():
+        try:
+            return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        except:
+            return {}
+    return {}
+
+def save_cache(cache: Dict[str, Any]) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(
+        json.dumps(cache, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+# =====================================================================
+# Format views like YouTube
+# =====================================================================
+def fmt_views(n: int) -> str:
+    if n >= 1_000_000_000:
+        return f"{n/1_000_000_000:.1f}B"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}k"
+    return str(n)
+
+# =====================================================================
+# YouTube API search (fast)
+# =====================================================================
+def youtube_api_search(query: str, yt_key: str, max_results: int = 12) -> List[Dict[str, Any]]:
+    from urllib.parse import urlencode
+
+    search_url = (
+        "https://www.googleapis.com/youtube/v3/search?"
+        + urlencode({
+            "key": yt_key,
+            "q": query,
+            "type": "video",
+            "part": "id,snippet",
+            "maxResults": max_results,
+        })
+    )
+
+    try:
+        r = requests.get(search_url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log("YT", f"API search failed: {e}", YELLOW)
+        return []
+
+    items = data.get("items", [])
+    if not items:
+        return []
+
+    video_ids = [it["id"]["videoId"] for it in items]
+
+    stats_url = (
+        "https://www.googleapis.com/youtube/v3/videos?"
+        + urlencode({
+            "key": yt_key,
+            "id": ",".join(video_ids),
+            "part": "statistics,snippet",
+        })
+    )
+
+    try:
+        r2 = requests.get(stats_url, timeout=10)
+        r2.raise_for_status()
+        stats_data = r2.json()
+    except Exception as e:
+        log("YT", f"Stats fetch failed: {e}", YELLOW)
+        return []
+
+    indexed = {x.get("id"): x for x in stats_data.get("items", [])}
+
+    out = []
+    for it in items:
+        vid = it["id"]["videoId"]
+        node = indexed.get(vid, {})
+        snippet = node.get("snippet", {})
+        stats   = node.get("statistics", {})
+        title   = snippet.get("title") or "(no title)"
+        views   = int(stats.get("viewCount", 0))
+
+        out.append({
+            "videoId": vid,
+            "title": title,
+            "views": views,
+        })
+
+    return out
+
+# =====================================================================
+# yt-dlp fallback
+# =====================================================================
+def youtube_fallback_yt_dlp(query: str, limit: int = 12) -> List[Dict[str, Any]]:
+    log("YT-FB", "Using yt-dlp fallback", YELLOW)
+    try:
+        cmd = ["yt-dlp", "-j", f"ytsearch{limit}:{query}"]
+        out = subprocess.check_output(cmd, text=True)
+    except:
+        return []
+
+    out_list = []
+    for line in out.splitlines():
+        try:
+            d = json.loads(line)
+        except:
+            continue
+        if "title" not in d or "webpage_url" not in d:
+            continue
+
+        vid   = d.get("id")
+        views = d.get("view_count") or 0
+        out_list.append({
+            "videoId": vid,
+            "title": d.get("title", "(no title)"),
+            "views": views,
+        })
+
+    return out_list[:limit]
+
+# =====================================================================
+# Get YT results with caching + fallback
+# =====================================================================
+def get_youtube_results(query: str, yt_key: str, max_results: int = 12) -> List[Dict[str, Any]]:
+    cache = load_cache()
+    qkey = f"yt:{query.lower()}"
+
+    if qkey in cache:
+        return cache[qkey]
+
+    api_res = youtube_api_search(query, yt_key, max_results)
+    if api_res:
+        cache[qkey] = api_res
+        save_cache(cache)
+        return api_res
+
+    fallback = youtube_fallback_yt_dlp(query, max_results)
+    cache[qkey] = fallback
+    save_cache(cache)
+    return fallback
+
+# =====================================================================
+# Arrow-key interactive picker
+# =====================================================================
+
+ARROW_LEFT  = "\x1b[D"
+ARROW_RIGHT = "\x1b[C"
+
+def read_key() -> str:
+    """
+    Returns: "LEFT", "RIGHT", digit, "ENTER", or raw char.
+    """
+    import tty, termios
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+
+        if ch in ("\r", "\n"):
+            return "ENTER"
+
+        if ch == "\x1b":  # Escape → arrow?
+            seq = sys.stdin.read(2)
+            if seq == "[D":
+                return "LEFT"
+            if seq == "[C":
+                return "RIGHT"
+            return ch + seq
+
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+def display_page(results: List[Dict[str, Any]], page: int, per_page: int = 3) -> None:
+    total = len(results)
+    total_pages = (total + per_page - 1) // per_page
+    start = (page - 1) * per_page
+    end   = min(start + per_page, total)
+    group = results[start:end]
+
+    print()
+    print(f"{BOLD}{CYAN}=== YouTube Results Page {page}/{total_pages} ==={RESET}")
+    print()
+
+    for idx, item in enumerate(group, start=start+1):
+        title = item["title"]
+        views = fmt_views(item["views"])
+        print(f"{WHITE}{idx}. {GREEN}{title}{RESET} ({YELLOW}{views} views{RESET})")
+
+    print()
+    nav = []
+    if page > 1:
+        nav.append(f"{BLUE}[← prev]{RESET}")
+    if page < total_pages:
+        nav.append(f"{BLUE}[next →]{RESET}")
+    print(" ".join(nav))
+
+    print(f"{MAGENTA}Type # to select, arrows to navigate, ENTER to cancel.{RESET}")
+def interactive_youtube_pick(results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Arrow-key + pagination selection (3 items per page).
+    Returns the selected dict, or None if user cancels.
+    """
+    if not results:
+        return None
+
+    per_page = 3
+    total = len(results)
+    total_pages = (total + per_page - 1) // per_page
+    page = 1
+
+    while True:
+        display_page(results, page, per_page)
+        key = read_key()
+
+        # Cancel
+        if key == "ENTER":
+            return None
+
+        # Left/right arrows
+        if key == "LEFT" and page > 1:
+            page -= 1
+            continue
+        if key == "RIGHT" and page < total_pages:
+            page += 1
+            continue
+
+        # Single-digit index
+        if key.isdigit():
+            idx = int(key)
+            if 1 <= idx <= total:
+                return results[idx - 1]
+
+        # Multi-digit numbers (e.g. "12")
+        if key.isdigit():
+            buf = key
+            # allow up to 2 more digits
+            for _ in range(2):
+                nxt = sys.stdin.read(1)
+                if nxt.isdigit():
+                    buf += nxt
+                else:
+                    break
+            try:
+                idx2 = int(buf)
+                if 1 <= idx2 <= total:
+                    return results[idx2 - 1]
+            except:
+                pass
+
+        # Unknown key → ignore and refresh
 
 
-# ---------------------------------------------------------
-# Genius search
-# ---------------------------------------------------------
+# =====================================================================
+# Genius Search
+# =====================================================================
+
 def search_genius(query: str, token: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     url = "https://api.genius.com/search"
     headers = {"Authorization": f"Bearer {token}"}
     params = {"q": query}
+
     t0 = time.perf_counter()
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
         hits = data.get("response", {}).get("hits", [])
         if not hits:
-            log("GENIUS", f'No hits for "{query}"', YELLOW)
+            log("GENIUS", f"No hits for '{query}'", YELLOW)
             return None, None, None
-        result = hits[0]["result"]
-        artist = result.get("primary_artist", {}).get("name")
-        title = result.get("title")
-        gid = result.get("id")
-        log("GENIUS", f'Matched: "{artist} - {title}"', GREEN)
+
+        res = hits[0]["result"]
+        artist = res.get("primary_artist", {}).get("name")
+        title  = res.get("title")
+        gid    = res.get("id")
+
+        t1 = time.perf_counter()
+        log("GENIUS", f'Matched: "{artist} - {title}" ({t1 - t0:.2f}s)', GREEN)
         return artist, title, gid
+
     except Exception as e:
-        log("GENIUS", f"Search error: {e}", RED)
+        log("GENIUS", f"Error: {e}", RED)
         return None, None, None
 
 
-# ---------------------------------------------------------
-# Musixmatch helpers
-# ---------------------------------------------------------
+# =====================================================================
+# Musixmatch lyrics
+# =====================================================================
+
 def fetch_lyrics_musixmatch(
     query: str,
     artist: Optional[str],
     title: Optional[str],
     api_key: str,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
-    base_params: Dict[str, Any] = {
+
+    params = {
         "apikey": api_key,
         "f_has_lyrics": 1,
-        "s_track_rating": "desc",
         "page_size": 1,
+        "s_track_rating": "desc",
     }
 
-    if artist or title:
-        if title:
-            base_params["q_track"] = title
-        if artist:
-            base_params["q_artist"] = artist
-        log("MM", f'Searching Musixmatch for "{artist or ""} - {title or ""}"', CYAN)
-    else:
-        base_params["q"] = query
-        log("MM", f'Searching Musixmatch for "{query}"', CYAN)
+    if artist:
+        params["q_artist"] = artist
+    if title:
+        params["q_track"] = title
+    if not (artist or title):
+        params["q"] = query
 
     try:
         r = requests.get("https://api.musixmatch.com/ws/1.1/track.search",
-                         params=base_params, timeout=10)
+                         params=params, timeout=10)
         r.raise_for_status()
-        data = r.json()
+        body = r.json().get("message", {}).get("body", {})
     except Exception as e:
-        log("MM", f"track.search failed: {e}", RED)
         return None, {"musixmatch_error": str(e)}
 
-    body = data.get("message", {}).get("body", {})
-    track_list = body.get("track_list", [])
-    if not track_list:
-        log("MM", "No results.", YELLOW)
+    tracks = body.get("track_list", [])
+    if not tracks:
         return None, {"musixmatch_status": "no_results"}
 
-    track = track_list[0].get("track", {})
-    track_id = track.get("track_id")
-    mm_artist = track.get("artist_name")
-    mm_title = track.get("track_name")
+    track = tracks[0].get("track", {})
+    tid    = track.get("track_id")
+    tname  = track.get("track_name")
+    aname  = track.get("artist_name")
 
-    log("MM", f'Selected: "{mm_artist} - {mm_title}"', GREEN)
+    if not tid:
+        return None, {"musixmatch_status": "no_track_id"}
 
-    # Fetch lyrics
     try:
         lr = requests.get(
             "https://api.musixmatch.com/ws/1.1/track.lyrics.get",
-            params={"track_id": track_id, "apikey": api_key},
-            timeout=10,
+            params={"track_id": tid, "apikey": api_key},
+            timeout=10
         )
         lr.raise_for_status()
-        ldata = lr.json()
+        lyr = lr.json().get("message", {}).get("body", {}).get("lyrics", {}).get("lyrics_body")
     except Exception as e:
-        log("MM", f"lyrics.get failed: {e}", RED)
-        return None, {"musixmatch_status": "lyrics_error", "error": str(e)}
+        return None, {"musixmatch_status": "lyrics_error", "musixmatch_error": str(e)}
 
-    lyrics = ldata.get("message", {}).get("body", {}).get("lyrics", {}).get("lyrics_body")
-    if not lyrics:
-        log("MM", "No lyrics body.", YELLOW)
+    if not lyr:
         return None, {"musixmatch_status": "no_lyrics"}
 
-    # Remove Musixmatch footer
+    # Remove MM footer
     footer = "******* This Lyrics is NOT for Commercial use *******"
-    if footer in lyrics:
-        lyrics = lyrics.split(footer, 1)[0].strip()
+    if footer in lyr:
+        lyr = lyr.split(footer, 1)[0].strip()
 
     meta = {
-        "artist": mm_artist or artist or "",
-        "title": mm_title or title or query,
-        "musixmatch_track_id": track_id,
+        "artist": aname or artist or "",
+        "title": tname or title or query,
+        "musixmatch_track_id": tid,
     }
-    return lyrics, meta
-# ---------------------------------------------------------
-# YouTube helpers
-# ---------------------------------------------------------
-def youtube_search_top(query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Return top YouTube results using: yt-dlp -j "ytsearchN:<query>".
-    """
-    log("YT", f'Searching YouTube top {limit}: "{query}"', BLUE)
-
-    try:
-        cmd = ["yt-dlp", "-j", f"ytsearch{limit}:{query}"]
-        out = subprocess.check_output(cmd, text=True)
-    except subprocess.CalledProcessError as e:
-        log("YT", f"yt-dlp search failed (exit {e.returncode})", RED)
-        return []
-    except Exception as e:
-        log("YT", f"Error: {e}", RED)
-        return []
-
-    results: List[Dict[str, Any]] = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-            if "title" in data and "webpage_url" in data:
-                results.append(data)
-        except json.JSONDecodeError:
-            continue
-    return results[:limit]
+    return lyr, meta
 
 
-def fmt_duration(seconds: Optional[float]) -> str:
-    if seconds is None:
-        return "?"
-    try:
-        s = int(seconds)
-    except:
-        return "?"
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    if h:
-        return f"{h:d}:{m:02d}:{s:02d}"
-    return f"{m:d}:{s:02d}"
+# =====================================================================
+# Lyrics fallback logic
+# =====================================================================
 
-
-def choose_youtube_result(results: List[Dict[str, Any]], no_ui: bool) -> Optional[Dict[str, Any]]:
-    if not results:
-        return None
-
-    if no_ui:
-        # Pick first result automatically
-        selected = results[0]
-        log("YT", f'Auto-selected (no-ui): "{selected.get("title")}"', GREEN)
-        return selected
-
-    print()
-    print(f"{BOLD}{CYAN}Top YouTube results:{RESET}")
-    for idx, item in enumerate(results, start=1):
-        title = item.get("title") or "(no title)"
-        uploader = item.get("uploader") or "unknown"
-        dur = fmt_duration(item.get("duration"))
-        print(
-            f"{WHITE}{idx:2d}.{RESET} "
-            f"{GREEN}{title}{RESET} "
-            f"{YELLOW}({uploader}, {dur}){RESET}"
-        )
-
-    print()
-    try:
-        choice_raw = input(
-            f"{MAGENTA}Pick result # [1–{len(results)}, ENTER=1]: {RESET}"
-        ).strip()
-    except EOFError:
-        choice_raw = ""
-
-    if not choice_raw:
-        choice = 1
-    else:
-        try:
-            choice = int(choice_raw)
-        except:
-            log("YT", f"Invalid selection '{choice_raw}', default=1", YELLOW)
-            choice = 1
-
-    if choice < 1 or choice > len(results):
-        log("YT", f"Choice {choice} out of range → default=1", YELLOW)
-        choice = 1
-
-    selected = results[choice - 1]
-    log("YT", f'Selected: "{selected.get("title")}"', GREEN)
-    return selected
-
-
-# ---------------------------------------------------------
-# Download MP3 from YouTube
-# ---------------------------------------------------------
-def youtube_download_mp3_from_url(url: str, slug: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Use yt-dlp to download audio and save as mp3s/<slug>.mp3.
-    Return (title, uploader).
-    """
-    out_template = str(MP3_DIR / f"{slug}.%(ext)s")
-    MP3_DIR.mkdir(parents=True, exist_ok=True)
-
-    log("YT", f"Downloading audio→ {slug}.mp3", BLUE)
-    print(f"{YELLOW}{url}{RESET}")
-
-    try:
-        cmd = ["yt-dlp", "-x", "--audio-format", "mp3", "-o", out_template, url]
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        log("YT", f"yt-dlp failed (exit {e.returncode})", RED)
-        return None, None
-
-    # Fetch metadata separately
-    try:
-        meta_json = subprocess.check_output(["yt-dlp", "-j", url], text=True)
-        lines = [ln for ln in meta_json.splitlines() if ln.strip()]
-        obj = json.loads(lines[-1])
-        return obj.get("title"), obj.get("uploader")
-    except:
-        return None, None
-
-
-# ---------------------------------------------------------
-# Lyrics fallback system
-# ---------------------------------------------------------
 def fetch_lyrics_with_fallbacks(
     query: str,
-    g_artist: Optional[str],
-    g_title: Optional[str],
+    genius_artist: Optional[str],
+    genius_title: Optional[str],
     mm_api_key: str,
     yt_title: Optional[str],
     yt_uploader: Optional[str],
     yt_url: Optional[str],
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    Try:
-      1) Musixmatch using Genius hints
-      2) Musixmatch using YouTube-inferred artist/title
-      3) Placeholder
-    """
 
-    # Attempt #1 (Genius hints)
-    lyrics, meta = fetch_lyrics_musixmatch(query, g_artist, g_title, mm_api_key)
-    if lyrics and lyrics.strip():
+    # 1) Try Genius → Musixmatch
+    lyr, meta = fetch_lyrics_musixmatch(query, genius_artist, genius_title, mm_api_key)
+    if lyr and lyr.strip():
         meta["lyrics_source"] = "musixmatch_genius"
         meta["youtube_title"] = yt_title
         meta["youtube_uploader"] = yt_uploader
         meta["youtube_url"] = yt_url
-        return lyrics, meta
+        return lyr, meta
 
-    # Attempt #2 (YouTube-derived)
-    yt_meta = {
+    # 2) Try YouTube-derived hints
+    candidates: List[Tuple[Optional[str], Optional[str]]] = []
+    if yt_title and " - " in yt_title:
+        left, right = yt_title.split(" - ", 1)
+        candidates.append((left.strip(), right.strip()))
+        candidates.append((right.strip(), left.strip()))
+    elif yt_title:
+        candidates.append((yt_uploader or None, yt_title))
+
+    for a, t in candidates:
+        lyr2, meta2 = fetch_lyrics_musixmatch(query, a, t, mm_api_key)
+        if lyr2 and lyr2.strip():
+            meta2["lyrics_source"] = "musixmatch_youtube"
+            meta2["youtube_title"] = yt_title
+            meta2["youtube_uploader"] = yt_uploader
+            meta2["youtube_url"] = yt_url
+            return lyr2, meta2
+
+    # 3) Final placeholder
+    return PLACEHOLDER_LYRICS, {
+        "artist": genius_artist or yt_uploader or "",
+        "title": genius_title or yt_title or query,
+        "lyrics_source": "placeholder",
+        "query": query,
         "youtube_title": yt_title,
         "youtube_uploader": yt_uploader,
         "youtube_url": yt_url,
     }
 
-    candidates: List[Tuple[Optional[str], Optional[str]]] = []
-    if yt_title:
-        if " - " in yt_title:
-            left, right = yt_title.split(" - ", 1)
-            left = left.strip()
-            right = right.strip()
-            candidates.append((left, right))
-            candidates.append((right, left))
-        else:
-            candidates.append((yt_uploader, yt_title))
-    elif yt_uploader:
-        candidates.append((yt_uploader, query))
 
-    for cand_artist, cand_title in candidates:
-        lyrics2, meta2 = fetch_lyrics_musixmatch(query, cand_artist, cand_title, mm_api_key)
-        if lyrics2 and lyrics2.strip():
-            meta2.update(yt_meta)
-            meta2.setdefault("artist", cand_artist or meta2.get("artist") or "")
-            meta2.setdefault("title", cand_title or meta2.get("title") or query)
-            meta2["lyrics_source"] = "musixmatch_youtube"
-            return lyrics2, meta2
+# =====================================================================
+# Audio download
+# =====================================================================
 
-    # Fallback placeholder
-    final_artist = g_artist or yt_uploader or ""
-    final_title = g_title or yt_title or query
-    meta = {
-        "artist": final_artist,
-        "title": final_title,
-        "lyrics_source": "placeholder",
-        "query": query,
-    }
-    meta.update(yt_meta)
-    return PLACEHOLDER_LYRICS, meta
-# ---------------------------------------------------------
-# CLI
-# ---------------------------------------------------------
+def download_audio_from_youtube(video_id: str, slug: str) -> Tuple[Optional[str], Optional[str]]:
+    """Download audio via yt-dlp."""
+    MP3_DIR.mkdir(parents=True, exist_ok=True)
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    out_template = str(MP3_DIR / f"{slug}.%(ext)s")
+
+    log("YT", f"Downloading audio for '{slug}'", BLUE)
+    print(f"{YELLOW}{url}{RESET}")
+
+    try:
+        subprocess.run(
+            ["yt-dlp", "-x", "--audio-format", "mp3", "-o", out_template, url],
+            check=True
+        )
+    except subprocess.CalledProcessError:
+        log("YT", "yt-dlp audio download failed.", RED)
+        return None, None
+
+    try:
+        meta_out = subprocess.check_output(["yt-dlp", "-j", url], text=True)
+        data = json.loads([ln for ln in meta_out.splitlines() if ln.strip()][-1])
+        return data.get("title"), data.get("uploader")
+    except:
+        return None, None
+
+
+# =====================================================================
+# ARGS + MAIN
+# =====================================================================
+
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        description="Generate txt+mp3 from query via Genius/Musixmatch/YouTube."
-    )
-    p.add_argument("query", nargs="*", help="Song search terms")
-    p.add_argument("--slug", type=str, help="Override slug")
-    p.add_argument("--no-ui", action="store_true", help="Run non-interactively")
+    p = argparse.ArgumentParser(description="txt+mp3 generator with YouTube API + Genius + Musixmatch")
+    p.add_argument("--slug", type=str, help="Slug override.")
+    p.add_argument("--no-ui", action="store_true", help="Disable interactive UI.")
+    p.add_argument("query", nargs="*", help="Song search query.")
     return p.parse_args(argv)
-
-
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
-    no_ui = args.no_ui
 
-    # -----------------------------------------------------
-    # Ensure query exists
-    # -----------------------------------------------------
-    if not args.query:
-        if no_ui:
-            print(f"{RED}Error: no query provided in --no-ui mode.{RESET}")
-            sys.exit(1)
-
-        print()
-        print(f"{WHITE}Enter a search query (song/artist):{RESET}")
-        raw_query = input(f"{CYAN}> {RESET}").strip()
-        if not raw_query:
-            print(f"{RED}No query entered. Exiting.{RESET}")
-            return
-    else:
-        raw_query = " ".join(args.query).strip()
-
-    print()
-    log("MODE", f'txt+mp3 generation for "{raw_query}"', CYAN)
-
-    # -----------------------------------------------------
-    # Load API keys
-    # -----------------------------------------------------
-    genius_token, mm_api_key = load_env()
+    genius_token, mm_api_key, yt_api_key = load_env()
 
     TXT_DIR.mkdir(parents=True, exist_ok=True)
     MP3_DIR.mkdir(parents=True, exist_ok=True)
     META_DIR.mkdir(parents=True, exist_ok=True)
 
-    # -----------------------------------------------------
-    # YouTube: Top-10 search
-    # -----------------------------------------------------
-    results = youtube_search_top(raw_query, limit=10)
-    selected = choose_youtube_result(results, no_ui) if results else None
+    # ---------------------------------------------------------------
+    # Determine QUERY
+    # ---------------------------------------------------------------
+    if args.query:
+        raw_query = " ".join(args.query).strip()
+    else:
+        if args.no_ui:
+            raise SystemExit(f"{RED}Error: query required in --no-ui mode.{RESET}")
+        raw_query = input(f"{WHITE}Enter search query: {RESET}").strip()
 
-    yt_title = selected.get("title") if selected else None
-    yt_uploader = selected.get("uploader") if selected else None
-    yt_url = selected.get("webpage_url") if selected else None
+    if not raw_query:
+        raise SystemExit(f"{RED}No query provided.{RESET}")
 
-    print()
-    print(f"{BOLD}{GREEN}YouTube selection summary:{RESET}")
-    print(f"  Query:    {WHITE}{raw_query}{RESET}")
-    print(f"  Title:    {CYAN}{yt_title or '(none)'}{RESET}")
-    print(f"  Uploader: {CYAN}{yt_uploader or '(none)'}{RESET}")
-    print(f"  URL:      {BLUE}{yt_url or '(none)'}{RESET}")
+    log("MODE", f'txt+mp3 generation for query "{raw_query}"', CYAN)
 
-    # -----------------------------------------------------
-    # Slug selection logic
-    # -----------------------------------------------------
+    # ---------------------------------------------------------------
+    # Slug handling
+    # ---------------------------------------------------------------
     if args.slug:
         slug = slugify(args.slug)
-        log("SLUG", f'Using explicit slug "{slug}"', GREEN)
+        log("SLUG", f'Using overridden slug "{slug}"', GREEN)
     else:
-        base_for_slug = yt_title or raw_query
-        suggested = slugify(base_for_slug)
-
-        if no_ui:
-            slug = suggested
-            log("SLUG", f'Auto-accept slug "{slug}" (--no-ui)', GREEN)
+        auto_slug = slugify(raw_query)
+        if args.no_ui:
+            slug = auto_slug
         else:
             print()
             try:
-                user_slug = input(
-                    f"{MAGENTA}Slug suggestion {RESET}"
-                    f"[{GREEN}{suggested}{RESET}] "
-                    f"{MAGENTA}(ENTER accepts): {RESET}"
+                manual = input(
+                    f"{MAGENTA}Suggested slug {RESET}[{GREEN}{auto_slug}{RESET}] "
+                    f"{MAGENTA}(ENTER to accept): {RESET}"
                 ).strip()
             except EOFError:
-                user_slug = ""
+                manual = ""
 
-            slug = slugify(user_slug) if user_slug else suggested
+            slug = slugify(manual) if manual else auto_slug
             log("SLUG", f'Using slug "{slug}"', GREEN)
 
-    txt_path = TXT_DIR / f"{slug}.txt"
+    # Prepare paths
+    txt_path  = TXT_DIR  / f"{slug}.txt"
     meta_path = META_DIR / f"{slug}.json"
-    mp3_path = MP3_DIR / f"{slug}.mp3"
+    mp3_path  = MP3_DIR  / f"{slug}.mp3"
 
-    # -----------------------------------------------------
-    # Final confirmation
-    # -----------------------------------------------------
-    if not no_ui:
+    # ---------------------------------------------------------------
+    # YouTube search (API → fallback → UI picker)
+    # ---------------------------------------------------------------
+    yt_results = get_youtube_results(raw_query, yt_api_key, max_results=12)
+
+    if not yt_results:
+        raise SystemExit(f"{RED}No YouTube results found.{RESET}")
+
+    if args.no_ui:
+        selected = yt_results[0]
+    else:
+        selected = interactive_youtube_pick(yt_results)
+
+    if not selected:
+        log("ABORT", "User cancelled selection.", YELLOW)
+        return
+
+    yt_title     = selected["title"]
+    yt_views     = selected["views"]
+    yt_video_id  = selected["videoId"]
+    yt_uploader  = None
+    yt_url       = f"https://www.youtube.com/watch?v={yt_video_id}"
+
+    log("YT", f'Selected: "{yt_title}"  ({fmt_views(yt_views)} views)', GREEN)
+
+    # Confirm details (UI only)
+    if not args.no_ui:
         print()
-        print(f"{BOLD}{CYAN}Final selection:{RESET}")
-        print(f"  Query: {WHITE}{raw_query}{RESET}")
-        print(f"  Title: {GREEN}{yt_title or '(unknown)'}{RESET}")
-        print(f"  Slug:  {MAGENTA}{slug}{RESET}")
-        if yt_url:
-            print(f"  URL:   {BLUE}{yt_url}{RESET}")
-
-        try:
-            resp = input(
-                f"{YELLOW}Proceed? [Y/n]: {RESET}"
-            ).strip().lower()
-        except EOFError:
-            resp = "y"
-
+        print(f"{CYAN}Final selection:{RESET}")
+        print(f"  Query:  {YELLOW}{raw_query}{RESET}")
+        print(f"  Title:  {GREEN}{yt_title}{RESET}")
+        print(f"  Slug:   {MAGENTA}{slug}{RESET}")
+        print(f"  URL:    {BLUE}{yt_url}{RESET}")
+        resp = input(f"{YELLOW}Proceed? [Y/n]: {RESET}").lower().strip()
         if resp not in ("", "y", "yes"):
-            log("ABORT", "User cancelled.", RED)
+            log("ABORT", "Cancelled.", RED)
             return
 
-    # -----------------------------------------------------
-    # Genius search
-    # -----------------------------------------------------
+    # ---------------------------------------------------------------
+    # Genius
+    # ---------------------------------------------------------------
     g_artist, g_title, g_id = search_genius(raw_query, genius_token)
 
-    # -----------------------------------------------------
-    # Lyrics + fallback system
-    # -----------------------------------------------------
+    # ---------------------------------------------------------------
+    # Lyrics (full fallback chain)
+    # ---------------------------------------------------------------
     lyrics_text, lyrics_meta = fetch_lyrics_with_fallbacks(
         raw_query,
         g_artist,
@@ -528,31 +654,28 @@ def main(argv=None):
         yt_url,
     )
 
-    final_artist = lyrics_meta.get("artist") or g_artist or yt_uploader or ""
-    final_title = lyrics_meta.get("title") or g_title or yt_title or raw_query
+    final_artist = lyrics_meta.get("artist") or g_artist or ""
+    final_title  = lyrics_meta.get("title")  or g_title  or raw_query
 
-    # -----------------------------------------------------
-    # Download MP3
-    # -----------------------------------------------------
-    if yt_url:
-        dl_title, dl_uploader = youtube_download_mp3_from_url(yt_url, slug)
-        dl_title = dl_title or yt_title
-        dl_uploader = dl_uploader or yt_uploader
-    else:
-        log("YT", "No URL found; skipping download.", RED)
-        dl_title = yt_title
-        dl_uploader = yt_uploader
+    # ---------------------------------------------------------------
+    # Download audio
+    # ---------------------------------------------------------------
+    dl_title, dl_uploader = download_audio_from_youtube(yt_video_id, slug)
+    if dl_title:
+        yt_title = dl_title
+    if dl_uploader:
+        yt_uploader = dl_uploader
 
-    # -----------------------------------------------------
-    # Write TXT Lyrics
-    # -----------------------------------------------------
+    # ---------------------------------------------------------------
+    # Write TXT
+    # ---------------------------------------------------------------
     txt_path.write_text(lyrics_text, encoding="utf-8")
-    log("TXT", f"Wrote lyrics → {txt_path}", GREEN)
+    log("TXT", f"Wrote {txt_path}", GREEN)
 
-    # -----------------------------------------------------
-    # Build META JSON
-    # -----------------------------------------------------
-    meta: Dict[str, Any] = {
+    # ---------------------------------------------------------------
+    # Write META
+    # ---------------------------------------------------------------
+    meta = {
         "slug": slug,
         "query": raw_query,
         "artist": final_artist,
@@ -560,24 +683,24 @@ def main(argv=None):
         "lyrics_source": lyrics_meta.get("lyrics_source"),
         "musixmatch_track_id": lyrics_meta.get("musixmatch_track_id"),
         "genius_id": g_id,
-        "youtube_title": lyrics_meta.get("youtube_title") or dl_title or yt_title,
-        "youtube_uploader": lyrics_meta.get("youtube_uploader") or dl_uploader or yt_uploader,
-        "youtube_url": lyrics_meta.get("youtube_url") or yt_url,
+        "youtube_title": yt_title,
+        "youtube_uploader": yt_uploader,
+        "youtube_url": yt_url,
     }
 
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    log("META", f"Wrote meta JSON → {meta_path}", GREEN)
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    log("META", f"Wrote {meta_path}", GREEN)
 
     if mp3_path.exists():
-        log("MP3", f"Audio file at {mp3_path}", GREEN)
+        log("MP3", f"Audio at {mp3_path}", GREEN)
     else:
-        log("MP3", f"MP3 missing (expected {mp3_path})", YELLOW)
+        log("MP3", f"Missing mp3 at {mp3_path}", RED)
 
     print()
-    print(f"{BOLD}{GREEN}Done.{RESET}")
-    print(f"  TXT:  {WHITE}{txt_path}{RESET}")
-    print(f"  MP3:  {WHITE}{mp3_path}{RESET}")
-    print(f"  META: {WHITE}{meta_path}{RESET}")
+    print(f"{GREEN}Done.{RESET}  Slug: {MAGENTA}{slug}{RESET}")
+    print(f"  TXT:  {txt_path}")
+    print(f"  MP3:  {mp3_path}")
+    print(f"  META: {meta_path}")
 
 
 if __name__ == "__main__":
