@@ -58,7 +58,7 @@ def convert_mp3_to_wav(mp3_path: Path, wav_path: Path):
 
 
 # ------------------------------------------------------------
-# Convert aligned segments → CSV used by 4_mp4
+# Convert aligned segments → 4-column CSV (start/end/text)
 # ------------------------------------------------------------
 def alignment_to_csv(aligned: dict, csv_path: Path):
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,16 +66,19 @@ def alignment_to_csv(aligned: dict, csv_path: Path):
     print(f"{BLUE}[CSV]{RESET} Writing {csv_path}")
 
     with open(csv_path, "w") as f:
-        f.write("line_index,time_secs,text\n")
+        f.write("line_index,start,end,text\n")
 
         for idx, seg in enumerate(aligned["segments"]):
             start = seg.get("start")
+            end = seg.get("end")
             text = seg.get("text", "").replace('"', "'")
 
-            if not text or start is None:
+            if start is None or end is None:
+                continue
+            if not text:
                 continue
 
-            f.write(f"{idx},{start:.3f},\"{text}\"\n")
+            f.write(f"{idx},{start:.3f},{end:.3f},\"{text}\"\n")
 
 
 # ------------------------------------------------------------
@@ -98,10 +101,14 @@ def run_alignment(slug: str):
     # --- Step 1: Convert MP3 → WAV for alignment ---
     convert_mp3_to_wav(mp3_path, wav_path)
 
-    # --- Step 2: Load lyrics ---
-    lyric_lines = [line.strip() for line in txt_path.read_text().splitlines() if line.strip()]
+    # --- Step 2: Load lyrics (clean) ---
+    lyric_lines = [
+        line.strip()
+        for line in txt_path.read_text().splitlines()
+        if line.strip()
+    ]
 
-    # --- Step 3: ASR WITHOUT VAD ---
+    # --- Step 3: ASR (NO VAD) ---
     print(f"{BLUE}[ASR]{RESET} Loading Whisper (medium, int8)…")
     device = "cpu"
 
@@ -160,7 +167,7 @@ def run_alignment(slug: str):
         device
     )
 
-    # --- Step 6: Replace Whisper’s ASR text with YOUR lyrics ---
+    # --- Step 6: Replace ASR text with YOUR lyric lines ---
     print(f"{BLUE}[LYRICS]{RESET} Mapping lyrics to aligned segments…")
 
     segments = aligned_asr["segments"]
@@ -170,12 +177,12 @@ def run_alignment(slug: str):
 
     for i in range(min_len):
         seg = segments[i]
-        seg["text"] = lyric_lines[i]   # overwrite with your lyrics
+        seg["text"] = lyric_lines[i]  # overwrite ASR text with real lyrics
         out_segments.append(seg)
 
     aligned = {"segments": out_segments}
 
-    # --- Step 7: Write CSV ---
+    # --- Step 7: Save CSV for 4_mp4 ---
     alignment_to_csv(aligned, csv_path)
 
     print("\n========================================")
@@ -189,7 +196,7 @@ def run_alignment(slug: str):
 # ------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="One-shot WhisperX → CSV alignment pipeline with colorized logs"
+        description="One-shot WhisperX → CSV alignment pipeline (colorized, 4-column CSV)"
     )
     parser.add_argument("slug", help="e.g. nirvana_come_as_you_are")
     args = parser.parse_args()
