@@ -82,7 +82,7 @@ def get_meta_title_for_slug(slug: str) -> str:
         if artist and title:
             return f"{title} by {artist}"
         return title
-    except:
+    except Exception:
         return slug.replace("_", " ")
 
 # ============================================================================
@@ -147,7 +147,7 @@ def read_offset(slug: str) -> float:
         return 0.0
     try:
         return float(p.read_text().strip())
-    except:
+    except Exception:
         return 0.0
 
 def write_offset(slug: str, offset: float) -> None:
@@ -204,7 +204,7 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
             for p in stems_dir.glob("*.wav"):
                 try:
                     p.unlink()
-                except:
+                except Exception:
                     pass
             stems_exist = False
 
@@ -238,18 +238,27 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
     return run(cmd, "STEP2-RENDER")
 
 # ============================================================================
-# Step 3 Stub (timing UI)
+# Step 3 — timing UI / auto-timing
 # ============================================================================
-def run_step3(slug: str, model_size: str | None = None) -> float:
+def run_step3(slug: str, timing_model_size: str | None = None) -> float:
+    """
+    Run the auto-timing script for this slug.
+
+    timing_model_size (if provided) is passed as --model-size to 3_auto_timing.py
+    so you can choose tiny/base/small/medium/etc from 0_master.
+    """
     cmd = [sys.executable, str(SCRIPTS_DIR / "3_auto_timing.py"), "--slug", slug]
-    if model_size:
-        cmd.extend(["--model-size", model_size])
+    if timing_model_size:
+        cmd += ["--model-size", timing_model_size]
     return run(cmd, "STEP3")
 
 # ============================================================================
-# Step 4 Stub (mp4 render)
+# Step 4 — mp4 render
 # ============================================================================
-def run_step4(slug: str, profile: str, offset: float, force=False, called_from_master=True) -> float:
+def run_step4(slug: str, profile: str, offset: float, force: bool = False, called_from_master: bool = True) -> float:
+    """
+    Render MP4 via 4_mp4.py, always passing the chosen offset through.
+    """
     cmd = [
         sys.executable, str(SCRIPTS_DIR / "4_mp4.py"),
         "--slug", slug,
@@ -261,7 +270,7 @@ def run_step4(slug: str, profile: str, offset: float, force=False, called_from_m
     return run(cmd, "STEP4")
 
 # ============================================================================
-# Step 5 Stub (upload)
+# Step 5 — upload
 # ============================================================================
 def run_step5(slug: str, profile: str, offset: float) -> float:
     cmd = [
@@ -303,7 +312,7 @@ def choose_steps_interactive(status: dict[str, str]) -> list[int]:
     if raw == "0":
         return []
 
-    chosen = []
+    chosen: list[int] = []
     for ch in raw:
         if ch.isdigit():
             i = int(ch)
@@ -385,7 +394,13 @@ def parse_args():
     p.add_argument("--no-ui", action="store_true")
     p.add_argument("--force-mp4", action="store_true")
     p.add_argument("--no-upload", action="store_true")
-    p.add_argument("--timing-model-size", type=str, help="Override model size for timing (3_auto_timing.py)")
+    # NEW: allow choosing timing model size for 3_auto_timing.py
+    p.add_argument(
+        "--timing-model-size",
+        type=str,
+        default=None,
+        help="Model size for step 3 auto-timing (e.g. tiny, base, small, medium).",
+    )
     return p.parse_args()
 
 # ============================================================================
@@ -395,8 +410,8 @@ def main():
     args = parse_args()
     no_ui = args.no_ui
 
-    slug = None
-    query = None
+    slug: str | None = None
+    query: str | None = None
 
     if args.slug:
         slug = slugify(args.slug)
@@ -420,15 +435,15 @@ def main():
         offset = read_offset(slug)
         log("OFFSET", f"Using stored offset={offset:+.3f}s", CYAN)
 
-    # Always persist the resolved offset so all downstream steps share it
-    write_offset(slug, offset)
+    if args.timing_model_size:
+        log("TIMING", f"Using timing model size={args.timing_model_size}", CYAN)
 
     status = detect_step_status(slug, args.profile)
 
     show_pipeline_status(status)
 
     if args.steps:
-        steps = []
+        steps: list[int] = []
         for ch in args.steps:
             if ch.isdigit():
                 i = int(ch)
@@ -487,7 +502,6 @@ def main():
         if t5: print(f"{WHITE}Step5 upload:{RESET}   {GREEN}{fmt_secs(t5)}{RESET}")
         print(f"{GREEN}Total time:{RESET}       {BOLD}{fmt_secs(total)}{RESET}")
         print(f"{BOLD}{CYAN}=================================={RESET}")
-
 
 if __name__ == "__main__":
     main()
