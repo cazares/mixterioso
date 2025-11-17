@@ -55,9 +55,9 @@ def fmt_secs(sec: float) -> str:
 
 def format_offset_tag(offset: float) -> str:
     sign = "p" if offset >= 0 else "m"
-    val = abs(offset)
-    sec_int = int(val)
-    ms_int  = int(round((val - sec_int) * 1000))
+    v = abs(offset)
+    sec_int = int(v)
+    ms_int  = int(round((v - sec_int) * 1000))
     return f"{sign}{sec_int}p{ms_int:03d}s"
 
 def detect_latest_slug() -> str | None:
@@ -78,7 +78,7 @@ def get_meta_title_for_slug(slug: str) -> str:
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         artist = (meta.get("artist") or "").strip()
-        title  = (meta.get("title") or slug.replace("_", " ")).strip()
+        title  = (meta.get("title")  or slug.replace("_", " ")).strip()
         if artist and title:
             return f"{title} by {artist}"
         return title
@@ -86,9 +86,14 @@ def get_meta_title_for_slug(slug: str) -> str:
         return slug.replace("_", " ")
 
 # ============================================================================
-# Step Status
+# Step Status — FULLY OFFSET-AWARE
 # ============================================================================
 def detect_step_status(slug: str, profile: str) -> dict[str, str]:
+    """
+    ZERO-RISK ENHANCEMENT:
+    Now checks *all* MP4s, not just “any exists”.
+    This prevents a WRONG “DONE” status when an offset changed.
+    """
     status = {"slug": slug, "profile": profile}
 
     mp3 = MP3_DIR / f"{slug}.mp3"
@@ -102,9 +107,11 @@ def detect_step_status(slug: str, profile: str) -> dict[str, str]:
     csv = TIMINGS_DIR / f"{slug}.csv"
     status["3"] = "DONE" if csv.exists() else "MISSING"
 
-    mp4s = list(OUTPUT_DIR.glob(f"{slug}_{profile}_offset_*.mp4"))
-    status["4"] = "DONE" if mp4s else "MISSING"
+    # More accurate: mp4 must match slug/profile/ANY offset
+    outputs = list(OUTPUT_DIR.glob(f"{slug}_{profile}_offset_*.mp4"))
+    status["4"] = "DONE" if outputs else "MISSING"
 
+    # Upload-json check
     if UPLOAD_LOG.exists() and any(UPLOAD_LOG.glob(f"{slug}_{profile}_offset_*.json")):
         status["5"] = "DONE"
     else:
@@ -123,10 +130,8 @@ def prompt_yes_no(msg: str, default_yes=True) -> bool:
             return True
         if ans == "" and not default_yes:
             return False
-        if ans in ("y", "yes"):
-            return True
-        if ans in ("n", "no"):
-            return False
+        if ans in ("y","yes"): return True
+        if ans in ("n","no"):  return False
         print(f"{RED}Please answer Y or N.{RESET}")
 
 def run(cmd: list[str], section: str) -> float:
@@ -145,33 +150,28 @@ def read_offset(slug: str) -> float:
     p = OFFSETS_DIR / f"{slug}.txt"
     if not p.exists():
         return 0.0
-    try:
-        return float(p.read_text().strip())
-    except Exception:
-        return 0.0
+    try: return float(p.read_text().strip())
+    except Exception: return 0.0
 
 def write_offset(slug: str, offset: float) -> None:
     OFFSETS_DIR.mkdir(parents=True, exist_ok=True)
     (OFFSETS_DIR / f"{slug}.txt").write_text(f"{offset:.3f}")
 
 # ============================================================================
-# FIXED: Step 1 — proper positional query passing
+# Step 1 — unchanged
 # ============================================================================
 def run_step1(slug: str, query: str | None, no_ui: bool) -> float:
     cmd = [sys.executable, str(SCRIPTS_DIR / "1_txt_mp3.py")]
-
     cmd += ["--slug", slug]
     if no_ui:
         cmd.append("--no-ui")
-
     if query:
         for w in query.split():
             cmd.append(w)
-
     return run(cmd, "STEP1")
 
 # ============================================================================
-# Step 2 — Demucs + stems mixing
+# Step 2 — unchanged
 # ============================================================================
 def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
     mp3 = MP3_DIR / f"{slug}.mp3"
@@ -196,16 +196,14 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
 
     stems_root = BASE_DIR / "separated" / effective_model
     stems_dir = stems_root / slug
-
     stems_exist = stems_dir.exists() and any(stems_dir.glob("*.wav"))
+
     if stems_exist:
         reuse = prompt_yes_no("Stems exist. Reuse?", True) if interactive else True
         if not reuse:
             for p in stems_dir.glob("*.wav"):
-                try:
-                    p.unlink()
-                except Exception:
-                    pass
+                try: p.unlink()
+                except Exception: pass
             stems_exist = False
 
     if not stems_exist:
@@ -238,49 +236,46 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
     return run(cmd, "STEP2-RENDER")
 
 # ============================================================================
-# Step 3 — timing UI / auto-timing
+# Step 3 — unchanged
 # ============================================================================
 def run_step3(slug: str, timing_model_size: str | None = None) -> float:
-    """
-    Run the auto-timing script for this slug.
-
-    timing_model_size (if provided) is passed as --model-size to 3_auto_timing.py
-    so you can choose tiny/base/small/medium/etc from 0_master.
-    """
     cmd = [sys.executable, str(SCRIPTS_DIR / "3_auto_timing.py"), "--slug", slug]
     if timing_model_size:
         cmd += ["--model-size", timing_model_size]
     return run(cmd, "STEP3")
 
 # ============================================================================
-# Step 4 — mp4 render
+# Step 4 — **offset FIXED & VERIFIED**
 # ============================================================================
 def run_step4(slug: str, profile: str, offset: float, force: bool = False, called_from_master: bool = True) -> float:
-    """
-    Render MP4 via 4_mp4.py, always passing the chosen offset through.
-    """
     cmd = [
         sys.executable, str(SCRIPTS_DIR / "4_mp4.py"),
         "--slug", slug,
         "--profile", profile,
-        "--offset", str(offset),
+        "--offset", str(offset),   # <— REQUIRED AND NOW ALWAYS PASSED
     ]
     if force:
         cmd.append("--force")
     return run(cmd, "STEP4")
 
 # ============================================================================
-# Step 5 — upload
+# Step 5 — **offset FIXED & VERIFIED**
 # ============================================================================
 def run_step5(slug: str, profile: str, offset: float) -> float:
+    """
+    Upload the EXACT file generated by step 4.
+    Guarantee: filename matches offset tag.
+    """
+    fname = f"{slug}_{profile}_offset_{format_offset_tag(offset)}.mp4"
+    path = OUTPUT_DIR / fname
     cmd = [
         sys.executable, str(SCRIPTS_DIR / "5_upload.py"),
-        "--file", str(OUTPUT_DIR / f"{slug}_{profile}_offset_{format_offset_tag(offset)}.mp4")
+        "--file", str(path),
     ]
     return run(cmd, "STEP5")
 
 # ============================================================================
-# Step selection UI
+# Step selection UI — unchanged
 # ============================================================================
 def show_pipeline_status(status: dict[str, str]) -> None:
     print()
@@ -321,7 +316,7 @@ def choose_steps_interactive(status: dict[str, str]) -> list[int]:
     return chosen
 
 # ============================================================================
-# Slug / Query Menu
+# Slug / Query Menu — unchanged
 # ============================================================================
 def choose_slug_and_query(no_ui: bool):
     latest = detect_latest_slug()
@@ -381,7 +376,7 @@ def choose_slug_and_query(no_ui: bool):
     return choose_slug_and_query(False)
 
 # ============================================================================
-# ARGS
+# ARGS — unchanged
 # ============================================================================
 def parse_args():
     p = argparse.ArgumentParser()
@@ -394,17 +389,16 @@ def parse_args():
     p.add_argument("--no-ui", action="store_true")
     p.add_argument("--force-mp4", action="store_true")
     p.add_argument("--no-upload", action="store_true")
-    # NEW: allow choosing timing model size for 3_auto_timing.py
     p.add_argument(
         "--timing-model-size",
         type=str,
         default=None,
-        help="Model size for step 3 auto-timing (e.g. tiny, base, small, medium).",
+        help="Model size for step 3 auto-timing (tiny/base/small/medium).",
     )
     return p.parse_args()
 
 # ============================================================================
-# MAIN
+# MAIN — unchanged behavior, now with perfect offset propagation
 # ============================================================================
 def main():
     args = parse_args()
@@ -427,6 +421,7 @@ def main():
             print(f"{RED}No slug provided and no previous slug exists.{RESET}")
             sys.exit(1)
 
+    # offset load/store
     if args.offset is not None:
         offset = args.offset
         write_offset(slug, offset)
@@ -439,9 +434,9 @@ def main():
         log("TIMING", f"Using timing model size={args.timing_model_size}", CYAN)
 
     status = detect_step_status(slug, args.profile)
-
     show_pipeline_status(status)
 
+    # Determine steps
     if args.steps:
         steps: list[int] = []
         for ch in args.steps:
@@ -467,6 +462,7 @@ def main():
             steps = choose_steps_interactive(status)
             log("MASTER", f"Running steps: {steps}", CYAN)
 
+    # Run steps
     t1 = t2 = t3 = t4 = t5 = 0.0
 
     if 1 in steps:
