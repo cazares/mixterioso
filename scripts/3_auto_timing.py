@@ -15,6 +15,11 @@
 #   python3 scripts/3_auto_timing.py --slug ascension \
 #     --mp3 mp3s/ascension.mp3 --txt txts/ascension.txt \
 #     --model-size small --lang en
+#
+# Near-term enhancement:
+#   - If no explicit --mp3 is given, this script will prefer a vocal-only
+#     stem from separated/*/<slug>/*vocals*.wav (Demucs output) when present,
+#     falling back to mp3s/<slug>.mp3 otherwise.
 
 from __future__ import annotations
 
@@ -62,6 +67,8 @@ MP3_DIR = BASE_DIR / "mp3s"
 TIMINGS_DIR = BASE_DIR / "timings"
 TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
 
+SEPARATED_DIR = BASE_DIR / "separated"  # where Demucs stems live
+
 # ---------- Data classes ----------
 @dataclass
 class Word:
@@ -107,6 +114,59 @@ def write_timings_csv(slug: str, triples: List[Tuple[int, float, float, str]]) -
             w.writerow([li, f"{ts:.3f}", f"{te:.3f}", tx])
     print(f"[green]Wrote timings:[/green] {out} ({len(triples)} rows)")
     return out
+
+
+# ---------- Audio selection for timing ----------
+def choose_timing_audio(slug: str, explicit_audio: Optional[Path]) -> Path:
+    """
+    Decide which audio file to use for timing:
+      - If explicit_audio is provided and exists: use it.
+      - Else, search for a Demucs vocal stem:
+            separated/*/<slug>/*vocals*.wav
+        pick the newest such file.
+      - Else, fall back to mp3s/<slug>.mp3.
+    """
+    # 1) Explicit override from CLI
+    if explicit_audio is not None:
+        if explicit_audio.exists():
+            print(f"[cyan]Using explicit audio for timing:[/cyan] {explicit_audio}")
+            return explicit_audio
+        else:
+            print(
+                f"[yellow]Explicit --mp3 not found, falling back to stems/mp3 search:[/yellow] "
+                f"{explicit_audio}"
+            )
+
+    # 2) Try to find a Demucs vocal stem
+    candidates: List[Path] = []
+    if SEPARATED_DIR.exists():
+        for model_dir in SEPARATED_DIR.iterdir():
+            if not model_dir.is_dir():
+                continue
+            slug_dir = model_dir / slug
+            if not slug_dir.is_dir():
+                continue
+            # Demucs typically names as 'vocals.wav' or '*vocals*.wav'
+            for p in slug_dir.glob("*vocals*.wav"):
+                candidates.append(p)
+
+    if candidates:
+        # Pick newest candidate by mtime = "latest processed"
+        best = max(candidates, key=lambda p: p.stat().st_mtime)
+        print(f"[green]Using vocal stem for timing:[/green] {best}")
+        return best
+
+    # 3) Fallback to original MP3
+    audio_path = MP3_DIR / f"{slug}.mp3"
+    if audio_path.exists():
+        print(
+            f"[yellow]Vocal stem not found; using original mp3 for timing:[/yellow] "
+            f"{audio_path}"
+        )
+        return audio_path
+
+    print(f"[bold red]No audio found for timing for slug={slug}[/bold red]")
+    sys.exit(1)
 
 
 # ---------- Transcription ----------
@@ -228,21 +288,27 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
     total_span = max(0.1, words[-1].end - words[0].start)
     avg_gap = max(1.5, min(6.0, total_span / max(1, len(lines))))  # seconds per line, clamped
 
-    MAX_LOOKAHEAD_WORDS = 120
-    TIME_PENALTY_PER_SEC = 1.3
-    TIME_PENALTY_MAX = 40.0
+    # How far ahead (in word tokens) each line is allowed to search.
+    MAX_LOOKAHEAD_WORDS = 120  # ~30–60 seconds of audio depending on speech rate
 
-    triples_temp: List[Tuple[int, float, Optional[float], str]] = []
+    # Time penalty scales
+    TIME_PENALTY_PER_SEC = 1.3   # how many "similarity points" per second of distance
+    TIME_PENALTY_MAX = 40.0      # cap penalty so far matches aren't completely nuked
 
+    triples: List[Tuple[int, float, float, str]] = []
+
+    # We'll walk forward through the transcript once.
     search_start_idx = 0
     prev_time = max(0.0, words[0].start - 0.5)
 
     for idx, raw_line in enumerate(lines):
         line_n = norm(raw_line)
         if not line_n:
-            t = prev_time + 0.5
-            triples_temp.append((idx, t, None, raw_line))
-            prev_time = t
+            # Blank line: keep a short gap
+            t_start = prev_time + 0.5
+            t_end = t_start + 2.0
+            triples.append((idx, t_start, t_end, raw_line))
+            prev_time = t_start
             continue
 
         line_tokens = line_n.split()
@@ -274,7 +340,7 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
             if not window_norm:
                 continue
 
-            text_sim = _similarity(window_norm, line_n)
+            text_sim = _similarity(window_norm, line_n)  # 0..100-ish
 
             start_time = words[start].start
             if expected_time is not None:
@@ -290,41 +356,37 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
                 best_start = start
 
         if best_score < 30.0:
-            t = prev_time + avg_gap
+            # Couldn't confidently align; guess based on previous time
+            t_start = prev_time + avg_gap
             print(
                 f"[yellow]Low alignment score ({best_score:.1f}) for line {idx} → "
-                f"fallback at {t:.2f}s[/yellow]"
+                f"fallback at {t_start:.2f}s[/yellow]"
             )
         else:
             t_candidate = words[best_start].start
             if t_candidate < prev_time - 0.25:
                 t_candidate = prev_time + 0.01
-            t = t_candidate
+            t_start = t_candidate
 
-        # ---- NEW: temporarily store end=None for all but last ----
-        if idx < len(lines) - 1:
-            triples_temp.append((idx, t, None, raw_line))
-        else:
-            end_t = t + avg_gap
-            triples_temp.append((idx, t, end_t, raw_line))
+        # End time heuristic: either the start of the next aligned line, or start + avg_gap
+        t_end = t_start + avg_gap
 
-        prev_time = t
+        triples.append((idx, t_start, t_end, raw_line))
+        prev_time = t_start
 
         MIN_ADVANCE_WORDS = max(3, len(line_tokens))
-        search_start_idx = min(n_words - 1, max(best_start + MIN_ADVANCE_WORDS, search_start_idx + 1))
+        search_start_idx = min(
+            n_words - 1,
+            max(best_start + MIN_ADVANCE_WORDS, search_start_idx + 1),
+        )
 
-    # ---- NEW: second pass assigning end times = next line's start ----
-    triples: List[Tuple[int, float, float, str]] = []
-    for i in range(len(triples_temp) - 1):
-        li, st, en, tx = triples_temp[i]
-        if en is None:
-            next_start = triples_temp[i + 1][1]
-            en = next_start
-        triples.append((li, st, en, tx))
-
-    # Last item already has end time
-    li, st, en, tx = triples_temp[-1]
-    triples.append((li, st, en, tx))
+    # Post-process end times so they don't go backwards
+    for i in range(len(triples) - 1):
+        li, s, e, text = triples[i]
+        _, s_next, _, _ = triples[i + 1]
+        if e > s_next:
+            e = max(s, s_next - 0.05)
+        triples[i] = (li, s, e, text)
 
     return triples
 
@@ -341,7 +403,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mp3",
         type=str,
-        help="Path to audio file. Default: mp3s/<slug>.mp3",
+        help="Path to audio file. If omitted, will prefer a vocal stem from separated/*/<slug>/*vocals*.wav, "
+             "falling back to mp3s/<slug>.mp3.",
     )
     parser.add_argument(
         "--txt",
@@ -374,11 +437,12 @@ def main() -> None:
 
     slug = args.slug
     txt_path = Path(args.txt) if args.txt else (TXT_DIR / f"{slug}.txt")
-    audio_path = Path(args.mp3) if args.mp3 else (MP3_DIR / f"{slug}.mp3")
+    explicit_audio = Path(args.mp3) if args.mp3 else None
+    audio_path = choose_timing_audio(slug, explicit_audio)
 
-    print(f"[cyan]Slug:[/cyan] {slug}")
-    print(f"[cyan]TXT:[/cyan]  {txt_path}")
-    print(f"[cyan]MP3:[/cyan]  {audio_path}")
+    print(f"[cyan]Slug:[/cyan]  {slug}")
+    print(f"[cyan]TXT:[/cyan]   {txt_path}")
+    print(f"[cyan]Audio for timing:[/cyan] {audio_path}")
 
     if not audio_path.exists():
         print(f"[bold red]Audio not found:[/bold red] {audio_path}")
