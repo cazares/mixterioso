@@ -108,7 +108,7 @@ ASS_FONT_MULTIPLIER = 1.5  # UI points -> ASS "Fontsize"
 # Global lyrics timing offset in seconds.
 # Negative => lyrics earlier (sooner); Positive => lyrics later.
 # Default from env; can be overridden by --offset argument.
-LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0") or "0")
+LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "-0.5") or "-0.5")
 
 # Music note logic
 MUSIC_NOTE_CHARS = "♪♫♬♩♭♮"

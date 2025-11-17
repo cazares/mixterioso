@@ -239,7 +239,7 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
 # Step 3 Stub (timing UI)
 # ============================================================================
 def run_step3(slug: str) -> float:
-    cmd = [sys.executable, str(SCRIPTS_DIR / "3_timing.py"), "--slug", slug]
+    cmd = [sys.executable, str(SCRIPTS_DIR / "3_auto_timing.py"), "--slug", slug]
     return run(cmd, "STEP3")
 
 # ============================================================================

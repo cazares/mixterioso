@@ -4,7 +4,7 @@
 # Auto-time lyrics (TXT) to audio (MP3/WAV):
 # - Transcribes words with timestamps via faster-whisper
 # - Aligns each lyric line to the best-matching word span
-# - Emits timings/<slug>.csv with header: line_index,time_secs,text
+# - Emits timings/<slug>.csv with header: line_index,start,end,text
 #
 # Repeated-lyrics aware:
 # - Walks forward through the transcript once (no jumping back)
@@ -98,13 +98,13 @@ def load_lyrics_lines(txt_path: Path) -> List[str]:
     return [ln for ln in lines if ln.strip()]
 
 
-def write_timings_csv(slug: str, triples: List[Tuple[int, float, str]]) -> Path:
+def write_timings_csv(slug: str, triples: List[Tuple[int, float, float, str]]) -> Path:
     out = TIMINGS_DIR / f"{slug}.csv"
     with out.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["line_index", "time_secs", "text"])
-        for li, ts, tx in triples:
-            w.writerow([li, f"{ts:.3f}", tx])
+        w.writerow(["line_index", "start", "end", "text"])
+        for li, ts, te, tx in triples:
+            w.writerow([li, f"{ts:.3f}", f"{te:.3f}", tx])
     print(f"[green]Wrote timings:[/green] {out} ({len(triples)} rows)")
     return out
 
@@ -195,7 +195,7 @@ def _similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio() * 100.0  # type: ignore[name-defined]
 
 
-def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int, float, str]]:
+def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int, float, float, str]]:
     """
     Repeated-lyrics-aware alignment.
 
@@ -214,10 +214,10 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
     if not words:
         # Fallback: dumb linear guess
         print("[yellow]No words from transcription; using naive +2.5s spacing[/yellow]")
-        out: List[Tuple[int, float, str]] = []
+        out: List[Tuple[int, float, float, str]] = []
         t = 0.0
         for idx, line in enumerate(lines):
-            out.append((idx, t, line))
+            out.append((idx, t, t + 2.5, line))
             t += 2.5
         return out
 
@@ -228,37 +228,29 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
     total_span = max(0.1, words[-1].end - words[0].start)
     avg_gap = max(1.5, min(6.0, total_span / max(1, len(lines))))  # seconds per line, clamped
 
-    # How far ahead (in word tokens) each line is allowed to search.
-    # This is the main guard against jumping to a very late repetition.
-    MAX_LOOKAHEAD_WORDS = 120  # ~30–60 seconds of audio depending on speech rate
+    MAX_LOOKAHEAD_WORDS = 120
+    TIME_PENALTY_PER_SEC = 1.3
+    TIME_PENALTY_MAX = 40.0
 
-    # Time penalty scales
-    TIME_PENALTY_PER_SEC = 1.3   # how many "similarity points" per second of distance
-    TIME_PENALTY_MAX = 40.0      # cap penalty so far matches aren't completely nuked
+    triples_temp: List[Tuple[int, float, Optional[float], str]] = []
 
-    triples: List[Tuple[int, float, str]] = []
-
-    # We'll walk forward through the transcript once.
     search_start_idx = 0
     prev_time = max(0.0, words[0].start - 0.5)
 
     for idx, raw_line in enumerate(lines):
         line_n = norm(raw_line)
         if not line_n:
-            # Blank line: just keep time monotone-ish
             t = prev_time + 0.5
-            triples.append((idx, t, raw_line))
+            triples_temp.append((idx, t, None, raw_line))
             prev_time = t
             continue
 
         line_tokens = line_n.split()
-        # Rough estimate of how many words should match this line
         approx_len = max(1, min(len(line_tokens), 12))
 
         best_score = -1e9
         best_start = search_start_idx
 
-        # Limit search window to avoid leaping across the song
         start_min = min(search_start_idx, n_words - 1)
         start_max = min(n_words - 1, start_min + MAX_LOOKAHEAD_WORDS)
 
@@ -268,7 +260,6 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
             expected_time = prev_time + avg_gap
 
         for start in range(start_min, start_max + 1):
-            # Window size heuristics: not too small, not too large
             remaining = n_words - start
             if remaining <= 0:
                 break
@@ -283,9 +274,8 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
             if not window_norm:
                 continue
 
-            text_sim = _similarity(window_norm, line_n)  # 0..100-ish
+            text_sim = _similarity(window_norm, line_n)
 
-            # Time penalty: earlier lines expect matches near expected_time
             start_time = words[start].start
             if expected_time is not None:
                 time_diff = abs(start_time - expected_time)
@@ -299,9 +289,7 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
                 best_score = score
                 best_start = start
 
-        # Threshold for "this line matched something"
         if best_score < 30.0:
-            # Couldn't confidently align; guess based on previous time
             t = prev_time + avg_gap
             print(
                 f"[yellow]Low alignment score ({best_score:.1f}) for line {idx} → "
@@ -309,18 +297,34 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
             )
         else:
             t_candidate = words[best_start].start
-            # Enforce monotonic increasing times with a small margin
             if t_candidate < prev_time - 0.25:
                 t_candidate = prev_time + 0.01
             t = t_candidate
 
-        triples.append((idx, t, raw_line))
+        # ---- NEW: temporarily store end=None for all but last ----
+        if idx < len(lines) - 1:
+            triples_temp.append((idx, t, None, raw_line))
+        else:
+            end_t = t + avg_gap
+            triples_temp.append((idx, t, end_t, raw_line))
+
         prev_time = t
 
-        # Advance the search window so future lines can't reuse the same words
-        # and can't jump backwards.
         MIN_ADVANCE_WORDS = max(3, len(line_tokens))
         search_start_idx = min(n_words - 1, max(best_start + MIN_ADVANCE_WORDS, search_start_idx + 1))
+
+    # ---- NEW: second pass assigning end times = next line's start ----
+    triples: List[Tuple[int, float, float, str]] = []
+    for i in range(len(triples_temp) - 1):
+        li, st, en, tx = triples_temp[i]
+        if en is None:
+            next_start = triples_temp[i + 1][1]
+            en = next_start
+        triples.append((li, st, en, tx))
+
+    # Last item already has end time
+    li, st, en, tx = triples_temp[-1]
+    triples.append((li, st, en, tx))
 
     return triples
 
