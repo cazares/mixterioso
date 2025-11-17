@@ -10,6 +10,8 @@
 # - Walks forward through the transcript once (no jumping back)
 # - Only searches a local window ahead of the previous line
 # - Penalizes matches far away from the expected time
+# - Uses run-tags in transcript (memoria#1.1, memoria#2.1, …) to bias
+#   repeated lyric lines toward the correct chorus run
 # - Post-fix pass smooths timings for consecutive repeated lines
 #
 # Usage:
@@ -84,6 +86,7 @@ class Word:
 # ---------- Normalization helpers ----------
 _PUNCT_RE = re.compile(r"[^a-z0-9'\s]+", re.IGNORECASE)
 _WS_RE = re.compile(r"\s+")
+_RUN_TAG_RE = re.compile(r"#(\d+)\.\d+")  # e.g. memoria#2.3 → run 2
 
 
 def norm(s: str) -> str:
@@ -386,24 +389,39 @@ def fix_repeated_lyric_blocks(
     return new_triples
 
 
+def _extract_run_id_from_word_text(text: str) -> Optional[int]:
+    """
+    Given a tagged word like 'memoria#2.3', return run_id=2.
+    """
+    m = _RUN_TAG_RE.search(text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
 def align_lyrics_to_words(
     lines: List[str],
     words: List[Word],
 ) -> List[Tuple[int, float, float, str]]:
     """
-    Repeated-lyrics-aware alignment.
+    Repeated-lyrics-aware alignment with run-aware bias.
 
     Strategy:
     - Pre-normalize transcript words (but keep tagged text around).
     - Track a "search_start_idx" that only moves forward (never backwards).
+    - Track how many times we've already seen each lyric line text
+      (1st, 2nd, 3rd occurrence of 'memoria', etc.).
     - For each lyric line:
-        * Look at a limited window of words ahead of search_start_idx.
-        * Score each window by (text_similarity - time_penalty).
-        * Choose the best start index.
-        * The line's time is the start time of that window.
-    - Time penalty pulls matches toward the expected time (prev_time + avg_gap),
-      so identical repeated lines near the end don't steal lines that belong
-      to earlier repeats.
+        * Look at a window of words ahead of search_start_idx.
+        * Score each window by:
+              score = text_similarity - time_penalty + run_bonus
+          where run_bonus nudges towards matching the corresponding
+          repeated word run in the transcript.
+    - After this, a post-fix layer smooths clearly suspicious timing
+      on consecutive repeated lyric lines.
     """
     if not words:
         # Fallback: dumb linear guess
@@ -429,14 +447,30 @@ def align_lyrics_to_words(
     TIME_PENALTY_PER_SEC = 1.3   # how many "similarity points" per second of distance
     TIME_PENALTY_MAX = 40.0      # cap penalty so far matches aren't completely nuked
 
+    # Run-aware scoring weights
+    RUN_MATCH_BONUS = 6.0        # bonus if run_id aligns with lyric occurrence index
+    RUN_EARLY_PENALTY = 4.0      # penalty if candidate run_id < occurrence index
+    RUN_LATE_PENALTY = 3.0       # penalty if candidate run_id is far ahead
+
     triples: List[Tuple[int, float, float, str]] = []
 
     # We'll walk forward through the transcript once.
     search_start_idx = 0
     prev_time = max(0.0, words[0].start - 0.5)
 
+    # Track how many times we've aligned each normalized lyric text so far
+    occurrence_counter = {}  # key: norm(line), value: count used so far
+
     for idx, raw_line in enumerate(lines):
         line_n = norm(raw_line)
+
+        # Compute which occurrence of this line we are on (1st, 2nd, …)
+        # For blank lines, we don't care.
+        if line_n:
+            occ_index = occurrence_counter.get(line_n, 0) + 1
+        else:
+            occ_index = 1
+
         if not line_n:
             # Blank line: keep a short gap
             t_start = prev_time + 0.5
@@ -483,7 +517,21 @@ def align_lyrics_to_words(
             else:
                 time_penalty = 0.0
 
-            score = text_sim - time_penalty
+            # Run-aware bonus/penalty: try to align e.g. 2nd 'memoria' line to 2nd
+            # 'memoria' run in transcript.
+            run_bonus = 0.0
+            if occ_index >= 1:
+                run_id = _extract_run_id_from_word_text(words[start].text)
+                if run_id is not None:
+                    if run_id == occ_index:
+                        run_bonus += RUN_MATCH_BONUS
+                    elif run_id < occ_index:
+                        run_bonus -= RUN_EARLY_PENALTY
+                    elif run_id > occ_index + 1:
+                        # allow a little slop for near matches, penalize bigger jumps
+                        run_bonus -= RUN_LATE_PENALTY
+
+            score = text_sim - time_penalty + run_bonus
 
             if score > best_score:
                 best_score = score
@@ -508,11 +556,16 @@ def align_lyrics_to_words(
         triples.append((idx, t_start, t_end, raw_line))
         prev_time = t_start
 
+        # Only advance search_start_idx forward
         MIN_ADVANCE_WORDS = max(3, len(line_tokens))
         search_start_idx = min(
             n_words - 1,
             max(best_start + MIN_ADVANCE_WORDS, search_start_idx + 1),
         )
+
+        # Commit occurrence count for this lyric line text
+        if line_n:
+            occurrence_counter[line_n] = occ_index
 
     # First pass: clamp end times so they don't exceed the next line's start
     for i in range(len(triples) - 1):
