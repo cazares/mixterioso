@@ -87,15 +87,20 @@ def norm(s: str) -> str:
     """
     Normalize text for fuzzy matching:
     - lowercase
+    - strip run-tags (#1.3, #12.2, etc.)
     - keep apostrophes
-    - strip other punctuation
+    - strip punctuation
     - collapse whitespace
     """
     s = s.strip().lower()
+
+    # REMOVE run-tags like '#1.3' or '#12.7'
+    s = re.sub(r"#\d+\.\d+", " ", s)
+
+    # existing cleanup
     s = _PUNCT_RE.sub(" ", s)
     s = _WS_RE.sub(" ", s).strip()
     return s
-
 
 def load_lyrics_lines(txt_path: Path) -> List[str]:
     if not txt_path.exists():
@@ -242,130 +247,51 @@ def transcribe_words(
     print(f"[green]Transcribed {len(words)} words[/green]")
     return words
 
+def tag_repeated_transcript_words(words, max_gap=1.5):
+    """
+    Given a list of Word(text,start,end), detect repeated text blocks
+    and tag each occurrence with a run counter.
+
+    Example:
+        "memoria memoria memoria"  → memoria#1.1, memoria#1.2, memoria#1.3
+        (later repeats) → memoria#2.1 ...
+    """
+    if not words:
+        return words
+
+    tagged = []
+    prev_text = None
+    prev_end = None
+    run_id = 0
+    idx_in_run = 0
+
+    for w in words:
+        t = w.text.lower()
+        if t == prev_text and prev_end is not None and abs(w.start - prev_end) <= max_gap:
+            # continues same run
+            idx_in_run += 1
+        else:
+            # new run
+            run_id += 1
+            idx_in_run = 1
+
+        tagged_text = f"{t}#{run_id}.{idx_in_run}"
+        tagged.append(Word(text=tagged_text, start=w.start, end=w.end))
+
+        prev_text = t
+        prev_end = w.end
+
+    return tagged
 
 # ---------- Similarity & alignment ----------
 def _similarity(a: str, b: str) -> float:
-    """
-    Return a similarity score in roughly [0, 100].
-    """
+    a = norm(a)
+    b = norm(b)
     if not a or not b:
         return 0.0
     if _HAS_RAPIDFUZZ:
         return float(fuzz.ratio(a, b))
-    # Fallback to difflib
-    return difflib.SequenceMatcher(None, a, b).ratio() * 100.0  # type: ignore[name-defined]
-
-
-def _postfix_fix_repeated_runs(
-    lines: List[str],
-    triples: List[Tuple[int, float, float, str]],
-    words: List[Word],
-    avg_gap: float,
-) -> List[Tuple[int, float, float, str]]:
-    """
-    Post-fix pass: smooth timings for consecutive repeated lines.
-
-    For any maximal run of consecutive lines whose normalized texts are identical,
-    if the gaps inside that run look suspicious (too small, too big, or non-increasing),
-    we keep the first start as an anchor and re-space the run evenly between that
-    start and the next non-repeated line (or track end).
-    """
-    if not triples:
-        return triples
-
-    n = len(triples)
-    norm_lines = [norm(t) for (_li, _s, _e, t) in triples]
-    track_end = words[-1].end if words else max(triples[-1][2], triples[-1][1] + avg_gap)
-
-    # Helper to decide if a run "needs fixing"
-    def needs_fix(start_idx: int, end_idx: int) -> bool:
-        if end_idx <= start_idx:
-            return False
-        diffs: List[float] = []
-        for i in range(start_idx, end_idx):
-            _, s1, _e1, _t1 = triples[i]
-            _, s2, _e2, _t2 = triples[i + 1]
-            diffs.append(s2 - s1)
-        if not diffs:
-            return False
-
-        min_gap = min(diffs)
-        max_gap = max(diffs)
-
-        # Suspicious if any non-increasing, or gaps wildly off from avg_gap
-        if any(d <= 0 for d in diffs):
-            return True
-        if max_gap > 2.5 * avg_gap:
-            return True
-        if min_gap < 0.35 * avg_gap:
-            return True
-        return False
-
-    i = 0
-    while i < n:
-        base = norm_lines[i]
-        if not base:
-            i += 1
-            continue
-
-        # Find maximal run of same normalized text
-        j = i
-        while j + 1 < n and norm_lines[j + 1] == base:
-            j += 1
-
-        if j == i:
-            i += 1
-            continue  # no repetition
-
-        # We have a run [i, j] (inclusive) of repeated lines
-        if not needs_fix(i, j):
-            i = j + 1
-            continue
-
-        # Anchor at the first start
-        li0, start0, end0, text0 = triples[i]
-        run_len = j - i + 1
-
-        # Right boundary is next line start, or track_end if none
-        if j + 1 < n:
-            _, next_start, _next_end, _next_text = triples[j + 1]
-            right_bound = max(next_start, start0 + avg_gap * run_len * 0.7)
-        else:
-            right_bound = max(track_end, start0 + avg_gap * run_len * 0.7)
-
-        total_window = max(right_bound - start0, avg_gap * run_len * 0.7)
-        # Use a gap close to avg_gap but respecting the available window
-        ideal_gap = min(avg_gap * 1.2, total_window / (run_len + 0.5))
-        ideal_gap = max(avg_gap * 0.5, ideal_gap)
-
-        # Re-space starts inside the window
-        for k in range(run_len):
-            idx = i + k
-            li, _old_s, old_e, text = triples[idx]
-            # Preserve a hint of original duration but keep sensible
-            orig_dur = max(0.25, old_e - start0)
-            new_start = start0 + k * ideal_gap
-            new_end = new_start + min(orig_dur, ideal_gap * 0.9)
-
-            if new_end > right_bound - 0.05:
-                new_end = right_bound - 0.05
-            if new_end <= new_start:
-                new_end = new_start + 0.05
-
-            triples[idx] = (li, new_start, new_end, text)
-
-        i = j + 1
-
-    # Final safety: ensure end times do not exceed next start
-    for i in range(len(triples) - 1):
-        li, s, e, t = triples[i]
-        _li2, s_next, _e2, _t2 = triples[i + 1]
-        if e > s_next:
-            e = max(s, s_next - 0.05)
-        triples[i] = (li, s, e, t)
-
-    return triples
-
+    return difflib.SequenceMatcher(None, a, b).ratio() * 100.0
 
 def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int, float, float, str]]:
     """
@@ -503,10 +429,60 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
         triples[i] = (li, s, e, text)
 
     # Post-fix: refine consecutive repeated lines
-    triples = _postfix_fix_repeated_runs(lines, triples, words, avg_gap)
+    triples = fix_repeated_lyric_blocks(triples)
 
     return triples
 
+def fix_repeated_lyric_blocks(triples):
+    import math
+
+    def norm_text(s):
+        return s.strip().lower()
+
+    n = len(triples)
+    if n == 0:
+        return triples
+
+    texts = [norm_text(t[3]) for t in triples]
+
+    blocks = []
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and texts[j] == texts[i] and texts[j] != "":
+            j += 1
+        if (j - i) > 1:
+            blocks.append((i, j - 1))
+        i = j
+
+    if not blocks:
+        return triples
+
+    new_triples = triples.copy()
+
+    for (b_start, b_end) in blocks:
+        count = b_end - b_start + 1
+        t0 = new_triples[b_start][1]
+
+        if b_end + 1 < n:
+            t1 = new_triples[b_end + 1][1]
+        else:
+            t1 = new_triples[b_end][1] + 3.0
+
+        if t1 <= t0:
+            spacing = 0.20
+            t1 = t0 + spacing * count
+        else:
+            spacing = (t1 - t0) / count
+
+        for k in range(count):
+            li, old_s, old_e, text = new_triples[b_start + k]
+            new_start = t0 + spacing * k
+            if old_e <= new_start:
+                old_e = new_start + 0.01
+            new_triples[b_start + k] = (li, new_start, old_e, text)
+
+    return new_triples
 
 # ---------- CLI ----------
 def parse_args() -> argparse.Namespace:
@@ -577,6 +553,7 @@ def main() -> None:
         language=args.lang,
         device=args.device,
     )
+    words = tag_repeated_transcript_words(words)
 
     triples = align_lyrics_to_words(lines, words)
     write_timings_csv(slug, triples)
