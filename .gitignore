@@ -40,3 +40,5 @@ covers/
 !requirements.txt
 !devcontainer.json
 *.webm
+gentle*/
+mfa_env/
