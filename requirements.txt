@@ -28,4 +28,7 @@ google-auth
 google-auth-oauthlib
 google-auth-httplib2
 
+# --- audio libraries ---
+montreal-forced-aligner
+
 # end of requirements.txt
