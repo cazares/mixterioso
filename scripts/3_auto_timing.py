@@ -70,6 +70,25 @@ TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 SEPARATED_DIR = BASE_DIR / "separated"  # where Demucs stems live
 
+# Intermediate dir for any generated audio used just for timing
+INTERMEDIATE_DIR = BASE_DIR / "intermediate"
+TIMING_TMP_DIR = INTERMEDIATE_DIR / "timing_with_filler"
+TIMING_TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Optional default filler clip (user can drop a small "hey listen" wav here)
+DEFAULT_FILLER_AUDIO = BASE_DIR / "assets" / "filler_hey_listen.wav"
+
+# Filler tokens that we will strip from Whisper output before alignment.
+# These should match what the filler clip is saying, normalized.
+FILLER_TOKENS = {
+    "hey",
+    "hey!",
+    "hey,",
+    "listen",
+    "listen!",
+    "listen,",
+}
+
 # ---------- Data classes ----------
 @dataclass
 class Word:
@@ -171,6 +190,75 @@ def probe_audio_duration(path: Path) -> float:
         return 0.0
 
 
+# ---------- Optional filler injection for timing ----------
+def build_fillerized_audio(
+    base_audio: Path,
+    filler_audio: Path,
+) -> Path:
+    """
+    Create a temp copy of base_audio with a quiet loop of filler_audio mixed in.
+
+    This is ONLY used for Whisper transcription to help it avoid collapsing
+    long 'silent' / instrumental gaps. The original base_audio is still used
+    for duration calculations and rendered mixes.
+
+    Implementation:
+      ffmpeg -y -i base -stream_loop -1 -i filler \
+        -filter_complex "[1:a]volume=0.25[a1];[0:a][a1]amix=inputs=2:duration=first:dropout_transition=0" \
+        -ac 1 out.wav
+    """
+    if not base_audio.exists():
+        raise FileNotFoundError(f"Base audio not found: {base_audio}")
+    if not filler_audio.exists():
+        raise FileNotFoundError(f"Filler audio not found: {filler_audio}")
+
+    out = TIMING_TMP_DIR / f"{base_audio.stem}_with_filler.wav"
+    if out.exists():
+        print(f"[cyan]Reusing existing filler-augmented audio:[/cyan] {out}")
+        return out
+
+    print(
+        f"[cyan]Building filler-augmented timing audio[/cyan]\n"
+        f"  Base:   {base_audio}\n"
+        f"  Filler: {filler_audio}\n"
+        f"  Out:    {out}"
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(base_audio),
+        "-stream_loop",
+        "-1",
+        "-i",
+        str(filler_audio),
+        "-filter_complex",
+        "[1:a]volume=0.25[a1];"
+        "[0:a][a1]amix=inputs=2:duration=first:dropout_transition=0",
+        "-ac",
+        "1",
+        str(out),
+    ]
+    try:
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(
+            f"[bold yellow]Filler mix failed ({e}); "
+            f"falling back to original timing audio.[/bold yellow]"
+        )
+        return base_audio
+
+    if not out.exists():
+        print(
+            "[bold yellow]Filler output was not created; "
+            "falling back to original timing audio.[/bold yellow]"
+        )
+        return base_audio
+
+    return out
+
+
 # ---------- Transcription ----------
 def choose_device(device_flag: Optional[str]) -> Tuple[str, str]:
     """
@@ -197,9 +285,14 @@ def transcribe_words(
     model_size: str = "small",
     language: Optional[str] = None,
     device: Optional[str] = None,
+    filler_tokens: Optional[set[str]] = None,
 ) -> List[Word]:
     """
     Run faster-whisper and return a flat list of words with timestamps.
+
+    If filler_tokens is provided, any words whose normalized text is in that set
+    will be dropped from the result. This is intended for synthetic "HEY/LISTEN"
+    filler injected purely to keep Whisper's timeline honest.
     """
     from time import perf_counter
 
@@ -222,21 +315,31 @@ def transcribe_words(
     )
 
     words: List[Word] = []
+    n_filler_dropped = 0
+
     for seg in segments:
         if getattr(seg, "words", None):
             for w in seg.words:
                 if w.start is None or w.end is None:
                     continue
-                wt = (w.word or "").strip()
-                if not wt:
+                wt_raw = (w.word or "").strip()
+                if not wt_raw:
                     continue
-                words.append(Word(text=wt, start=float(w.start), end=float(w.end)))
+                wt_norm = norm(wt_raw)
+                if filler_tokens and wt_norm in filler_tokens:
+                    n_filler_dropped += 1
+                    continue
+                words.append(Word(text=wt_raw, start=float(w.start), end=float(w.end)))
         else:
             # Fallback: treat whole segment as one token if no word timestamps
             if seg.start is None:
                 continue
             seg_text = (seg.text or "").strip()
             if not seg_text:
+                continue
+            seg_norm = norm(seg_text)
+            if filler_tokens and seg_norm in filler_tokens:
+                n_filler_dropped += 1
                 continue
             words.append(
                 Word(
@@ -253,6 +356,12 @@ def transcribe_words(
         )
     else:
         print("[bold red]No words returned from transcription[/bold red]")
+
+    if filler_tokens is not None:
+        print(
+            f"[cyan]Filler filtering:[/cyan] "
+            f"dropped {n_filler_dropped} filler tokens based on {len(filler_tokens)} patterns"
+        )
 
     return words
 
@@ -606,6 +715,7 @@ def perform_alignment(
 
     return align_lines_dp(lines, words, audio_duration)
 
+
 def ensure_sixstem_vocals(slug: str) -> Optional[Path]:
     model_name = "htdemucs_6s"
     root = SEPARATED_DIR / model_name
@@ -629,6 +739,7 @@ def ensure_sixstem_vocals(slug: str) -> Optional[Path]:
     subprocess.run(cmd, check=True)
 
     return vocals if vocals.exists() else None
+
 
 # ---------- CLI ----------
 def parse_args() -> argparse.Namespace:
@@ -672,6 +783,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Device for faster-whisper: cpu or cuda. Default: auto-detect.",
     )
+    parser.add_argument(
+        "--filler-audio",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a short speech-like clip (e.g., 'hey listen'). "
+            "If provided (or if assets/filler_hey_listen.wav exists), a quiet "
+            "loop of this audio is mixed into a temp copy of the timing audio "
+            "before Whisper, and any filler words are stripped from the transcript. "
+            "This is ONLY used for timing; original audio is untouched."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -683,9 +806,31 @@ def main() -> None:
     explicit_audio = Path(args.mp3) if args.mp3 else None
     audio_path = choose_timing_audio(slug, explicit_audio)
 
+    # Decide on filler audio (if any)
+    filler_audio: Optional[Path] = None
+    if args.filler_audio:
+        cand = Path(args.filler_audio)
+        if cand.exists():
+            filler_audio = cand
+        else:
+            print(
+                f"[yellow]Specified --filler-audio not found:[/yellow] {cand} "
+                f"– ignoring."
+            )
+    elif DEFAULT_FILLER_AUDIO.exists():
+        filler_audio = DEFAULT_FILLER_AUDIO
+
+    # Build filler-augmented audio for Whisper if we have a filler clip
+    if filler_audio is not None:
+        whisper_audio = build_fillerized_audio(audio_path, filler_audio)
+    else:
+        whisper_audio = audio_path
+
     print(f"[cyan]Slug:[/cyan]  {slug}")
     print(f"[cyan]TXT:[/cyan]   {txt_path}")
-    print(f"[cyan]Audio for timing:[/cyan] {audio_path}")
+    print(f"[cyan]Audio for timing (base):[/cyan] {audio_path}")
+    if whisper_audio != audio_path:
+        print(f"[cyan]Audio for Whisper (with filler):[/cyan] {whisper_audio}")
 
     if not audio_path.exists():
         print(f"[bold red]Audio not found:[/bold red] {audio_path}")
@@ -703,12 +848,18 @@ def main() -> None:
     lines = load_lyrics_lines(txt_path)
     print(f"[green]Loaded {len(lines)} lyric lines[/green]")
 
-    # 1) Transcribe words
+    # 1) Transcribe words (on whisper_audio, which may be filler-augmented)
+    filler_norm_tokens: Optional[set[str]] = None
+    if filler_audio is not None:
+        # Normalize FILLER_TOKENS once here
+        filler_norm_tokens = {norm(t) for t in FILLER_TOKENS}
+
     words = transcribe_words(
-        audio_path=audio_path,
+        audio_path=whisper_audio,
         model_size=args.model_size,
         language=args.lang,
         device=args.device,
+        filler_tokens=filler_norm_tokens,
     )
 
     # 2) Alignment (DP-based)
