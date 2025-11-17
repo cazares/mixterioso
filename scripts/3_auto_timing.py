@@ -13,11 +13,14 @@
 # - Post-fix pass smooths timings for consecutive repeated lines
 #
 # Usage:
+#   python3 scripts/3_auto_timing.py --slug nirvana_come_as_you_are
+#     (uses txts/<slug>.txt and prefers separated/*/<slug>/*vocals*.wav)
+#
 #   python3 scripts/3_auto_timing.py --slug ascension \
 #     --mp3 mp3s/ascension.mp3 --txt txts/ascension.txt \
 #     --model-size small --lang en
 #
-# Near-term enhancement:
+# Behavior:
 #   - If no explicit --mp3 is given, this script will prefer a vocal-only
 #     stem from separated/*/<slug>/*vocals*.wav (Demucs output) when present,
 #     falling back to mp3s/<slug>.mp3 otherwise.
@@ -101,6 +104,7 @@ def norm(s: str) -> str:
     s = _PUNCT_RE.sub(" ", s)
     s = _WS_RE.sub(" ", s).strip()
     return s
+
 
 def load_lyrics_lines(txt_path: Path) -> List[str]:
     if not txt_path.exists():
@@ -242,12 +246,19 @@ def transcribe_words(
             seg_text = (seg.text or "").strip()
             if not seg_text:
                 continue
-            words.append(Word(text=seg_text, start=float(seg.start), end=float(seg.end or seg.start + 2.0)))
+            words.append(
+                Word(
+                    text=seg_text,
+                    start=float(seg.start),
+                    end=float(seg.end or seg.start + 2.0),
+                )
+            )
 
     print(f"[green]Transcribed {len(words)} words[/green]")
     return words
 
-def tag_repeated_transcript_words(words, max_gap=1.5):
+
+def tag_repeated_transcript_words(words: List[Word], max_gap: float = 1.5) -> List[Word]:
     """
     Given a list of Word(text,start,end), detect repeated text blocks
     and tag each occurrence with a run counter.
@@ -259,15 +270,19 @@ def tag_repeated_transcript_words(words, max_gap=1.5):
     if not words:
         return words
 
-    tagged = []
-    prev_text = None
-    prev_end = None
+    tagged: List[Word] = []
+    prev_text: Optional[str] = None
+    prev_end: Optional[float] = None
     run_id = 0
     idx_in_run = 0
 
     for w in words:
         t = w.text.lower()
-        if t == prev_text and prev_end is not None and abs(w.start - prev_end) <= max_gap:
+        if (
+            t == prev_text
+            and prev_end is not None
+            and abs(w.start - prev_end) <= max_gap
+        ):
             # continues same run
             idx_in_run += 1
         else:
@@ -283,22 +298,103 @@ def tag_repeated_transcript_words(words, max_gap=1.5):
 
     return tagged
 
+
 # ---------- Similarity & alignment ----------
 def _similarity(a: str, b: str) -> float:
+    """
+    Return a similarity score in roughly [0, 100].
+    Normalize both sides first so run-tags / punctuation don't confuse it.
+    """
     a = norm(a)
     b = norm(b)
     if not a or not b:
         return 0.0
     if _HAS_RAPIDFUZZ:
         return float(fuzz.ratio(a, b))
-    return difflib.SequenceMatcher(None, a, b).ratio() * 100.0
+    # Fallback to difflib
+    return difflib.SequenceMatcher(None, a, b).ratio() * 100.0  # type: ignore[name-defined]
 
-def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int, float, float, str]]:
+
+def fix_repeated_lyric_blocks(
+    triples: List[Tuple[int, float, float, str]],
+    min_spacing: float = 0.20,
+) -> List[Tuple[int, float, float, str]]:
+    """
+    Post-process alignment to fix repeated identical consecutive lyric lines:
+      - Detect consecutive duplicate lyric lines (normalized)
+      - Redistribute their start times evenly in the available time window
+      - Adjust end times to preserve positive durations
+    """
+    def norm_text(s: str) -> str:
+        return s.strip().lower()
+
+    n = len(triples)
+    if n == 0:
+        return triples
+
+    texts = [norm_text(t[3]) for t in triples]
+
+    blocks: List[Tuple[int, int]] = []
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and texts[j] == texts[i] and texts[j] != "":
+            j += 1
+        if (j - i) > 1:
+            blocks.append((i, j - 1))
+        i = j
+
+    if not blocks:
+        return triples
+
+    new_triples = list(triples)
+
+    for (b_start, b_end) in blocks:
+        count = b_end - b_start + 1
+        if count < 2:
+            continue
+
+        t0 = new_triples[b_start][1]
+
+        if b_end + 1 < n:
+            t1 = new_triples[b_end + 1][1]
+        else:
+            # last block → give it a little tail
+            t1 = new_triples[b_end][1] + 3.0
+
+        if t1 <= t0:
+            spacing = max(min_spacing, 0.20)
+            t1 = t0 + spacing * count
+        else:
+            spacing = max(min_spacing, (t1 - t0) / float(count))
+
+        for k in range(count):
+            li, old_s, old_e, text = new_triples[b_start + k]
+            new_start = t0 + spacing * k
+            if old_e <= new_start:
+                old_e = new_start + 0.01  # enforce minimal duration
+            new_triples[b_start + k] = (li, new_start, old_e, text)
+
+    # Final safety pass: ensure we never have end > next start
+    for i in range(len(new_triples) - 1):
+        li, s, e, text = new_triples[i]
+        _li2, s_next, _e2, _t2 = new_triples[i + 1]
+        if e > s_next:
+            e = max(s, s_next - 0.05)
+        new_triples[i] = (li, s, e, text)
+
+    return new_triples
+
+
+def align_lyrics_to_words(
+    lines: List[str],
+    words: List[Word],
+) -> List[Tuple[int, float, float, str]]:
     """
     Repeated-lyrics-aware alignment.
 
     Strategy:
-    - Pre-normalize transcript words.
+    - Pre-normalize transcript words (but keep tagged text around).
     - Track a "search_start_idx" that only moves forward (never backwards).
     - For each lyric line:
         * Look at a limited window of words ahead of search_start_idx.
@@ -308,8 +404,6 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
     - Time penalty pulls matches toward the expected time (prev_time + avg_gap),
       so identical repeated lines near the end don't steal lines that belong
       to earlier repeats.
-    - After the initial pass, a post-fix layer re-spaces any suspicious
-      runs of consecutive repeated lines.
     """
     if not words:
         # Fallback: dumb linear guess
@@ -428,61 +522,22 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
             e = max(s, s_next - 0.05)
         triples[i] = (li, s, e, text)
 
-    # Post-fix: refine consecutive repeated lines
-    triples = fix_repeated_lyric_blocks(triples)
-
     return triples
 
-def fix_repeated_lyric_blocks(triples):
-    import math
 
-    def norm_text(s):
-        return s.strip().lower()
+def perform_alignment(
+    lines: List[str],
+    words: List[Word],
+) -> List[Tuple[int, float, float, str]]:
+    """
+    Top-level alignment wrapper:
+      - core forward alignment
+      - then repeated-lyric block smoothing
+    """
+    base_triples = align_lyrics_to_words(lines, words)
+    smoothed = fix_repeated_lyric_blocks(base_triples)
+    return smoothed
 
-    n = len(triples)
-    if n == 0:
-        return triples
-
-    texts = [norm_text(t[3]) for t in triples]
-
-    blocks = []
-    i = 0
-    while i < n:
-        j = i + 1
-        while j < n and texts[j] == texts[i] and texts[j] != "":
-            j += 1
-        if (j - i) > 1:
-            blocks.append((i, j - 1))
-        i = j
-
-    if not blocks:
-        return triples
-
-    new_triples = triples.copy()
-
-    for (b_start, b_end) in blocks:
-        count = b_end - b_start + 1
-        t0 = new_triples[b_start][1]
-
-        if b_end + 1 < n:
-            t1 = new_triples[b_end + 1][1]
-        else:
-            t1 = new_triples[b_end][1] + 3.0
-
-        if t1 <= t0:
-            spacing = 0.20
-            t1 = t0 + spacing * count
-        else:
-            spacing = (t1 - t0) / count
-
-        for k in range(count):
-            li, old_s, old_e, text = new_triples[b_start + k]
-            new_start = t0 + spacing * k
-            if old_e <= new_start:
-                old_e = new_start + 0.01
-            new_triples[b_start + k] = (li, new_start, old_e, text)
-
-    return new_triples
 
 # ---------- CLI ----------
 def parse_args() -> argparse.Namespace:
@@ -496,8 +551,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mp3",
         type=str,
-        help="Path to audio file. If omitted, will prefer a vocal stem from separated/*/<slug>/*vocals*.wav, "
-             "falling back to mp3s/<slug>.mp3.",
+        help=(
+            "Path to audio file. If omitted, will prefer a vocal stem from "
+            "separated/*/<slug>/*vocals*.wav, falling back to mp3s/<slug>.mp3."
+        ),
     )
     parser.add_argument(
         "--txt",
@@ -547,18 +604,25 @@ def main() -> None:
     lines = load_lyrics_lines(txt_path)
     print(f"[green]Loaded {len(lines)} lyric lines[/green]")
 
+    # 1) Transcribe words
     words = transcribe_words(
         audio_path=audio_path,
         model_size=args.model_size,
         language=args.lang,
         device=args.device,
     )
-    words = tag_repeated_transcript_words(words)
 
-    triples = align_lyrics_to_words(lines, words)
+    # 2) Tag repeated transcript words (memoria, etc.)
+    tagged_words = tag_repeated_transcript_words(words)
+
+    # 3) Alignment (+ repeated-lyrics smoothing)
+    triples = perform_alignment(lines, tagged_words)
+
+    # 4) Write CSV
     write_timings_csv(slug, triples)
 
 
 if __name__ == "__main__":
     main()
+
 # end of 3_auto_timing.py
