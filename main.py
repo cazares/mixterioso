@@ -6,22 +6,14 @@ from typing import List, Optional
 app = FastAPI()
 
 class AlignRequest(BaseModel):
-    corpus_dir: str              # folder: *.wav + matching *.lab or *.txt
-    dictionary_path: str         # .dict file
-    acoustic_model_path: str     # .zip or .tar.gz acoustic model
-    output_dir: str              # MFA will drop TextGrids here
-    extra_args: Optional[List[str]] = []  # raw args, caller fully responsible
+    corpus_dir: str
+    dictionary_path: str
+    acoustic_model_path: str
+    output_dir: str
+    extra_args: Optional[List[str]] = []
 
 @app.post("/align")
 def align(req: AlignRequest):
-    """
-    The caller controls everything:
-      - They must guarantee paths exist.
-      - They must provide valid MFA models.
-      - They must decide any MFA flags.
-    This endpoint just runs the command and returns stdout/stderr.
-    """
-
     cmd = [
         "mfa", "align",
         req.corpus_dir,
@@ -41,14 +33,10 @@ def align(req: AlignRequest):
             text=True
         )
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "command": cmd,
-        }
+        return {"success": False, "error": str(e), "command": cmd}
 
     return {
-        "success": (result.returncode == 0),
+        "success": result.returncode == 0,
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,

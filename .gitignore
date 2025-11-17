@@ -42,3 +42,5 @@ covers/
 *.webm
 gentle*/
 mfa_env/
+!wavs/**
+!corpus/
