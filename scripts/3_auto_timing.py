@@ -10,6 +10,7 @@
 # - Walks forward through the transcript once (no jumping back)
 # - Only searches a local window ahead of the previous line
 # - Penalizes matches far away from the expected time
+# - Post-fix pass smooths timings for consecutive repeated lines
 #
 # Usage:
 #   python3 scripts/3_auto_timing.py --slug ascension \
@@ -255,6 +256,117 @@ def _similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio() * 100.0  # type: ignore[name-defined]
 
 
+def _postfix_fix_repeated_runs(
+    lines: List[str],
+    triples: List[Tuple[int, float, float, str]],
+    words: List[Word],
+    avg_gap: float,
+) -> List[Tuple[int, float, float, str]]:
+    """
+    Post-fix pass: smooth timings for consecutive repeated lines.
+
+    For any maximal run of consecutive lines whose normalized texts are identical,
+    if the gaps inside that run look suspicious (too small, too big, or non-increasing),
+    we keep the first start as an anchor and re-space the run evenly between that
+    start and the next non-repeated line (or track end).
+    """
+    if not triples:
+        return triples
+
+    n = len(triples)
+    norm_lines = [norm(t) for (_li, _s, _e, t) in triples]
+    track_end = words[-1].end if words else max(triples[-1][2], triples[-1][1] + avg_gap)
+
+    # Helper to decide if a run "needs fixing"
+    def needs_fix(start_idx: int, end_idx: int) -> bool:
+        if end_idx <= start_idx:
+            return False
+        diffs: List[float] = []
+        for i in range(start_idx, end_idx):
+            _, s1, _e1, _t1 = triples[i]
+            _, s2, _e2, _t2 = triples[i + 1]
+            diffs.append(s2 - s1)
+        if not diffs:
+            return False
+
+        min_gap = min(diffs)
+        max_gap = max(diffs)
+
+        # Suspicious if any non-increasing, or gaps wildly off from avg_gap
+        if any(d <= 0 for d in diffs):
+            return True
+        if max_gap > 2.5 * avg_gap:
+            return True
+        if min_gap < 0.35 * avg_gap:
+            return True
+        return False
+
+    i = 0
+    while i < n:
+        base = norm_lines[i]
+        if not base:
+            i += 1
+            continue
+
+        # Find maximal run of same normalized text
+        j = i
+        while j + 1 < n and norm_lines[j + 1] == base:
+            j += 1
+
+        if j == i:
+            i += 1
+            continue  # no repetition
+
+        # We have a run [i, j] (inclusive) of repeated lines
+        if not needs_fix(i, j):
+            i = j + 1
+            continue
+
+        # Anchor at the first start
+        li0, start0, end0, text0 = triples[i]
+        run_len = j - i + 1
+
+        # Right boundary is next line start, or track_end if none
+        if j + 1 < n:
+            _, next_start, _next_end, _next_text = triples[j + 1]
+            right_bound = max(next_start, start0 + avg_gap * run_len * 0.7)
+        else:
+            right_bound = max(track_end, start0 + avg_gap * run_len * 0.7)
+
+        total_window = max(right_bound - start0, avg_gap * run_len * 0.7)
+        # Use a gap close to avg_gap but respecting the available window
+        ideal_gap = min(avg_gap * 1.2, total_window / (run_len + 0.5))
+        ideal_gap = max(avg_gap * 0.5, ideal_gap)
+
+        # Re-space starts inside the window
+        for k in range(run_len):
+            idx = i + k
+            li, _old_s, old_e, text = triples[idx]
+            # Preserve a hint of original duration but keep sensible
+            orig_dur = max(0.25, old_e - start0)
+            new_start = start0 + k * ideal_gap
+            new_end = new_start + min(orig_dur, ideal_gap * 0.9)
+
+            if new_end > right_bound - 0.05:
+                new_end = right_bound - 0.05
+            if new_end <= new_start:
+                new_end = new_start + 0.05
+
+            triples[idx] = (li, new_start, new_end, text)
+
+        i = j + 1
+
+    # Final safety: ensure end times do not exceed next start
+    for i in range(len(triples) - 1):
+        li, s, e, t = triples[i]
+        _li2, s_next, _e2, _t2 = triples[i + 1]
+        if e > s_next:
+            e = max(s, s_next - 0.05)
+        triples[i] = (li, s, e, t)
+
+    return triples
+
+
 def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int, float, float, str]]:
     """
     Repeated-lyrics-aware alignment.
@@ -270,6 +382,8 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
     - Time penalty pulls matches toward the expected time (prev_time + avg_gap),
       so identical repeated lines near the end don't steal lines that belong
       to earlier repeats.
+    - After the initial pass, a post-fix layer re-spaces any suspicious
+      runs of consecutive repeated lines.
     """
     if not words:
         # Fallback: dumb linear guess
@@ -380,13 +494,16 @@ def align_lyrics_to_words(lines: List[str], words: List[Word]) -> List[Tuple[int
             max(best_start + MIN_ADVANCE_WORDS, search_start_idx + 1),
         )
 
-    # Post-process end times so they don't go backwards
+    # First pass: clamp end times so they don't exceed the next line's start
     for i in range(len(triples) - 1):
         li, s, e, text = triples[i]
-        _, s_next, _, _ = triples[i + 1]
+        _li2, s_next, _e2, _t2 = triples[i + 1]
         if e > s_next:
             e = max(s, s_next - 0.05)
         triples[i] = (li, s, e, text)
+
+    # Post-fix: refine consecutive repeated lines
+    triples = _postfix_fix_repeated_runs(lines, triples, words, avg_gap)
 
     return triples
 
