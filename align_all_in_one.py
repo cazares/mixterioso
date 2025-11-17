@@ -50,6 +50,68 @@ TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # ------------------ Helpers ------------------
+# === TIMING SANITY FILTERS ===
+def sanitize_timings(rows, song_duration, merge_ms=150):
+    """
+    rows = list of dicts with: index, start, end, text
+    Returns a new cleaned list with:
+      - merged near-duplicates
+      - strictly increasing start times
+      - end <= next.start - epsilon
+      - no rows past song end
+    """
+
+    # ---------- 1. Merge lyrics within merge_ms ----------
+    merged = []
+    cur = None
+    merge_s = merge_ms / 1000.0
+
+    for row in rows:
+        if cur is None:
+            cur = row.copy()
+            continue
+
+        # if start times are near-duplicates → merge
+        if abs(row["start"] - cur["start"]) <= merge_s and row["text"] == cur["text"]:
+            cur["end"] = max(cur["end"], row["end"])
+        else:
+            merged.append(cur)
+            cur = row.copy()
+
+    if cur is not None:
+        merged.append(cur)
+
+    rows = merged
+
+    # ---------- 2. Sort by start time ----------
+    rows.sort(key=lambda r: r["start"])
+
+    # ---------- 3. Clamp to song duration ----------
+    clean = []
+    for r in rows:
+        if r["start"] >= song_duration:
+            continue
+        r2 = r.copy()
+        r2["end"] = min(r["end"], song_duration - 0.10)
+        clean.append(r2)
+
+    rows = clean
+
+    # ---------- 4. Strictly increasing start times ----------
+    for i in range(1, len(rows)):
+        if rows[i]["start"] <= rows[i-1]["start"]:
+            rows[i]["start"] = rows[i-1]["start"] + 0.001
+
+    # ---------- 5. Force end = next.start - epsilon ----------
+    eps = 0.05
+    for i in range(len(rows)-1):
+        rows[i]["end"] = min(rows[i]["end"], rows[i+1]["start"] - eps)
+
+    # Final clamp
+    rows[-1]["end"] = min(rows[-1]["end"], song_duration - 0.10)
+
+    return rows
+
 def norm_tokens(s: str) -> List[str]:
     return re.findall(r"[a-z0-9']+", s.lower())
 
@@ -355,6 +417,36 @@ def run_vw3(slug: str, debug: bool = False):
 
     # C3
     aligned = stitch_end_times(aligned)
+
+        # === SANITIZE TIMINGS ===
+    # Convert `(li, st, en, tx)` tuples → dict rows
+    dict_rows = []
+    for (li, st, en, tx) in aligned:
+        dict_rows.append({
+            "index": li,
+            "start": float(st),
+            "end": float(en),
+            "text": tx
+        })
+
+    import librosa
+    # Load audio again just to get true duration (fast)
+    y, sr = librosa.load(str(audio), sr=None, mono=True)
+    duration = len(y) / sr
+
+    log("SANITY", f"Applying timing sanitizer to {len(dict_rows)} rows…", WHITE + BOLD)
+    cleaned = sanitize_timings(dict_rows, duration)
+    log("SANITY", f"→ {len(cleaned)} rows after cleaning", GREEN + BOLD)
+
+    # Convert dict rows → canonical tuple rows
+    aligned = []
+    for r in cleaned:
+        aligned.append((
+            r["index"],
+            r["start"],
+            r["end"],
+            r["text"]
+        ))
 
     out_csv = TIMINGS_DIR / f"{slug}.csv"
     write_canonical_csv(out_csv, aligned)
