@@ -132,7 +132,7 @@ ASS_FONT_MULTIPLIER = 1.5  # multiple of UI font size to get ASS fontsize
 # Global lyrics timing offset in seconds. Positive = delay, negative = earlier.
 # This is applied uniformly to all lyric timestamps at render time so you can
 # nudge the whole subtitle track without re-running timing.
-LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0") or "0")
+LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "-1.5") or "-1.5")
 # If you prefer hardcoded only, comment the line above and do e.g.:
 # LYRICS_OFFSET_SECS = -0.35  # shift lyrics 350 ms earlier
 
