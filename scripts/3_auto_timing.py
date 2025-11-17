@@ -3,15 +3,10 @@
 #
 # Auto-time lyrics (TXT) to audio (MP3/WAV):
 # - Transcribes words with timestamps via faster-whisper
-# - Aligns each lyric line to the best-matching word span (forward-only)
-# - Uses RMS envelope to snap each line’s start toward local audio peaks
+# - Globally aligns all lyric tokens to transcript tokens (DP)
+# - Derives each line's start/end from matched transcript words
+# - Fills gaps by interpolation; enforces monotonically increasing timings
 # - Emits timings/<slug>.csv with header: line_index,start,end,text
-#
-# Repeated-lyrics aware:
-# - Walks forward through the transcript once (no jumping back)
-# - Only searches a local window ahead of the previous line
-# - Penalizes matches far away from the expected time
-# - Post-fix pass smooths timings for consecutive repeated lines
 #
 # Usage:
 #   python3 scripts/3_auto_timing.py --slug nirvana_come_as_you_are
@@ -31,10 +26,11 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 # Optional pretty logging via rich (falls back to normal print)
 try:
@@ -44,7 +40,7 @@ except Exception:  # pragma: no cover
 
 # ---------------------------------------------------------------------
 # Dependencies:
-#   python3 -m pip install faster-whisper rapidfuzz soundfile numpy
+#   python3 -m pip install faster-whisper rapidfuzz
 # ---------------------------------------------------------------------
 try:
     from faster_whisper import WhisperModel  # type: ignore
@@ -56,7 +52,7 @@ except Exception as e:  # pragma: no cover
 try:
     from rapidfuzz import fuzz  # type: ignore
     _HAS_RAPIDFUZZ = True
-except Exception:  # pragma: no cover
+except Exception:
     import difflib  # type: ignore
     _HAS_RAPIDFUZZ = False
 
@@ -64,20 +60,6 @@ try:
     import torch  # type: ignore
 except Exception:  # pragma: no cover
     torch = None  # type: ignore
-
-try:
-    import numpy as np  # type: ignore
-except Exception as e:  # pragma: no cover
-    print("[bold red]Missing dependency:[/bold red] numpy")
-    print("  python3 -m pip install numpy")
-    raise
-
-try:
-    import soundfile as sf  # type: ignore
-except Exception as e:  # pragma: no cover
-    print("[bold red]Missing dependency:[/bold red] soundfile")
-    print("  python3 -m pip install soundfile")
-    raise
 
 # ---------- Paths ----------
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -103,19 +85,13 @@ _WS_RE = re.compile(r"\s+")
 
 def norm(s: str) -> str:
     """
-    Normalize text for fuzzy matching:
+    Normalize text for matching / tokenizing:
     - lowercase
-    - strip run-tags (#1.3, #12.2, etc.)
     - keep apostrophes
     - strip punctuation
     - collapse whitespace
     """
     s = s.strip().lower()
-
-    # REMOVE run-tags like '#1.3' or '#12.7'
-    s = re.sub(r"#\d+\.\d+", " ", s)
-
-    # existing cleanup
     s = _PUNCT_RE.sub(" ", s)
     s = _WS_RE.sub(" ", s).strip()
     return s
@@ -144,54 +120,55 @@ def write_timings_csv(slug: str, triples: List[Tuple[int, float, float, str]]) -
 # ---------- Audio selection for timing ----------
 def choose_timing_audio(slug: str, explicit_audio: Optional[Path]) -> Path:
     """
-    Decide which audio file to use for timing:
-      - If explicit_audio is provided and exists: use it.
-      - Else, search for a Demucs vocal stem:
-            separated/*/<slug>/*vocals*.wav
-        pick the newest such file.
-      - Else, fall back to mp3s/<slug>.mp3.
+    B-FIX: Always use FULL MIX for timing, not vocals-only stems.
+    Why? Whisper collapses silent regions in isolated vocals, shifting timestamps early.
+    Full mix preserves correct real-time continuity due to ambience/noise.
     """
-    # 1) Explicit override from CLI
-    if explicit_audio is not None:
-        if explicit_audio.exists():
-            print(f"[cyan]Using explicit audio for timing:[/cyan] {explicit_audio}")
-            return explicit_audio
-        else:
-            print(
-                f"[yellow]Explicit --mp3 not found, falling back to stems/mp3 search:[/yellow] "
-                f"{explicit_audio}"
-            )
 
-    # 2) Try to find a Demucs vocal stem
-    candidates: List[Path] = []
-    if SEPARATED_DIR.exists():
-        for model_dir in SEPARATED_DIR.iterdir():
-            if not model_dir.is_dir():
-                continue
-            slug_dir = model_dir / slug
-            if not slug_dir.is_dir():
-                continue
-            # Demucs typically names as 'vocals.wav' or '*vocals*.wav'
-            for p in slug_dir.glob("*vocals*.wav"):
-                candidates.append(p)
+    # 1) CLI override wins
+    if explicit_audio is not None and explicit_audio.exists():
+        print(f"[cyan]Using explicit audio for timing:[/cyan] {explicit_audio}")
+        return explicit_audio
 
-    if candidates:
-        # Pick newest candidate by mtime = "latest processed"
-        best = max(candidates, key=lambda p: p.stat().st_mtime)
-        print(f"[green]Using vocal stem for timing:[/green] {best}")
+    # 2) Prefer a WAV full-mix from mixes/<slug>_<profile>.wav
+    #    (Profile-independent: always choose karaoke mix if exists)
+    mix_candidates = list((BASE_DIR / "mixes").glob(f"{slug}_*.wav"))
+    if mix_candidates:
+        best = max(mix_candidates, key=lambda p: p.stat().st_mtime)
+        print(f"[green]Using mixed full audio for timing:[/green] {best}")
         return best
 
-    # 3) Fallback to original MP3
-    audio_path = MP3_DIR / f"{slug}.mp3"
-    if audio_path.exists():
-        print(
-            f"[yellow]Vocal stem not found; using original mp3 for timing:[/yellow] "
-            f"{audio_path}"
-        )
-        return audio_path
+    # 3) Fallback to mp3s/<slug>.mp3
+    mp3_path = MP3_DIR / f"{slug}.mp3"
+    if mp3_path.exists():
+        print(f"[yellow]Using original mp3 for timing:[/yellow] {mp3_path}")
+        return mp3_path
 
     print(f"[bold red]No audio found for timing for slug={slug}[/bold red]")
     sys.exit(1)
+
+
+def probe_audio_duration(path: Path) -> float:
+    """
+    Use ffprobe to get audio duration in seconds.
+    """
+    if not path.exists():
+        return 0.0
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        return float(out.strip())
+    except Exception:
+        return 0.0
 
 
 # ---------- Transcription ----------
@@ -269,133 +246,21 @@ def transcribe_words(
                 )
             )
 
-    print(f"[green]Transcribed {len(words)} words[/green]")
+    if words:
+        print(
+            f"[green]Transcribed {len(words)} words[/green] "
+            f"(first at {words[0].start:.2f}s, last at {words[-1].end:.2f}s)"
+        )
+    else:
+        print("[bold red]No words returned from transcription[/bold red]")
+
     return words
 
 
-# ---------- RMS envelope ----------
-def compute_rms_envelope(
-    audio_path: Path,
-    frame_ms: float = 50.0,
-    hop_ms: float = 25.0,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Compute a simple RMS envelope over the mono audio.
-
-    Returns:
-        rms_times  : np.ndarray of shape (N,)  – time (seconds) at each RMS sample
-        rms_values : np.ndarray of shape (N,)  – RMS amplitude at each sample
-    """
-    print(f"[cyan]Computing RMS envelope for:[/cyan] {audio_path}")
-    data, sr = sf.read(str(audio_path), always_2d=True)
-    mono = data.mean(axis=1)
-
-    frame_size = max(1, int(sr * frame_ms / 1000.0))
-    hop_size = max(1, int(sr * hop_ms / 1000.0))
-
-    rms_vals: List[float] = []
-    rms_times: List[float] = []
-
-    n = len(mono)
-    i = 0
-    while i + frame_size <= n:
-        frame = mono[i : i + frame_size]
-        if len(frame) == 0:
-            break
-        rms = float(np.sqrt(np.mean(frame * frame)))
-        center_sample = i + frame_size / 2.0
-        t = center_sample / float(sr)
-        rms_vals.append(rms)
-        rms_times.append(t)
-        i += hop_size
-
-    if not rms_vals:
-        return np.array([], dtype=float), np.array([], dtype=float)
-
-    rt = np.asarray(rms_times, dtype=float)
-    rv = np.asarray(rms_vals, dtype=float)
-
-    print(f"[green]RMS envelope:[/green] {len(rt)} samples (frame={frame_ms}ms, hop={hop_ms}ms)")
-    return rt, rv
-
-
-def snap_to_rms_peak(
-    t_start: float,
-    rms_times: np.ndarray,
-    rms_values: np.ndarray,
-    window_sec: float = 0.60,
-) -> float:
-    """
-    D-level refinement:
-
-    Given a candidate start time t_start, look in a small window around it
-    and move the start toward the local RMS peak (if any).
-    """
-    if rms_times.size == 0 or rms_values.size == 0:
-        return t_start
-
-    lo = max(0.0, t_start - window_sec)
-    hi = t_start + window_sec
-
-    mask = (rms_times >= lo) & (rms_times <= hi)
-    if not np.any(mask):
-        return t_start
-
-    sub_vals = rms_values[mask]
-    sub_times = rms_times[mask]
-    idx = int(np.argmax(sub_vals))
-    t_peak = float(sub_times[idx])
-
-    return t_peak
-
-
-# ---------- Transcript repeated-word tagging ----------
-def tag_repeated_transcript_words(words: List[Word], max_gap: float = 1.5) -> List[Word]:
-    """
-    Given a list of Word(text,start,end), detect repeated text blocks
-    and tag each occurrence with a run counter.
-
-    Example:
-        "memoria memoria memoria"  → memoria#1.1, memoria#1.2, memoria#1.3
-        (later repeats) → memoria#2.1 ...
-    """
-    if not words:
-        return words
-
-    tagged: List[Word] = []
-    prev_text: Optional[str] = None
-    prev_end: Optional[float] = None
-    run_id = 0
-    idx_in_run = 0
-
-    for w in words:
-        t = w.text.lower()
-        if (
-            t == prev_text
-            and prev_end is not None
-            and abs(w.start - prev_end) <= max_gap
-        ):
-            # continues same run
-            idx_in_run += 1
-        else:
-            # new run
-            run_id += 1
-            idx_in_run = 1
-
-        tagged_text = f"{t}#{run_id}.{idx_in_run}"
-        tagged.append(Word(text=tagged_text, start=w.start, end=w.end))
-
-        prev_text = t
-        prev_end = w.end
-
-    return tagged
-
-
-# ---------- Similarity & alignment ----------
+# ---------- Similarity ----------
 def _similarity(a: str, b: str) -> float:
     """
     Return a similarity score in roughly [0, 100].
-    Normalize both sides first so run-tags / punctuation don't confuse it.
     """
     a = norm(a)
     b = norm(b)
@@ -407,255 +272,369 @@ def _similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio() * 100.0  # type: ignore[name-defined]
 
 
-def fix_repeated_lyric_blocks(
-    triples: List[Tuple[int, float, float, str]],
-    min_spacing: float = 0.20,
-) -> List[Tuple[int, float, float, str]]:
+def _tokens_similar(a: str, b: str, threshold: float = 70.0) -> bool:
     """
-    Post-process alignment to fix repeated identical consecutive lyric lines:
-      - Detect consecutive duplicate lyric lines (normalized)
-      - Redistribute their start times evenly in the available time window
-      - Adjust end times to preserve positive durations
-
-    This is a light-touch temporal smoothing pass on top of the D-level
-    alignment; it does not attempt to clamp ends to the next start.
+    Decide if two tokens should be considered a "match" in the DP alignment.
     """
-    def norm_text(s: str) -> str:
-        return s.strip().lower()
-
-    n = len(triples)
-    if n == 0:
-        return triples
-
-    texts = [norm_text(t[3]) for t in triples]
-
-    blocks: List[Tuple[int, int]] = []
-    i = 0
-    while i < n:
-        j = i + 1
-        while j < n and texts[j] == texts[i] and texts[j] != "":
-            j += 1
-        if (j - i) > 1:
-            blocks.append((i, j - 1))
-        i = j
-
-    if not blocks:
-        return triples
-
-    new_triples = list(triples)
-
-    for (b_start, b_end) in blocks:
-        count = b_end - b_start + 1
-        if count < 2:
-            continue
-
-        t0 = new_triples[b_start][1]
-
-        if b_end + 1 < n:
-            t1 = new_triples[b_end + 1][1]
-        else:
-            # last block → give it a little tail
-            t1 = new_triples[b_end][1] + 3.0
-
-        if t1 <= t0:
-            spacing = max(min_spacing, 0.20)
-            t1 = t0 + spacing * count
-        else:
-            spacing = max(min_spacing, (t1 - t0) / float(count))
-
-        for k in range(count):
-            li, old_s, old_e, text = new_triples[b_start + k]
-            new_start = t0 + spacing * k
-            if old_e <= new_start:
-                old_e = new_start + 0.01  # enforce minimal duration
-            new_triples[b_start + k] = (li, new_start, old_e, text)
-
-    return new_triples
+    return _similarity(a, b) >= threshold
 
 
-def refine_triples_with_rms(
-    triples: List[Tuple[int, float, float, str]],
-    rms_times: np.ndarray,
-    rms_values: np.ndarray,
-) -> List[Tuple[int, float, float, str]]:
-    """
-    D-level refinement step:
-
-    For each line, snap its start toward the local RMS peak in a small
-    neighborhood. End times are left as-is (we trust alignment).
-    """
-    if rms_times.size == 0 or rms_values.size == 0:
-        return triples
-
-    refined: List[Tuple[int, float, float, str]] = []
-
-    for li, s, e, text in triples:
-        new_s = snap_to_rms_peak(s, rms_times, rms_values)
-        # Keep a minimal safety: don't move start past end
-        if new_s >= e:
-            new_s = max(s, e - 0.01)
-        refined.append((li, new_s, e, text))
-
-    return refined
-
-
-def align_lyrics_to_words(
+# ---------- DP-based global alignment ----------
+def align_lines_dp(
     lines: List[str],
     words: List[Word],
+    audio_duration: float,
 ) -> List[Tuple[int, float, float, str]]:
     """
-    Repeated-lyrics-aware alignment (core D-level base):
+    Global sequence alignment between:
+      - lyric tokens (with line indices)
+      - transcript tokens (one per Word)
 
-    Strategy:
-    - Pre-normalize transcript words (but keep tagged text around).
-    - Track a "search_start_idx" that only moves forward (never backwards).
-    - For each lyric line:
-        * Look at a limited window of words ahead of search_start_idx.
-        * Score each window by (text_similarity - time_penalty).
-        * Choose the best start index.
-        * The line's time is the start time of that window.
-    - Time penalty pulls matches toward the expected time (prev_time + avg_gap),
-      so identical repeated lines near the end don't steal lines that belong
-      to earlier repeats.
-
-    RMS-based refinement happens in a separate pass (refine_triples_with_rms).
+    Steps:
+      1) Flatten lyrics into tokens with line indices.
+      2) Flatten transcript words into normalized tokens.
+      3) Dynamic-programming alignment (Levenshtein-style).
+      4) For each line, derive [start,end] from earliest/latest matched word index.
+      5) Interpolate any lines that didn't get matches.
+      6) Enforce monotone, non-overlapping timings, clamped to audio_duration.
     """
-    if not words:
-        # Fallback: dumb linear guess
-        print("[yellow]No words from transcription; using naive +2.5s spacing[/yellow]")
-        out: List[Tuple[int, float, float, str]] = []
-        t = 0.0
-        for idx, line in enumerate(lines):
-            out.append((idx, t, t + 2.5, line))
-            t += 2.5
-        return out
+    n_lines = len(lines)
+    if n_lines == 0:
+        return []
 
-    n_words = len(words)
-    words_norm = [norm(w.text) for w in words]
+    # ---- Build lyric token sequence ----
+    lyric_tokens: List[Tuple[str, int]] = []  # (token_text, line_index)
+    for li, line in enumerate(lines):
+        toks = norm(line).split()
+        for t in toks:
+            if t:
+                lyric_tokens.append((t, li))
 
-    # Overall track span; used to estimate average gap between lyric lines
-    total_span = max(0.1, words[-1].end - words[0].start)
-    avg_gap = max(1.5, min(6.0, total_span / max(1, len(lines))))  # seconds per line, clamped
+    # ---- Build transcript token sequence ----
+    transcript_tokens: List[str] = []
+    tok2word_index: List[int] = []  # map transcript-token index -> Word index
 
-    # How far ahead (in word tokens) each line is allowed to search.
-    MAX_LOOKAHEAD_WORDS = 120  # ~30–60 seconds of audio depending on speech rate
-
-    # Time penalty scales
-    TIME_PENALTY_PER_SEC = 1.3   # how many "similarity points" per second of distance
-    TIME_PENALTY_MAX = 40.0      # cap penalty so far matches aren't completely nuked
-
-    triples: List[Tuple[int, float, float, str]] = []
-
-    # We'll walk forward through the transcript once.
-    search_start_idx = 0
-    prev_time = max(0.0, words[0].start - 0.5)
-
-    for idx, raw_line in enumerate(lines):
-        line_n = norm(raw_line)
-        if not line_n:
-            # Blank line: keep a short gap
-            t_start = prev_time + 0.5
-            t_end = t_start + 2.0
-            triples.append((idx, t_start, t_end, raw_line))
-            prev_time = t_start
+    for wi, w in enumerate(words):
+        tok = norm(w.text)
+        if not tok:
             continue
+        transcript_tokens.append(tok)
+        tok2word_index.append(wi)
 
-        line_tokens = line_n.split()
-        approx_len = max(1, min(len(line_tokens), 12))
+    if not lyric_tokens or not transcript_tokens:
+        # Fallback: naive spacing across the audio duration
+        print(
+            "[yellow]Token sequences empty; falling back to naive linear spacing.[/yellow]"
+        )
+        total_span = audio_duration if audio_duration > 0 else 2.5 * n_lines
+        avg_gap = total_span / max(1, n_lines)
+        triples: List[Tuple[int, float, float, str]] = []
+        t = 0.0
+        for li, line in enumerate(lines):
+            start = t
+            end = t + avg_gap
+            triples.append((li, start, end, line))
+            t = end
+        return triples
 
-        best_score = -1e9
-        best_start = search_start_idx
+    L = len(lyric_tokens)
+    T = len(transcript_tokens)
 
-        start_min = min(search_start_idx, n_words - 1)
-        start_max = min(n_words - 1, start_min + MAX_LOOKAHEAD_WORDS)
+    print(
+        f"[cyan]DP alignment:[/cyan] {L} lyric tokens vs {T} transcript tokens "
+        f"({n_lines} lines)"
+    )
 
-        if idx == 0:
-            expected_time = words[0].start
-        else:
-            expected_time = prev_time + avg_gap
+    # ---- DP matrix ----
+    INF = 10**9
+    # dp[i][j] = best cost to align first i lyric tokens with first j transcript tokens
+    dp: List[List[int]] = [[INF] * (T + 1) for _ in range(L + 1)]
+    prev: List[List[Optional[Tuple[str, int, int]]]] = [
+        [None] * (T + 1) for _ in range(L + 1)
+    ]
 
-        for start in range(start_min, start_max + 1):
-            remaining = n_words - start
-            if remaining <= 0:
-                break
+    dp[0][0] = 0
 
-            max_window = min(
-                remaining,
-                len(line_tokens) + 4,
-                approx_len + 6,
-            )
-
-            window_norm = " ".join(words_norm[start : start + max_window]).strip()
-            if not window_norm:
+    for i in range(L + 1):
+        for j in range(T + 1):
+            cur = dp[i][j]
+            if cur == INF:
                 continue
 
-            text_sim = _similarity(window_norm, line_n)  # 0..100-ish
+            # Match / substitute both sequences (advance i and j)
+            if i < L and j < T:
+                tok_l, _li = lyric_tokens[i]
+                tok_t = transcript_tokens[j]
+                cost = 0 if _tokens_similar(tok_l, tok_t) else 1
+                if cur + cost < dp[i + 1][j + 1]:
+                    dp[i + 1][j + 1] = cur + cost
+                    prev[i + 1][j + 1] = ("M", i, j)
 
-            start_time = words[start].start
-            if expected_time is not None:
-                time_diff = abs(start_time - expected_time)
-                time_penalty = min(time_diff * TIME_PENALTY_PER_SEC, TIME_PENALTY_MAX)
-            else:
-                time_penalty = 0.0
+            # Skip transcript token (insertion in lyrics)
+            if j < T:
+                if cur + 1 < dp[i][j + 1]:
+                    dp[i][j + 1] = cur + 1
+                    prev[i][j + 1] = ("T", i, j)
 
-            score = text_sim - time_penalty
+            # Skip lyric token (deletion)
+            if i < L:
+                if cur + 1 < dp[i + 1][j]:
+                    dp[i + 1][j] = cur + 1
+                    prev[i + 1][j] = ("L", i, j)
 
-            if score > best_score:
-                best_score = score
-                best_start = start
-
-        if best_score < 30.0:
-            # Couldn't confidently align; guess based on previous time
-            t_start = prev_time + avg_gap
-            print(
-                f"[yellow]Low alignment score ({best_score:.1f}) for line {idx} → "
-                f"fallback at {t_start:.2f}s[/yellow]"
-            )
-        else:
-            t_candidate = words[best_start].start
-            if t_candidate < prev_time - 0.25:
-                t_candidate = prev_time + 0.01
-            t_start = t_candidate
-
-        # End time heuristic: start + avg_gap (we trust D-level later to refine)
-        t_end = t_start + avg_gap
-
-        triples.append((idx, t_start, t_end, raw_line))
-        prev_time = t_start
-
-        MIN_ADVANCE_WORDS = max(3, len(line_tokens))
-        search_start_idx = min(
-            n_words - 1,
-            max(best_start + MIN_ADVANCE_WORDS, search_start_idx + 1),
+    # We align full sequences → end at (L, T)
+    if dp[L][T] >= INF:
+        print(
+            "[yellow]DP failed to find a finite alignment; falling back to naive spacing.[/yellow]"
         )
+        total_span = audio_duration if audio_duration > 0 else 2.5 * n_lines
+        avg_gap = total_span / max(1, n_lines)
+        triples: List[Tuple[int, float, float, str]] = []
+        t = 0.0
+        for li, line in enumerate(lines):
+            start = t
+            end = t + avg_gap
+            triples.append((li, start, end, line))
+            t = end
+        return triples
 
-    return triples
+    print(f"[green]DP alignment cost:[/green] {dp[L][T]}")
+
+    # ---- Backtrack to collect matches ----
+    line_to_word_indices: Dict[int, List[int]] = {}
+
+    i, j = L, T
+    while i > 0 or j > 0:
+        step = prev[i][j]
+        if step is None:
+            break
+        op, pi, pj = step
+        if op == "M":
+            tok_l, line_idx = lyric_tokens[pi]
+            # Only treat as a match if tokens are reasonably similar
+            tok_t = transcript_tokens[pj]
+            if _tokens_similar(tok_l, tok_t):
+                word_idx = tok2word_index[pj]
+                line_to_word_indices.setdefault(line_idx, []).append(word_idx)
+        # Move to predecessor
+        i, j = pi, pj
+
+    # ---- Derive per-line start/end from word indices ----
+    # First, compute avg_gap from transcript span
+    if words:
+        total_span = max(0.1, words[-1].end - words[0].start)
+    else:
+        total_span = audio_duration if audio_duration > 0 else 2.5 * n_lines
+    avg_gap = max(1.0, min(6.0, total_span / max(1, n_lines)))
+
+    per_line: List[Tuple[int, Optional[float], Optional[float], str]] = []
+    for li in range(n_lines):
+        line = lines[li]
+        idxs = line_to_word_indices.get(li)
+        if idxs:
+            w_min = min(idxs)
+            w_max = max(idxs)
+            start = float(words[w_min].start)
+            end = float(words[w_max].end)
+            if end <= start:
+                end = start + 0.25
+            per_line.append((li, start, end, line))
+        else:
+            # Placeholder; filled later
+            per_line.append((li, None, None, line))
+
+    # ---- Interpolate lines that didn't get direct matches ----
+    def fill_missing(
+        arr: List[Tuple[int, Optional[float], Optional[float], str]]
+    ) -> List[Tuple[int, float, float, str]]:
+        out: List[Tuple[int, float, float, str]] = list(arr)  # shallow copy
+
+        # Pass 1: simple forward fill for starts/ends if isolated misses
+        last_known_idx = None
+        for i in range(len(out)):
+            li, s, e, text = out[i]
+            if s is not None and e is not None:
+                last_known_idx = i
+                continue
+            # missing -> keep None for now
+            continue
+
+        # Pass 2: full block interpolation
+        i = 0
+        while i < len(out):
+            li, s, e, text = out[i]
+            if s is not None and e is not None:
+                i += 1
+                continue
+
+            # start of a missing block
+            start_block = i
+            while i < len(out):
+                li2, s2, e2, txt2 = out[i]
+                if s2 is not None and e2 is not None:
+                    break
+                i += 1
+            end_block = i - 1  # inclusive
+
+            # neighbors
+            left = start_block - 1
+            right = i if i < len(out) else None
+
+            if left >= 0 and right is not None and right < len(out):
+                # Interpolate between left and right
+                _, sL, eL, _ = out[left]
+                _, sR, eR, _ = out[right]
+                assert sL is not None and eL is not None and sR is not None and eR is not None
+                span = max(0.5, sR - eL)
+                n_missing = end_block - start_block + 1
+                step = span / (n_missing + 1)
+                cur_start = eL + step
+                for k in range(start_block, end_block + 1):
+                    li_k, _s_k, _e_k, text_k = out[k]
+                    s_k = cur_start
+                    e_k = s_k + avg_gap
+                    out[k] = (li_k, s_k, e_k, text_k)
+                    cur_start += step
+            elif left >= 0:
+                # Only left neighbor; continue forward with avg_gap
+                _, sL, eL, _ = out[left]
+                assert sL is not None and eL is not None
+                cur_start = eL + 0.25
+                for k in range(start_block, end_block + 1):
+                    li_k, _s_k, _e_k, text_k = out[k]
+                    s_k = cur_start
+                    e_k = s_k + avg_gap
+                    out[k] = (li_k, s_k, e_k, text_k)
+                    cur_start += avg_gap
+            elif right is not None and right < len(out):
+                # Only right neighbor; walk backward from it
+                _, sR, eR, _ = out[right]
+                assert sR is not None and eR is not None
+                cur_end = sR - 0.25
+                for k in range(end_block, start_block - 1, -1):
+                    li_k, _s_k, _e_k, text_k = out[k]
+                    e_k = cur_end
+                    s_k = e_k - avg_gap
+                    if s_k < 0:
+                        s_k = 0.0
+                    out[k] = (li_k, s_k, e_k, text_k)
+                    cur_end = s_k - 0.25
+            else:
+                # No neighbors at all → space from 0
+                cur_start = 0.0
+                for k in range(start_block, end_block + 1):
+                    li_k, _s_k, _e_k, text_k = out[k]
+                    s_k = cur_start
+                    e_k = s_k + avg_gap
+                    out[k] = (li_k, s_k, e_k, text_k)
+                    cur_start += avg_gap
+
+            i = end_block + 1
+
+        # Replace any remaining None (paranoia)
+        for i in range(len(out)):
+            li, s, e, text = out[i]
+            if s is None or e is None:
+                s = 0.0 if i == 0 else (out[i - 1][1] or 0.0) + avg_gap
+                e = s + avg_gap
+                out[i] = (li, s, e, text)
+
+        # Cast types
+        return [(li, float(s), float(e), text) for (li, s, e, text) in out]
+
+    filled = fill_missing(per_line)
+
+    # ---- Enforce monotone, non-overlapping timings ----
+    filled.sort(key=lambda t: t[0])  # sort by line_index, just in case
+
+    MIN_GAP = 0.05
+    for idx in range(1, len(filled)):
+        li, s, e, text = filled[idx]
+        _li_prev, s_prev, e_prev, _txt_prev = filled[idx - 1]
+        if s < s_prev + MIN_GAP:
+            s = s_prev + MIN_GAP
+        if e <= s:
+            e = s + 0.01
+        filled[idx] = (li, s, e, text)
+
+    # Clamp ends so that end[i] <= start[i+1] - MIN_GAP
+    for idx in range(len(filled) - 1):
+        li, s, e, text = filled[idx]
+        _li_n, s_next, _e_n, _txt_n = filled[idx + 1]
+        max_e = s_next - MIN_GAP
+        if e > max_e:
+            e = max(s + 0.01, max_e)
+        filled[idx] = (li, s, e, text)
+
+    # Clamp to audio_duration
+    if audio_duration > 0:
+        clamped: List[Tuple[int, float, float, str]] = []
+        for li, s, e, text in filled:
+            if s >= audio_duration:
+                # drop lines entirely beyond the audio
+                continue
+            e = min(e, audio_duration)
+            if e <= s:
+                e = min(audio_duration, s + 0.01)
+            clamped.append((li, s, e, text))
+        filled = clamped
+
+    return filled
 
 
+# ---------- Wrapper ----------
 def perform_alignment(
     lines: List[str],
     words: List[Word],
-    rms_times: Optional[np.ndarray] = None,
-    rms_values: Optional[np.ndarray] = None,
+    audio_duration: float,
 ) -> List[Tuple[int, float, float, str]]:
     """
-    Top-level alignment wrapper:
-      - core forward alignment (C-level base)
-      - D-level RMS refinement for line starts
-      - repeated-lyric block smoothing
+    Top-level alignment wrapper.
     """
-    base_triples = align_lyrics_to_words(lines, words)
+    if not words:
+        print(
+            "[yellow]No words from transcription; using naive linear spacing across track.[/yellow]"
+        )
+        total_span = audio_duration if audio_duration > 0 else 2.5 * len(lines)
+        avg_gap = total_span / max(1, len(lines))
+        triples: List[Tuple[int, float, float, str]] = []
+        t = 0.0
+        for idx, line in enumerate(lines):
+            triples.append((idx, t, t + avg_gap, line))
+            t += avg_gap
+        return triples
 
-    if rms_times is not None and rms_values is not None:
-        base_triples = refine_triples_with_rms(base_triples, rms_times, rms_values)
+    return align_lines_dp(lines, words, audio_duration)
 
-    smoothed = fix_repeated_lyric_blocks(base_triples)
-    return smoothed
+def ensure_sixstem_vocals(slug: str) -> Optional[Path]:
+    model_name = "htdemucs_6s"
+    root = SEPARATED_DIR / model_name
+    slug_dir = root / slug
+    vocals = slug_dir / "vocals.wav"
+    if vocals.exists():
+        return vocals
 
+    mp3_path = MP3_DIR / f"{slug}.mp3"
+    if not mp3_path.exists():
+        return None
+
+    # run demucs 6-stem once
+    cmd = [
+        sys.executable,
+        "-m", "demucs",
+        "-n", model_name,
+        str(mp3_path),
+    ]
+    print(f"[cyan]Running Demucs 6-stem for timing:[/cyan] {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+
+    return vocals if vocals.exists() else None
 
 # ---------- CLI ----------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Auto-time lyrics TXT to audio using faster-whisper.")
+    parser = argparse.ArgumentParser(
+        description="Auto-time lyrics TXT to audio using faster-whisper (DP alignment)."
+    )
 
     parser.add_argument(
         "--slug",
@@ -715,6 +694,12 @@ def main() -> None:
         print(f"[bold red]TXT not found:[/bold red] {txt_path}")
         sys.exit(1)
 
+    audio_duration = probe_audio_duration(audio_path)
+    if audio_duration > 0:
+        print(f"[cyan]Audio duration:[/cyan] {audio_duration:.2f}s")
+    else:
+        print("[yellow]Could not determine audio duration via ffprobe.[/yellow]")
+
     lines = load_lyrics_lines(txt_path)
     print(f"[green]Loaded {len(lines)} lyric lines[/green]")
 
@@ -726,20 +711,13 @@ def main() -> None:
         device=args.device,
     )
 
-    # 2) Tag repeated transcript words (memoria, etc.)
-    tagged_words = tag_repeated_transcript_words(words)
+    # 2) Alignment (DP-based)
+    triples = perform_alignment(lines, words, audio_duration)
 
-    # 3) Compute RMS envelope for D-level refinement
-    rms_times, rms_values = compute_rms_envelope(audio_path)
-
-    # 4) Alignment (+ repeated-lyrics smoothing + RMS refinement)
-    triples = perform_alignment(lines, tagged_words, rms_times, rms_values)
-
-    # 5) Write CSV
+    # 3) Write CSV
     write_timings_csv(slug, triples)
 
 
 if __name__ == "__main__":
     main()
-
 # end of 3_auto_timing.py
