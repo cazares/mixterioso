@@ -202,8 +202,10 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
         reuse = prompt_yes_no("Stems exist. Reuse?", True) if interactive else True
         if not reuse:
             for p in stems_dir.glob("*.wav"):
-                try: p.unlink()
-                except: pass
+                try:
+                    p.unlink()
+                except:
+                    pass
             stems_exist = False
 
     if not stems_exist:
@@ -414,6 +416,9 @@ def main():
     else:
         offset = read_offset(slug)
         log("OFFSET", f"Using stored offset={offset:+.3f}s", CYAN)
+
+    # Always persist the resolved offset so all downstream steps share it
+    write_offset(slug, offset)
 
     status = detect_step_status(slug, args.profile)
 
