@@ -127,7 +127,7 @@ def run_whisperx_on_audio(audio_path: Path, lang: str = "en") -> Dict[str, Any]:
         }
     where word_segments = [{ "word": str, "start": float, "end": float }, ...]
     """
-    log("WX", f"Loading WhisperX ASR model (small.{lang})…", CYAN)
+    log("WX", f"Loading WhisperX ASR model (medium)…", CYAN)
 
     import torch  # type: ignore
     import whisperx  # type: ignore
@@ -135,7 +135,7 @@ def run_whisperx_on_audio(audio_path: Path, lang: str = "en") -> Dict[str, Any]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
 
-    model = whisperx.load_model(f"small.{lang}", device=device, compute_type=compute_type)
+    model = whisperx.load_model(f"medium", device=device, compute_type=compute_type)
     log("WX", f"Running ASR on {audio_path}…", MAG)
     result = model.transcribe(str(audio_path), batch_size=16)
 
@@ -240,14 +240,28 @@ def align_lines_to_tokens(
                 window_toks = tokens[j:k]
                 if not window_toks:
                     continue
-                hits = sum(1 for t in ltoks if t in window_toks)
-                ratio = hits / float(len(ltoks))
-                if ratio > best_score:
-                    best_score = ratio
-                    best_j = j
-                    best_k = k
+                # STRICT substring match inside window_toks
+                window_str = " ".join(window_toks)
+                line_str   = " ".join(ltoks)
 
-        if best_score >= coverage_thresh and best_j is not None:
+                if line_str in window_str:
+                    # perfect sequence match
+                    score = 1.0
+                else:
+                    # fallback: partial sequence overlap
+                    score = 0.0
+                    for j2 in range(len(window_toks) - len(ltoks) + 1):
+                        if window_toks[j2:j2+len(ltoks)] == ltoks:
+                            score = 0.90
+                            break
+
+                # use score
+                if score > best_score:
+                    best_score = score
+                    best_j = j
+                    best_k = j + len(ltoks)
+
+        if best_score > 0 and best_j is not None:
             ts = token_times[best_j]
             out.append((i, ts, ts + 0.01, line))
             cursor = max(cursor, best_k or (best_j + 1))
@@ -352,22 +366,11 @@ def sanitize_timings(
         if dict_rows[i]["start"] <= dict_rows[i - 1]["start"]:
             dict_rows[i]["start"] = dict_rows[i - 1]["start"] + 0.001
 
-    # 5) Enforce end = min(end, next.start - eps)
-    eps = 0.05
-    for i in range(len(dict_rows) - 1):
-        dict_rows[i]["end"] = min(
-            dict_rows[i]["end"],
-            dict_rows[i + 1]["start"] - eps,
-        )
-        if dict_rows[i]["end"] < dict_rows[i]["start"]:
-            dict_rows[i]["end"] = dict_rows[i]["start"] + 0.01
-
-    # Final last row clamp
-    dict_rows[-1]["end"] = min(dict_rows[-1]["end"], song_duration - 0.05)
-    if dict_rows[-1]["end"] < dict_rows[-1]["start"]:
-        dict_rows[-1]["end"] = dict_rows[-1]["start"] + 0.50
-
-    # Back to tuple rows, preserving original line_index
+    # ----------------------------------------------------------------------
+    # 5) Convert to tuple rows (preserve index), then sort by line_index
+    #    BEFORE expanding durations. This keeps the timing monotone AND
+    #    guarantees correct "line stays visible until next line" behavior.
+    # ----------------------------------------------------------------------
     final_rows: List[Tuple[int, float, float, str]] = []
     for r in dict_rows:
         final_rows.append(
@@ -379,8 +382,30 @@ def sanitize_timings(
             )
         )
 
-    # Sort again by line_index for CSV readability (but times are monotone)
+    # Sort by line_index for readability and stable ordering
     final_rows.sort(key=lambda x: x[0])
+
+    # ----------------------------------------------------------------------
+    # 6) EXPAND DURATIONS PROPERLY
+    # Each line should remain visible until *just before* the next line starts.
+    # This replaces the old min(end, next.start - eps) behavior, which caused
+    # 0.01s flashes for most lyrics.
+    # ----------------------------------------------------------------------
+    EPS = 0.10  # small gap to prevent overlap in ASS subtitles
+
+    for i in range(len(final_rows) - 1):
+        li, st, en, tx = final_rows[i]
+        next_st = final_rows[i + 1][1]
+
+        # new end is right before next start
+        new_end = max(st + 0.01, next_st - EPS)
+        final_rows[i] = (li, st, new_end, tx)
+
+    # Last line ends near song end
+    li, st, en, tx = final_rows[-1]
+    last_end = max(st + 0.01, song_duration - 0.10)
+    final_rows[-1] = (li, st, last_end, tx)
+
     return final_rows
 
 
