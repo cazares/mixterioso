@@ -69,7 +69,7 @@ curl -s -X POST \
 
 echo "Alignment result saved to align_result.json"
 echo "Check $ALIGNED_DIR for the TextGrid output."
-
+     
 # Cleanup temp
 rm "$REQ_JSON"
 
