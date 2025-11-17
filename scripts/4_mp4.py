@@ -203,8 +203,9 @@ def read_timings(slug: str):
         print(f"Timing CSV not found: {csv_path}")
         sys.exit(1)
     native = load_timings_any(csv_path)
-    rows = [(start,end,text,li) for (li,start,end,text) in native]
-    rows.sort(key=lambda x: x[0])
+    # native should be [(line_index, start, end, text), ...]
+    rows = [(start, end, text, li) for (li, start, end, text) in native]
+    rows.sort(key=lambda x: x[0])  # sort by start time
     return rows
 
 
@@ -249,7 +250,7 @@ def build_ass(
 
     # Audio duration fallback
     if audio_duration <= 0.0 and timings:
-        last_end = max(end for (start,end,_t,_li) in timings)
+        last_end = max(end for (start, end, _t, _li) in timings)
         audio_duration = last_end + 5.0
     if audio_duration <= 0.0:
         audio_duration = 5.0
@@ -335,7 +336,7 @@ def build_ass(
             end = audio_duration
 
         music_only = is_music_only(t)
-        unified.append((start,end,t,li,music_only))
+        unified.append((start, end, t, li, music_only))
 
     unified.sort(key=lambda x: x[0])
 
@@ -361,9 +362,9 @@ def build_ass(
     fade_tag = f"\\fad({FADE_IN_MS},{FADE_OUT_MS})" if (FADE_IN_MS or FADE_OUT_MS) else ""
 
     n = len(unified)
-    next_color      = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
-    divider_color   = rgb_to_bgr(DIVIDER_COLOR_RGB)
-    next_label_color= rgb_to_bgr(NEXT_LABEL_COLOR_RGB)
+    next_color       = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
+    divider_color    = rgb_to_bgr(DIVIDER_COLOR_RGB)
+    next_label_color = rgb_to_bgr(NEXT_LABEL_COLOR_RGB)
 
     divider_height = max(0.5, DIVIDER_HEIGHT_PX)
     x_left  = float(DIVIDER_LEFT_MARGIN_PX)
@@ -416,7 +417,7 @@ def build_ass(
                     deatht = min(spawn + NOTE_DURATION, next_start)
                     if deatht <= spawn:
                         continue
-                    x,y = random_pos_fullscreen()
+                    x, y = random_pos_fullscreen()
                     note = random_note()
                     tag  = f"{{\\an5\\pos({x},{y})\\fs{preview_font*2}\\fad({NOTE_FADE_IN},{NOTE_FADE_OUT})}}"
                     events.append(
@@ -464,7 +465,6 @@ def build_ass(
 
 # =============================================================================
 # Remaining logic: choose_audio, parse_args, main, etc.
-# (unchanged from your version except for Option C behavior above)
 # =============================================================================
 def choose_audio(slug: str, profile: str) -> Path:
     mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
@@ -531,14 +531,14 @@ def main(argv=None):
 
     out_mp4 = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(LYRICS_OFFSET_SECS)}.mp4"
 
-    # Pre-existing MP4 menu omitted for brevity (unchanged)
-    # [... identical to your version ...]
+    # (Existing pre-existing MP4 menu / prompts live here in your version.)
 
     # ================================================================
     # Full render
     # ================================================================
     font_size = args.font_size or DEFAULT_UI_FONT_SIZE
     font_size = max(20, min(200, font_size))
+    font_size = int(font_size)
     ass_font_size = int(font_size * ASS_FONT_MULTIPLIER)
 
     audio_path = choose_audio(slug, profile)
