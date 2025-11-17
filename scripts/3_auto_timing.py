@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
 # scripts/3_auto_timing.py
 #
-# Auto-time lyrics (TXT) to audio (MP3/WAV):
-# - Transcribes words with timestamps via faster-whisper
-# - Globally aligns all lyric tokens to transcript tokens (DP)
-# - Derives each line's start/end from matched transcript words
+# Auto-time lyrics (TXT) to audio using Gentle (HTTP forced aligner):
+# - Sends audio + full lyrics text to Gentle over HTTP
+# - Receives per-word timestamps from Gentle
+# - Globally aligns lyric lines to aligned words (DP over tokens)
+# - Derives each line's start/end from matched word indices
 # - Fills gaps by interpolation; enforces monotonically increasing timings
 # - Emits timings/<slug>.csv with header: line_index,start,end,text
 #
+# Requirements:
+#   - Gentle running in HTTP mode (Option 1):
+#       ./gentle --http --port 8765
+#   - Python deps:
+#       python3 -m pip install requests rapidfuzz
+#
 # Usage:
 #   python3 scripts/3_auto_timing.py --slug nirvana_come_as_you_are
-#     (uses txts/<slug>.txt and prefers separated/*/<slug>/*vocals*.wav)
 #
-#   python3 scripts/3_auto_timing.py --slug ascension \
-#     --mp3 mp3s/ascension.mp3 --txt txts/ascension.txt \
-#     --model-size small --lang en
-#
-# Behavior:
-#   - If no explicit --mp3 is given, this script will prefer a vocal-only
-#     stem from separated/*/<slug>/*vocals*.wav (Demucs output) when present,
-#     falling back to mp3s/<slug>.mp3 otherwise.
+#   python3 scripts/3_auto_timing.py \
+#       --slug nirvana_come_as_you_are \
+#       --mp3 mp3s/nirvana_come_as_you_are.mp3 \
+#       --txt txts/nirvana_come_as_you_are.txt \
+#       --gentle-url http://localhost:8765/transcriptions?async=false
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import subprocess
 import sys
@@ -38,15 +42,11 @@ try:
 except Exception:  # pragma: no cover
     pass
 
-# ---------------------------------------------------------------------
-# Dependencies:
-#   python3 -m pip install faster-whisper rapidfuzz
-# ---------------------------------------------------------------------
 try:
-    from faster_whisper import WhisperModel  # type: ignore
+    import requests  # type: ignore
 except Exception as e:  # pragma: no cover
-    print("[bold red]Missing dependency:[/bold red] faster-whisper")
-    print("  python3 -m pip install faster-whisper")
+    print("[bold red]Missing dependency:[/bold red] requests")
+    print("  python3 -m pip install requests")
     raise
 
 try:
@@ -56,11 +56,6 @@ except Exception:
     import difflib  # type: ignore
     _HAS_RAPIDFUZZ = False
 
-try:
-    import torch  # type: ignore
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore
-
 # ---------- Paths ----------
 BASE_DIR = Path(__file__).resolve().parent.parent
 TXT_DIR = BASE_DIR / "txts"
@@ -68,26 +63,10 @@ MP3_DIR = BASE_DIR / "mp3s"
 TIMINGS_DIR = BASE_DIR / "timings"
 TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-SEPARATED_DIR = BASE_DIR / "separated"  # where Demucs stems live
-
-# Intermediate dir for any generated audio used just for timing
+MIXES_DIR = BASE_DIR / "mixes"
 INTERMEDIATE_DIR = BASE_DIR / "intermediate"
-TIMING_TMP_DIR = INTERMEDIATE_DIR / "timing_with_filler"
-TIMING_TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-# Optional default filler clip (user can drop a small "hey listen" wav here)
-DEFAULT_FILLER_AUDIO = BASE_DIR / "assets" / "filler_hey_listen.wav"
-
-# Filler tokens that we will strip from Whisper output before alignment.
-# These should match what the filler clip is saying, normalized.
-FILLER_TOKENS = {
-    "hey",
-    "hey!",
-    "hey,",
-    "listen",
-    "listen!",
-    "listen,",
-}
+GENTLE_AUDIO_DIR = INTERMEDIATE_DIR / "gentle_audio"
+GENTLE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------- Data classes ----------
 @dataclass
@@ -125,6 +104,15 @@ def load_lyrics_lines(txt_path: Path) -> List[str]:
     return [ln for ln in lines if ln.strip()]
 
 
+def load_lyrics_text(txt_path: Path) -> str:
+    """
+    Load full lyrics text as a single string to send to Gentle.
+    """
+    if not txt_path.exists():
+        raise FileNotFoundError(f"TXT not found: {txt_path}")
+    return txt_path.read_text(encoding="utf-8", errors="ignore")
+
+
 def write_timings_csv(slug: str, triples: List[Tuple[int, float, float, str]]) -> Path:
     out = TIMINGS_DIR / f"{slug}.csv"
     with out.open("w", newline="", encoding="utf-8") as f:
@@ -136,35 +124,82 @@ def write_timings_csv(slug: str, triples: List[Tuple[int, float, float, str]]) -
     return out
 
 
-# ---------- Audio selection for timing ----------
+# ---------- Audio selection & conversion for Gentle ----------
 def choose_timing_audio(slug: str, explicit_audio: Optional[Path]) -> Path:
     """
-    B-FIX: Always use FULL MIX for timing, not vocals-only stems.
-    Why? Whisper collapses silent regions in isolated vocals, shifting timestamps early.
-    Full mix preserves correct real-time continuity due to ambience/noise.
-    """
+    Select the best audio source for alignment.
 
+    Priority:
+      1) Explicit --mp3/--audio path (any extension)
+      2) mixes/<slug>_*.wav (most recent)
+      3) mp3s/<slug>.mp3
+
+    This path is then converted (if needed) to a Gentle-friendly WAV.
+    """
     # 1) CLI override wins
     if explicit_audio is not None and explicit_audio.exists():
-        print(f"[cyan]Using explicit audio for timing:[/cyan] {explicit_audio}")
+        print(f"[cyan]Using explicit audio for alignment:[/cyan] {explicit_audio}")
         return explicit_audio
 
     # 2) Prefer a WAV full-mix from mixes/<slug>_<profile>.wav
-    #    (Profile-independent: always choose karaoke mix if exists)
-    mix_candidates = list((BASE_DIR / "mixes").glob(f"{slug}_*.wav"))
+    mix_candidates = list(MIXES_DIR.glob(f"{slug}_*.wav"))
     if mix_candidates:
         best = max(mix_candidates, key=lambda p: p.stat().st_mtime)
-        print(f"[green]Using mixed full audio for timing:[/green] {best}")
+        print(f"[green]Using mixed full audio for alignment:[/green] {best}")
         return best
 
     # 3) Fallback to mp3s/<slug>.mp3
     mp3_path = MP3_DIR / f"{slug}.mp3"
     if mp3_path.exists():
-        print(f"[yellow]Using original mp3 for timing:[/yellow] {mp3_path}")
+        print(f"[yellow]Using original mp3 for alignment:[/yellow] {mp3_path}")
         return mp3_path
 
-    print(f"[bold red]No audio found for timing for slug={slug}[/bold red]")
+    print(f"[bold red]No audio found for alignment for slug={slug}[/bold red]")
     sys.exit(1)
+
+
+def convert_to_gentle_wav(src: Path) -> Path:
+    """
+    Convert source audio to a Gentle-friendly WAV (mono, 16kHz).
+    If src is already a .wav, we still convert into our dedicated dir
+    to enforce consistent format.
+    """
+    if not src.exists():
+        raise FileNotFoundError(f"Audio not found: {src}")
+
+    out = GENTLE_AUDIO_DIR / f"{src.stem}_gentle.wav"
+    if out.exists():
+        print(f"[cyan]Reusing existing Gentle WAV:[/cyan] {out}")
+        return out
+
+    print(
+        f"[cyan]Converting audio for Gentle alignment[/cyan]\n"
+        f"  In:  {src}\n"
+        f"  Out: {out}"
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src),
+        "-ac",
+        "1",        # mono
+        "-ar",
+        "16000",    # 16 kHz
+        str(out),
+    ]
+    try:
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[bold red]ffmpeg conversion failed:[/bold red] {e}")
+        sys.exit(1)
+
+    if not out.exists():
+        print("[bold red]Gentle WAV not created; aborting.[/bold red]")
+        sys.exit(1)
+
+    return out
 
 
 def probe_audio_duration(path: Path) -> float:
@@ -190,178 +225,115 @@ def probe_audio_duration(path: Path) -> float:
         return 0.0
 
 
-# ---------- Optional filler injection for timing ----------
-def build_fillerized_audio(
-    base_audio: Path,
-    filler_audio: Path,
-) -> Path:
+# ---------- Gentle HTTP client ----------
+def call_gentle(
+    gentle_url: str,
+    audio_wav: Path,
+    transcript_text: str,
+) -> Dict:
     """
-    Create a temp copy of base_audio with a quiet loop of filler_audio mixed in.
+    Call Gentle HTTP server with audio + transcript text.
 
-    This is ONLY used for Whisper transcription to help it avoid collapsing
-    long 'silent' / instrumental gaps. The original base_audio is still used
-    for duration calculations and rendered mixes.
+    gentle_url example:
+      http://localhost:8765/transcriptions?async=false
 
-    Implementation:
-      ffmpeg -y -i base -stream_loop -1 -i filler \
-        -filter_complex "[1:a]volume=0.25[a1];[0:a][a1]amix=inputs=2:duration=first:dropout_transition=0" \
-        -ac 1 out.wav
+    Returns parsed JSON dict.
     """
-    if not base_audio.exists():
-        raise FileNotFoundError(f"Base audio not found: {base_audio}")
-    if not filler_audio.exists():
-        raise FileNotFoundError(f"Filler audio not found: {filler_audio}")
+    if not audio_wav.exists():
+        raise FileNotFoundError(f"Gentle audio not found: {audio_wav}")
 
-    out = TIMING_TMP_DIR / f"{base_audio.stem}_with_filler.wav"
-    if out.exists():
-        print(f"[cyan]Reusing existing filler-augmented audio:[/cyan] {out}")
-        return out
+    print(f"[cyan]Contacting Gentle at:[/cyan] {gentle_url}")
 
-    print(
-        f"[cyan]Building filler-augmented timing audio[/cyan]\n"
-        f"  Base:   {base_audio}\n"
-        f"  Filler: {filler_audio}\n"
-        f"  Out:    {out}"
-    )
+    files = {
+        "audio": ("audio.wav", audio_wav.open("rb"), "audio/wav"),
+    }
+    data = {
+        "transcript": transcript_text,
+    }
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(base_audio),
-        "-stream_loop",
-        "-1",
-        "-i",
-        str(filler_audio),
-        "-filter_complex",
-        "[1:a]volume=0.25[a1];"
-        "[0:a][a1]amix=inputs=2:duration=first:dropout_transition=0",
-        "-ac",
-        "1",
-        str(out),
-    ]
     try:
-        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        resp = requests.post(gentle_url, files=files, data=data, timeout=600)
     except Exception as e:
         print(
-            f"[bold yellow]Filler mix failed ({e}); "
-            f"falling back to original timing audio.[/bold yellow]"
+            "[bold red]Failed to reach Gentle HTTP server.[/bold red]\n"
+            f"URL: {gentle_url}\n"
+            f"Error: {e}"
         )
-        return base_audio
+        sys.exit(1)
 
-    if not out.exists():
+    if resp.status_code != 200:
         print(
-            "[bold yellow]Filler output was not created; "
-            "falling back to original timing audio.[/bold yellow]"
+            "[bold red]Gentle returned non-200 status.[/bold red]\n"
+            f"Status: {resp.status_code}\n"
+            f"Body: {resp.text[:1000]}"
         )
-        return base_audio
+        sys.exit(1)
 
-    return out
+    try:
+        payload = resp.json()
+    except json.JSONDecodeError:
+        print("[bold red]Failed to parse JSON from Gentle response.[/bold red]")
+        print(f"Raw response (truncated): {resp.text[:1000]}")
+        sys.exit(1)
+
+    return payload
 
 
-# ---------- Transcription ----------
-def choose_device(device_flag: Optional[str]) -> Tuple[str, str]:
+def words_from_gentle(payload: Dict) -> List[Word]:
     """
-    Decide device and compute_type for faster-whisper.
+    Extract a flat list of Word objects from Gentle JSON payload.
+
+    Expected structure (simplified):
+
+    {
+      "transcript": "...",
+      "words": [
+        {
+          "case": "success",
+          "alignedWord": "hello",
+          "start": 12.34,
+          "end": 12.78,
+          ...
+        },
+        {
+          "case": "not-found-in-audio",
+          ...
+        }
+      ]
+    }
     """
-    if device_flag:
-        dev = device_flag
-    else:
-        if torch is not None and getattr(torch, "cuda", None) and torch.cuda.is_available():  # type: ignore[attr-defined]
-            dev = "cuda"
-        else:
-            dev = "cpu"
-
-    if dev == "cuda":
-        compute_type = "float16"
-    else:
-        compute_type = "int8"
-
-    return dev, compute_type
-
-
-def transcribe_words(
-    audio_path: Path,
-    model_size: str = "small",
-    language: Optional[str] = None,
-    device: Optional[str] = None,
-    filler_tokens: Optional[set[str]] = None,
-) -> List[Word]:
-    """
-    Run faster-whisper and return a flat list of words with timestamps.
-
-    If filler_tokens is provided, any words whose normalized text is in that set
-    will be dropped from the result. This is intended for synthetic "HEY/LISTEN"
-    filler injected purely to keep Whisper's timeline honest.
-    """
-    from time import perf_counter
-
-    dev, compute_type = choose_device(device)
-    print(
-        f"[cyan]Loading faster-whisper model[/cyan] "
-        f"size=[bold]{model_size}[/bold] device=[bold]{dev}[/bold] compute_type=[bold]{compute_type}[/bold]"
-    )
-    t0 = perf_counter()
-    model = WhisperModel(model_size, device=dev, compute_type=compute_type)
-    t1 = perf_counter()
-    print(f"[cyan]Model loaded in {t1 - t0:.1f}s[/cyan]")
-
-    print(f"[cyan]Transcribing audio:[/cyan] {audio_path}")
-    segments, info = model.transcribe(
-        str(audio_path),
-        beam_size=5,
-        word_timestamps=True,
-        language=language,
-    )
-
+    words_json = payload.get("words", [])
     words: List[Word] = []
-    n_filler_dropped = 0
 
-    for seg in segments:
-        if getattr(seg, "words", None):
-            for w in seg.words:
-                if w.start is None or w.end is None:
-                    continue
-                wt_raw = (w.word or "").strip()
-                if not wt_raw:
-                    continue
-                wt_norm = norm(wt_raw)
-                if filler_tokens and wt_norm in filler_tokens:
-                    n_filler_dropped += 1
-                    continue
-                words.append(Word(text=wt_raw, start=float(w.start), end=float(w.end)))
-        else:
-            # Fallback: treat whole segment as one token if no word timestamps
-            if seg.start is None:
-                continue
-            seg_text = (seg.text or "").strip()
-            if not seg_text:
-                continue
-            seg_norm = norm(seg_text)
-            if filler_tokens and seg_norm in filler_tokens:
-                n_filler_dropped += 1
-                continue
-            words.append(
-                Word(
-                    text=seg_text,
-                    start=float(seg.start),
-                    end=float(seg.end or seg.start + 2.0),
-                )
-            )
+    for w in words_json:
+        case = w.get("case", "")
+        if case != "success":
+            # Skip tokens that Gentle couldn't align to audio
+            continue
+        start = w.get("start", None)
+        end = w.get("end", None)
+        if start is None or end is None:
+            continue
+
+        # Prefer alignedWord; fall back to "word" or raw transcript word
+        text = (
+            w.get("alignedWord")
+            or w.get("word")
+            or ""
+        )
+        text = (text or "").strip()
+        if not text:
+            continue
+
+        words.append(Word(text=text, start=float(start), end=float(end)))
 
     if words:
         print(
-            f"[green]Transcribed {len(words)} words[/green] "
+            f"[green]Gentle aligned {len(words)} words[/green] "
             f"(first at {words[0].start:.2f}s, last at {words[-1].end:.2f}s)"
         )
     else:
-        print("[bold red]No words returned from transcription[/bold red]")
-
-    if filler_tokens is not None:
-        print(
-            f"[cyan]Filler filtering:[/cyan] "
-            f"dropped {n_filler_dropped} filler tokens based on {len(filler_tokens)} patterns"
-        )
+        print("[bold red]No aligned words from Gentle.[/bold red]")
 
     return words
 
@@ -388,7 +360,7 @@ def _tokens_similar(a: str, b: str, threshold: float = 70.0) -> bool:
     return _similarity(a, b) >= threshold
 
 
-# ---------- DP-based global alignment ----------
+# ---------- DP-based global alignment (lyrics lines -> Gentle words) ----------
 def align_lines_dp(
     lines: List[str],
     words: List[Word],
@@ -397,11 +369,11 @@ def align_lines_dp(
     """
     Global sequence alignment between:
       - lyric tokens (with line indices)
-      - transcript tokens (one per Word)
+      - Gentle tokens (one per aligned Word)
 
     Steps:
       1) Flatten lyrics into tokens with line indices.
-      2) Flatten transcript words into normalized tokens.
+      2) Flatten Gentle-aligned words into normalized tokens.
       3) Dynamic-programming alignment (Levenshtein-style).
       4) For each line, derive [start,end] from earliest/latest matched word index.
       5) Interpolate any lines that didn't get matches.
@@ -419,7 +391,7 @@ def align_lines_dp(
             if t:
                 lyric_tokens.append((t, li))
 
-    # ---- Build transcript token sequence ----
+    # ---- Build Gentle token sequence ----
     transcript_tokens: List[str] = []
     tok2word_index: List[int] = []  # map transcript-token index -> Word index
 
@@ -450,13 +422,13 @@ def align_lines_dp(
     T = len(transcript_tokens)
 
     print(
-        f"[cyan]DP alignment:[/cyan] {L} lyric tokens vs {T} transcript tokens "
-        f"({n_lines} lines)"
+        f"[cyan]DP alignment (lyrics vs Gentle words):[/cyan] "
+        f"{L} lyric tokens vs {T} aligned tokens ({n_lines} lines)"
     )
 
     # ---- DP matrix ----
     INF = 10**9
-    # dp[i][j] = best cost to align first i lyric tokens with first j transcript tokens
+    # dp[i][j] = best cost to align first i lyric tokens with first j Gentle tokens
     dp: List[List[int]] = [[INF] * (T + 1) for _ in range(L + 1)]
     prev: List[List[Optional[Tuple[str, int, int]]]] = [
         [None] * (T + 1) for _ in range(L + 1)
@@ -479,7 +451,7 @@ def align_lines_dp(
                     dp[i + 1][j + 1] = cur + cost
                     prev[i + 1][j + 1] = ("M", i, j)
 
-            # Skip transcript token (insertion in lyrics)
+            # Skip Gentle token (insertion in lyrics)
             if j < T:
                 if cur + 1 < dp[i][j + 1]:
                     dp[i][j + 1] = cur + 1
@@ -529,7 +501,7 @@ def align_lines_dp(
         i, j = pi, pj
 
     # ---- Derive per-line start/end from word indices ----
-    # First, compute avg_gap from transcript span
+    # First, compute avg_gap from Gentle span
     if words:
         total_span = max(0.1, words[-1].end - words[0].start)
     else:
@@ -558,17 +530,7 @@ def align_lines_dp(
     ) -> List[Tuple[int, float, float, str]]:
         out: List[Tuple[int, float, float, str]] = list(arr)  # shallow copy
 
-        # Pass 1: simple forward fill for starts/ends if isolated misses
-        last_known_idx = None
-        for i in range(len(out)):
-            li, s, e, text = out[i]
-            if s is not None and e is not None:
-                last_known_idx = i
-                continue
-            # missing -> keep None for now
-            continue
-
-        # Pass 2: full block interpolation
+        # Pass 1: we leave None as-is; main work is in block interpolation
         i = 0
         while i < len(out):
             li, s, e, text = out[i]
@@ -579,7 +541,7 @@ def align_lines_dp(
             # start of a missing block
             start_block = i
             while i < len(out):
-                li2, s2, e2, txt2 = out[i]
+                li2, s2, e2, _txt2 = out[i]
                 if s2 is not None and e2 is not None:
                     break
                 i += 1
@@ -638,8 +600,6 @@ def align_lines_dp(
                     out[k] = (li_k, s_k, e_k, text_k)
                     cur_start += avg_gap
 
-            i = end_block + 1
-
         # Replace any remaining None (paranoia)
         for i in range(len(out)):
             li, s, e, text = out[i]
@@ -680,7 +640,7 @@ def align_lines_dp(
         clamped: List[Tuple[int, float, float, str]] = []
         for li, s, e, text in filled:
             if s >= audio_duration:
-                # drop lines entirely beyond the audio
+                # Drop lines entirely beyond the audio
                 continue
             e = min(e, audio_duration)
             if e <= s:
@@ -702,7 +662,7 @@ def perform_alignment(
     """
     if not words:
         print(
-            "[yellow]No words from transcription; using naive linear spacing across track.[/yellow]"
+            "[yellow]No words from Gentle; using naive linear spacing across track.[/yellow]"
         )
         total_span = audio_duration if audio_duration > 0 else 2.5 * len(lines)
         avg_gap = total_span / max(1, len(lines))
@@ -716,48 +676,23 @@ def perform_alignment(
     return align_lines_dp(lines, words, audio_duration)
 
 
-def ensure_sixstem_vocals(slug: str) -> Optional[Path]:
-    model_name = "htdemucs_6s"
-    root = SEPARATED_DIR / model_name
-    slug_dir = root / slug
-    vocals = slug_dir / "vocals.wav"
-    if vocals.exists():
-        return vocals
-
-    mp3_path = MP3_DIR / f"{slug}.mp3"
-    if not mp3_path.exists():
-        return None
-
-    # run demucs 6-stem once
-    cmd = [
-        sys.executable,
-        "-m", "demucs",
-        "-n", model_name,
-        str(mp3_path),
-    ]
-    print(f"[cyan]Running Demucs 6-stem for timing:[/cyan] {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
-
-    return vocals if vocals.exists() else None
-
-
 # ---------- CLI ----------
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Auto-time lyrics TXT to audio using faster-whisper (DP alignment)."
+        description="Auto-time lyrics TXT to audio using Gentle (HTTP forced aligner)."
     )
 
     parser.add_argument(
         "--slug",
         required=True,
-        help="Song slug (used for timings/<slug>.csv).",
+        help="Song slug (used for txts/<slug>.txt, mp3s/<slug>.mp3, timings/<slug>.csv).",
     )
     parser.add_argument(
         "--mp3",
         type=str,
         help=(
-            "Path to audio file. If omitted, will prefer a vocal stem from "
-            "separated/*/<slug>/*vocals*.wav, falling back to mp3s/<slug>.mp3."
+            "Path to audio file (any format ffmpeg can read). If omitted, "
+            "will prefer mixes/<slug>_*.wav, falling back to mp3s/<slug>.mp3."
         ),
     )
     parser.add_argument(
@@ -766,34 +701,10 @@ def parse_args() -> argparse.Namespace:
         help="Path to lyrics TXT. Default: txts/<slug>.txt",
     )
     parser.add_argument(
-        "--model-size",
+        "--gentle-url",
         type=str,
-        default="small",
-        help="faster-whisper model size (tiny, base, small, medium, large-v2, etc.).",
-    )
-    parser.add_argument(
-        "--lang",
-        type=str,
-        default=None,
-        help="Language code (e.g., en, es). None = auto-detect.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Device for faster-whisper: cpu or cuda. Default: auto-detect.",
-    )
-    parser.add_argument(
-        "--filler-audio",
-        type=str,
-        default=None,
-        help=(
-            "Optional path to a short speech-like clip (e.g., 'hey listen'). "
-            "If provided (or if assets/filler_hey_listen.wav exists), a quiet "
-            "loop of this audio is mixed into a temp copy of the timing audio "
-            "before Whisper, and any filler words are stripped from the transcript. "
-            "This is ONLY used for timing; original audio is untouched."
-        ),
+        default="http://localhost:8765/transcriptions?async=false",
+        help="Gentle HTTP endpoint (default: http://localhost:8765/transcriptions?async=false).",
     )
     return parser.parse_args()
 
@@ -804,68 +715,44 @@ def main() -> None:
     slug = args.slug
     txt_path = Path(args.txt) if args.txt else (TXT_DIR / f"{slug}.txt")
     explicit_audio = Path(args.mp3) if args.mp3 else None
-    audio_path = choose_timing_audio(slug, explicit_audio)
 
-    # Decide on filler audio (if any)
-    filler_audio: Optional[Path] = None
-    if args.filler_audio:
-        cand = Path(args.filler_audio)
-        if cand.exists():
-            filler_audio = cand
-        else:
-            print(
-                f"[yellow]Specified --filler-audio not found:[/yellow] {cand} "
-                f"– ignoring."
-            )
-    elif DEFAULT_FILLER_AUDIO.exists():
-        filler_audio = DEFAULT_FILLER_AUDIO
-
-    # Build filler-augmented audio for Whisper if we have a filler clip
-    if filler_audio is not None:
-        whisper_audio = build_fillerized_audio(audio_path, filler_audio)
-    else:
-        whisper_audio = audio_path
+    base_audio = choose_timing_audio(slug, explicit_audio)
+    gentle_wav = convert_to_gentle_wav(base_audio)
 
     print(f"[cyan]Slug:[/cyan]  {slug}")
     print(f"[cyan]TXT:[/cyan]   {txt_path}")
-    print(f"[cyan]Audio for timing (base):[/cyan] {audio_path}")
-    if whisper_audio != audio_path:
-        print(f"[cyan]Audio for Whisper (with filler):[/cyan] {whisper_audio}")
+    print(f"[cyan]Audio (base):[/cyan] {base_audio}")
+    print(f"[cyan]Audio for Gentle:[/cyan] {gentle_wav}")
 
-    if not audio_path.exists():
-        print(f"[bold red]Audio not found:[/bold red] {audio_path}")
-        sys.exit(1)
     if not txt_path.exists():
         print(f"[bold red]TXT not found:[/bold red] {txt_path}")
         sys.exit(1)
 
-    audio_duration = probe_audio_duration(audio_path)
+    audio_duration = probe_audio_duration(base_audio)
     if audio_duration > 0:
         print(f"[cyan]Audio duration:[/cyan] {audio_duration:.2f}s")
     else:
         print("[yellow]Could not determine audio duration via ffprobe.[/yellow]")
 
+    # 1) Load lyrics
     lines = load_lyrics_lines(txt_path)
+    transcript_text = load_lyrics_text(txt_path)
     print(f"[green]Loaded {len(lines)} lyric lines[/green]")
 
-    # 1) Transcribe words (on whisper_audio, which may be filler-augmented)
-    filler_norm_tokens: Optional[set[str]] = None
-    if filler_audio is not None:
-        # Normalize FILLER_TOKENS once here
-        filler_norm_tokens = {norm(t) for t in FILLER_TOKENS}
-
-    words = transcribe_words(
-        audio_path=whisper_audio,
-        model_size=args.model_size,
-        language=args.lang,
-        device=args.device,
-        filler_tokens=filler_norm_tokens,
+    # 2) Call Gentle
+    payload = call_gentle(
+        gentle_url=args.gentle_url,
+        audio_wav=gentle_wav,
+        transcript_text=transcript_text,
     )
 
-    # 2) Alignment (DP-based)
+    # 3) Extract words
+    words = words_from_gentle(payload)
+
+    # 4) Alignment (DP-based)
     triples = perform_alignment(lines, words, audio_duration)
 
-    # 3) Write CSV
+    # 5) Write CSV
     write_timings_csv(slug, triples)
 
 
