@@ -240,8 +240,10 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
 # ============================================================================
 # Step 3 Stub (timing UI)
 # ============================================================================
-def run_step3(slug: str) -> float:
+def run_step3(slug: str, model_size: str | None = None) -> float:
     cmd = [sys.executable, str(SCRIPTS_DIR / "3_auto_timing.py"), "--slug", slug]
+    if model_size:
+        cmd.extend(["--model-size", model_size])
     return run(cmd, "STEP3")
 
 # ============================================================================
@@ -383,6 +385,7 @@ def parse_args():
     p.add_argument("--no-ui", action="store_true")
     p.add_argument("--force-mp4", action="store_true")
     p.add_argument("--no-upload", action="store_true")
+    p.add_argument("--timing-model-size", type=str, help="Override model size for timing (3_auto_timing.py)")
     return p.parse_args()
 
 # ============================================================================
@@ -458,7 +461,7 @@ def main():
         t2 = run_step2(slug, args.profile, args.model, interactive=not no_ui)
 
     if 3 in steps:
-        t3 = run_step3(slug)
+        t3 = run_step3(slug, args.timing_model_size)
 
     if 4 in steps:
         t4 = run_step4(
