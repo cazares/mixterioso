@@ -160,13 +160,12 @@ def main() -> None:
         log(section, f"ERROR loading ASR model: {e}", RED)
         sys.exit(1)
 
-    # 2) Transcribe (VAD OFF for music)
+    # 2) Transcribe (no vad_filter arg; your WhisperX version doesn't support it)
     log(section, f"Transcribing {audio_path} ...", CYAN)
     try:
         asr_result = model.transcribe(
             str(audio_path),
             language=args.language,
-            vad_filter=False,  # IMPORTANT: VAD OFF for songs
         )
     except Exception as e:
         log(section, f"ERROR during transcription: {e}", RED)
