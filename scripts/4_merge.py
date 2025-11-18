@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 # scripts/4_merge.py
 #
-# STEP 4: AUTO-TIMING (WHISPERX) — NON-BLOCKING, JSON OUTPUT
-# ----------------------------------------------------------
-# - Reads txts/<slug>.txt
-# - Uses WhisperX to transcribe + align mp3s/<slug>.mp3
-# - Outputs canonical timings CSV:
-#       line_index,start,end,text
-# - Fully compatible with master pipeline (Option A)
-# - Accepts --language, passes through WhisperX args
-# - Streams WhisperX logs so pipeline never looks "hung"
-# - ALWAYS returns JSON on the last line
+# STEP 4: WHISPERX AUTO-TIMING WRAPPER
+# -------------------------------------
+# - Calls _whisperx_align_driver.py
+# - Streams logs so 0_master.py never looks "hung"
+# - Always prints a final JSON dict on last line:
+#       { "ok": true/false, "slug": "...", "csv": "...", ... }
 #
-# NOTE:
-#   This file preserves your custom alignment logic.
-#   Only safe minimal modifications were made.
+# CSV schema produced:
+#       line_index,start,end,text
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import time
@@ -35,44 +29,35 @@ BASE = Path(__file__).resolve().parent.parent
 TXT_DIR = BASE / "txts"
 MP3_DIR = BASE / "mp3s"
 TIMINGS_DIR = BASE / "timings"
-
 TIMINGS_DIR.mkdir(exist_ok=True)
 
-# -------------------------------------------------------------------
-# Logging
-# -------------------------------------------------------------------
 def log(section, msg, color=CYAN):
     ts = time.strftime("%H:%M:%S")
-    print(f"{color}[{ts}] [{section}]{RESET} {msg}")
+    print(f"{color}[{ts}] [{section}]{RESET} {msg}", flush=True)
 
-# -------------------------------------------------------------------
-# Run WhisperX alignment (same behavior as your original script)
-# -------------------------------------------------------------------
-def run_whisperx(slug, language, passthrough_args):
+def run_whisperx(slug, language, passthrough):
     section = "WhisperX"
 
-    txt_path = TXT_DIR / f"{slug}.txt"
-    if not txt_path.exists():
-        log(section, f"ERROR: lyrics file not found {txt_path}", RED)
-        return {"ok": False, "error": "lyrics-not-found"}
-
-    mp3_path = MP3_DIR / f"{slug}.mp3"
-    if not mp3_path.exists():
-        log(section, f"ERROR: mp3 file not found {mp3_path}", RED)
-        return {"ok": False, "error": "mp3-not-found"}
-
+    txt = TXT_DIR / f"{slug}.txt"
+    mp3 = MP3_DIR / f"{slug}.mp3"
     out_csv = TIMINGS_DIR / f"{slug}.csv"
 
-    log(section, f"Running WhisperX on {mp3_path}")
+    if not txt.exists():
+        log(section, f"ERROR: lyrics file missing: {txt}", RED)
+        return {"ok": False, "error": "lyrics-not-found"}
+    if not mp3.exists():
+        log(section, f"ERROR: mp3 missing: {mp3}", RED)
+        return {"ok": False, "error": "mp3-not-found"}
 
     cmd = [
         "python3", "scripts/_whisperx_align_driver.py",
-        "--audio", str(mp3_path),
-        "--lyrics", str(txt_path),
+        "--audio", str(mp3),
+        "--lyrics", str(txt),
         "--output", str(out_csv),
-        "--language", language
-    ] + passthrough_args
+        "--language", language,
+    ] + passthrough
 
+    log(section, "RUN on " + str(mp3), CYAN)
     log(section, "CMD: " + " ".join(cmd), BLUE)
 
     proc = subprocess.Popen(
@@ -84,52 +69,33 @@ def run_whisperx(slug, language, passthrough_args):
     )
 
     for line in proc.stdout:
-        print(f"{CYAN}[WhisperX]{RESET} {line.rstrip()}")
+        print(f"{CYAN}[WhisperX]{RESET} {line.rstrip()}", flush=True)
 
     proc.wait()
     rc = proc.returncode
 
     if rc != 0:
-        log(section, f"WhisperX FAILED (code {rc})", RED)
+        log(section, f"FAILED (exit={rc})", RED)
         return {"ok": False, "error": "whisperx-failed"}
 
     if not out_csv.exists():
-        log(section, f"ERROR: WhisperX did not produce CSV", RED)
-        return {"ok": False, "error": "no-output"}
+        log(section, "ERROR: expected CSV missing", RED)
+        return {"ok": False, "error": "no-csv"}
 
-    log(section, f"Timing CSV ready: {out_csv}", GREEN)
+    log(section, f"CSV READY → {out_csv}", GREEN)
+    return {"ok": True, "slug": slug, "csv": str(out_csv)}
 
-    return {
-        "ok": True,
-        "slug": slug,
-        "csv": str(out_csv)
-    }
-
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--slug", required=True)
-    parser.add_argument("--language", default="en")
-    parser.add_argument("--pass", dest="passthrough", nargs="*", default=[])
-    # All other args should pass-through raw:
-    parser.add_argument("extra", nargs="*", help="additional args passed directly to WhisperX")
+    p = argparse.ArgumentParser()
+    p.add_argument("--slug", required=True)
+    p.add_argument("--language", default="en")
+    p.add_argument("--pass", dest="passthrough", nargs="*", default=[])
+    p.add_argument("extra", nargs="*", help="passthrough args")
+    args = p.parse_args()
 
-    args = parser.parse_args()
+    passthrough = (args.passthrough or []) + (args.extra or [])
 
-    passthrough_args = []
-    if args.passthrough:
-        passthrough_args.extend(args.passthrough)
-    if args.extra:
-        passthrough_args.extend(args.extra)
-
-    result = run_whisperx(
-        args.slug,
-        args.language,
-        passthrough_args
-    )
-
+    result = run_whisperx(args.slug, args.language, passthrough)
     print(json.dumps(result))
 
 if __name__ == "__main__":
