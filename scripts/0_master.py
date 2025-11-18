@@ -158,8 +158,13 @@ def main():
         "Step2:Download"
     )
 
-    # Keep working even if meta fails; it's optional
-    if meta_json:
+    # Fallback metadata
+    meta_title = slug.replace("_", " ")
+    meta_artist = ""
+
+    if meta_json and meta_json.get("ok"):
+        meta_title = meta_json.get("title", meta_title)
+        meta_artist = meta_json.get("artist", meta_artist)
         log("Master", f"Metadata received: {meta_json}", GREEN)
     else:
         log("Master", f"No metadata returned; continuing.", YELLOW)
@@ -217,9 +222,9 @@ def main():
     gen_json, rc = run_step(
         [
             "python3", "scripts/5_gen.py",
-            "--slug", slug,
+            "--base-filename", slug,
             "--offset", str(args.offset),
-            "--profile", selected_mode  # may not be needed
+            "--profile", selected_mode
         ],
         "Step5:Gen"
     )
@@ -231,15 +236,19 @@ def main():
     log("Master", f"MP4 generated: {mp4_path}", GREEN)
 
     # ------------------------------------------------------------------
-    # STEP 6 — UPLOAD
+    # STEP 6 — UPLOAD (new CLI)
     # ------------------------------------------------------------------
+    yt_title = f"{meta_title} - {meta_artist}" if meta_artist else meta_title
+    yt_description = f"Karaoke generated automatically for '{meta_title}'"
+
     upload_json, rc = run_step(
         [
             "python3", "scripts/6_upload.py",
-            "--file", mp4_path,
-            "--slug", slug,
-            "--profile", selected_mode,
-            "--offset", str(args.offset)
+            "--mp4", mp4_path,
+            "--title", yt_title,
+            "--description", yt_description,
+            "--base-filename", slug,
+            "--visibility", "public"
         ],
         "Step6:Upload"
     )
@@ -248,7 +257,8 @@ def main():
         log("Master", "Upload failed!", RED)
         sys.exit(1)
 
-    log("Master", f"Upload complete → {upload_json}", GREEN)
+    url = upload_json.get("watch_url", "<no-url>")
+    log("Master", f"YouTube upload complete → {url}", GREEN)
     log("Master", "Pipeline complete", GREEN)
 
 
