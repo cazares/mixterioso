@@ -64,6 +64,16 @@ MP3_DIR.mkdir(parents=True, exist_ok=True)
 META_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
+# Load .env automatically (if present) so we don't rely on `source .env`
+try:
+    from dotenv import load_dotenv
+    env_path = BASE / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+except Exception:
+    # If python-dotenv is not installed or anything else fails, just continue.
+    pass
+
 
 # ----------------------------------------------------------------------
 # HELPERS
@@ -85,41 +95,130 @@ def write_json(path, data):
 
 
 # ----------------------------------------------------------------------
-# LYRICS FETCH
+# MUSIXMATCH HELPERS (TEXT LYRICS)
+# ----------------------------------------------------------------------
+def musixmatch_search_track(query, api_key):
+    """
+    Returns track_id or None
+    """
+    import urllib.parse
+    import urllib.request
+
+    url = (
+        "https://api.musixmatch.com/ws/1.1/track.search?"
+        + urllib.parse.urlencode({
+            "q_track": query,
+            "page_size": 1,
+            "s_track_rating": "desc",
+            "apikey": api_key
+        })
+    )
+
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        lst = data.get("message", {}).get("body", {}).get("track_list", [])
+        if lst:
+            return lst[0]["track"]["track_id"]
+    except Exception:
+        return None
+
+    return None
+
+
+def musixmatch_fetch_lyrics(track_id, api_key):
+    """
+    Returns text lyrics or None
+    """
+    import urllib.parse
+    import urllib.request
+
+    url = (
+        "https://api.musixmatch.com/ws/1.1/track.lyrics.get?"
+        + urllib.parse.urlencode({
+            "track_id": track_id,
+            "apikey": api_key
+        })
+    )
+
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        lyr = data.get("message", {}).get("body", {}).get("lyrics", {})
+        text = lyr.get("lyrics_body")
+        if text:
+            # Musixmatch returns a disclaimer at the bottom — strip it.
+            text = re.sub(r"\*\*\*.+", "", text).strip()
+            return text
+    except Exception:
+        return None
+
+    return None
+
+
+# ----------------------------------------------------------------------
+# LYRICS FETCH (MUSIXMATCH FIRST, THEN GENIUS)
 # ----------------------------------------------------------------------
 def fetch_lyrics(query, language):
     section = "Lyrics"
+    slug = slugify(query)
 
     log(section, f"Searching lyrics for query: {query}")
 
-    slug = slugify(query)
+    # ---------------------------------------------------------------
+    # 1) FIRST PRIORITY → MUSIXMATCH TEXT-ONLY LYRICS
+    # ---------------------------------------------------------------
+    mm_api_key = os.getenv("MUSIXMATCH_API_KEY", "")
+    if mm_api_key:
+        log(section, "Trying Musixmatch...", BLUE)
+        track_id = musixmatch_search_track(query, mm_api_key)
 
-    # 1: Try basic Genius scraping
-    #    We use lyricsgenius ONLY if installed, else fallback to manual.
+        if track_id:
+            log(section, f"Musixmatch track_id={track_id}", GREEN)
+            mm_lyrics = musixmatch_fetch_lyrics(track_id, mm_api_key)
+            if mm_lyrics:
+                log(section, "Musixmatch lyrics found.", GREEN)
+                lyr_path = TXT_DIR / f"{slug}.txt"
+                lyr_path.write_text(mm_lyrics, encoding="utf-8")
+                return {
+                    "ok": True,
+                    "slug": slug,
+                    "lyrics_path": str(lyr_path)
+                }
+        else:
+            log(section, "Musixmatch found no track match.", YELLOW)
+    # If MUSIXMATCH_API_KEY is not set or Musixmatch fails, we silently fall through to Genius.
+
+    # ---------------------------------------------------------------
+    # 2) FALLBACK → GENIUS (existing working behavior)
+    # ---------------------------------------------------------------
+    log(section, "Trying Genius fallback...", BLUE)
+
+    lyrics = None
     try:
         import lyricsgenius
-        G = lyricsgenius.Genius(os.getenv("GENIUS_API_KEY", ""), timeout=10, skip_non_songs=True)
+        G = lyricsgenius.Genius(
+            os.getenv("GENIUS_API_KEY", ""),
+            timeout=10,
+            skip_non_songs=True
+        )
         song = G.search_song(query)
+        if song and song.lyrics:
+            log(section, "Genius lyrics found.", GREEN)
+            lyrics = song.lyrics
     except Exception as e:
-        log(section, f"Genius API failed or unavailable: {e}", YELLOW)
-        song = None
+        log(section, f"Genius API failed: {e}", YELLOW)
 
-    if song and song.lyrics:
-        lyrics = song.lyrics
-        log(section, "Genius lyrics found.", GREEN)
-    else:
-        # 2: One last attempt with direct "artist - title" extraction
-        # If it still fails -> ask user to paste lyrics manually (but via fallback for pipeline)
-        log(section, "No lyrics found via Genius.", YELLOW)
-        log(section, "Falling back to manual lyrics.", YELLOW)
-
-        # Non-interactive fallback: create empty placeholder
-        lyrics = "[NO LYRICS FOUND]\n\n(Please update txts/%s.txt manually)" % slug
+    # ---------------------------------------------------------------
+    # 3) FALLBACK OF LAST RESORT → manual placeholder
+    # ---------------------------------------------------------------
+    if not lyrics:
+        log(section, "No lyrics from Musixmatch or Genius.", YELLOW)
+        lyrics = f"[NO LYRICS FOUND]\n\n(Please update txts/{slug}.txt manually)"
 
     lyr_path = TXT_DIR / f"{slug}.txt"
     lyr_path.write_text(lyrics, encoding="utf-8")
 
-    # Final JSON
     return {
         "ok": True,
         "slug": slug,
@@ -136,13 +235,13 @@ def fetch_meta(slug, query=None):
     artist = ""
     title = ""
 
-    # Simple heuristic: try parsing “artist - title” from query
+    # Simple heuristic: try parsing “artist - title”
     if query and "-" in query:
         parts = [p.strip() for p in query.split("-", 1)]
         if len(parts) == 2:
             artist, title = parts
 
-    # If not, try splitting last search result words
+    # If not, fallback guess
     if not artist or not title:
         if query:
             tokens = query.split()
@@ -174,7 +273,6 @@ def fetch_meta(slug, query=None):
 def fetch_mp3(slug):
     section = "MP3"
 
-    # If MP3 already exists → skip
     mp3_path = MP3_DIR / f"{slug}.mp3"
     if mp3_path.exists():
         log(section, f"MP3 already exists: {mp3_path}", GREEN)
@@ -185,7 +283,6 @@ def fetch_mp3(slug):
             "video_id": None,
         }
 
-    # 1) Use yt-dlp to search for best match
     search_query = f"ytsearch1:{slug.replace('_', ' ')}"
     tmp_mp3 = TMP_DIR / f"{slug}.mp3"
 
@@ -209,10 +306,8 @@ def fetch_mp3(slug):
             "slug": slug
         }
 
-    # Move tmp mp3 into mp3s/
     tmp_mp3.rename(mp3_path)
 
-    # Extract the video ID by parsing the stdout
     vid = None
     m = re.search(r"watch\?v=([A-Za-z0-9_\-]{6,})", proc.stdout)
     if m:
@@ -226,7 +321,6 @@ def fetch_mp3(slug):
         "mp3_path": str(mp3_path),
         "video_id": vid,
     }
-
 
 
 # ----------------------------------------------------------------------
@@ -245,7 +339,7 @@ def main():
     slug = args.slug
     lang = args.language
 
-    # LYRICS ------------------------------------------------------------------
+    # LYRICS ----------------------------------------------------------
     if task == "lyrics":
         if not query:
             print(json.dumps({"ok": False, "error": "--query required"}))
@@ -254,7 +348,7 @@ def main():
         print(json.dumps(result))
         return
 
-    # META --------------------------------------------------------------------
+    # META ------------------------------------------------------------
     if task == "meta":
         if not slug and not query:
             print(json.dumps({"ok": False, "error": "Need --slug OR --query"}))
@@ -265,7 +359,7 @@ def main():
         print(json.dumps(result))
         return
 
-    # MP3 ---------------------------------------------------------------------
+    # MP3 -------------------------------------------------------------
     if task == "mp3":
         if not slug:
             print(json.dumps({"ok": False, "error": "--slug required"}))
