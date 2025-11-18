@@ -171,7 +171,7 @@ def greedy_line_alignment(
     words: List[Word],
     min_ratio: float = 0.55,
     search_pad: int = 48,
-) -> List[Tuple[int, float, str]]:
+) -> List[Tuple[int, float, float, str]]:
     """
     Map each lyric line to a timestamp (start of best-matching word span).
     - Token-based matching against ASR words (normalized).
@@ -195,7 +195,7 @@ def greedy_line_alignment(
         for _ in toks:
             word_times.append(w.start)
 
-    out: List[Tuple[int, float, str]] = []
+    out: List[Tuple[int, float, float, str]] = []
     cursor = 0
     N = len(word_tokens)
 
@@ -247,7 +247,7 @@ def greedy_line_alignment(
     # Enforce non-decreasing times (strictly increasing by tiny epsilon)
     eps = 1e-3
     last = -1e9
-    fixed: List[Tuple[int, float, str]] = []
+    fixed: List[Tuple[int, float, float, str]] = []
     for li, ts, line in out:
         if ts <= last:
             ts = last + eps
@@ -332,7 +332,7 @@ def main():
             "slug": slug,
             "mp3": str(mp3_path),
             "txt": str(txt_path),
-            "triples": [{"line_index": li, "time_secs": ts, "text": line} for li, ts, line in triples],
+            "triples": [{"line_index": li, "start_secs": ts, "end_secs": te, "text": line} for li, ts, te, line in triples],
         }
         dbg_path = out_dir / f"{slug}.align.debug.json"
         dbg_path.write_text(json.dumps(dj, indent=2), encoding="utf-8")
