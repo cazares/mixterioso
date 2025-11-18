@@ -4,8 +4,6 @@ rm output/nirvana*.ass
 rm timings/nirvana*.csv
 rm mixes/nirvana*.wav
 
-# python3 scripts/3_auto_timing.py --slug nirvana_come_as_you_are --debug
-
 python3 scripts/3_auto_timing.py \
     --slug nirvana_come_as_you_are \
     --language en \

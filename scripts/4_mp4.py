@@ -9,13 +9,20 @@
 #   - Uses 1920x1080 video
 #   - Renders main lyrics in the top band
 #   - Renders "Next:" preview in the bottom band
-#   - Extends each lyric line on screen until:
-#       * the next lyric line, or
-#       * a music-note block starts (instrumental region)
-#   - Inserts randomized music-note overlays in gaps where:
-#       * the pre-gap lyric line has been visible ≥ 4s, AND
-#       * the notes themselves can stay ≥ 4s
-#   - Never overlays notes on top of active lyrics
+#   - Extends each lyric line (and title screen) on screen until:
+#       * the next lyric line, OR
+#       * a music-note block starts
+#   - Inserts randomized music-note overlays only in purely instrumental regions:
+#       * pre-lyric intro, or gaps between lyrics
+#       * never overlapping any lyric line (even low-confidence)
+#       * only if:
+#           - the pre-instrumental line has been visible ≥ 4s, AND
+#           - the notes themselves can stay ≥ 4s, AND
+#           - notes end 1s before the next lyric starts
+#   - Notes appear in fixed non-overlapping slots:
+#       * 4 horizontal “slots” across the vertical center line
+#       * each 2s “frame” picks a subset of slots (1–4) and draws one note per slot
+#       * notes are randomly chosen from ♩ ♪ ♫ ♬
 #   - Hides "Next:" preview during music-note sections
 #   - Supports global offset (--offset or KARAOKE_OFFSET_SECS)
 #   - Supports --force to re-render MP4 even if it exists
@@ -76,11 +83,13 @@ DIVIDER_RIGHT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX
 VERTICAL_OFFSET_FRACTION = 0.0
 TITLE_EXTRA_OFFSET_FRACTION = -0.20
 
+# Updated scales
 NEXT_LINE_FONT_SCALE  = 0.55
 NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.45
 NEXT_LABEL_TOP_MARGIN_PX  = 10
 NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX + NEXT_LABEL_TOP_MARGIN_PX
 
+# Updated fade
 FADE_IN_MS  = 75
 FADE_OUT_MS = 75
 
@@ -115,18 +124,21 @@ LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "-0.5") or "-0.5")
 # =============================================================================
 # MUSIC NOTES
 # =============================================================================
-MUSIC_NOTE_CHARS = "♪♫♩♬"   # white only
-NOTE_GAP_THRESHOLD_SECS = 4.0  # minimum duration allocated for notes themselves
-NOTE_SAFE_INSET = 0.35
+MUSIC_NOTE_CHARS = "♪♫♩♬"
+NOTE_GAP_THRESHOLD_SECS = 4.0          # minimum notes segment duration
 NOTE_MIN_COUNT = 1
-NOTE_MAX_COUNT = 4   # 1–4 notes at a time
-NOTE_DURATION  = 2.0 # each note cluster lasts ~2s (update rate)
-NOTE_SPAWN_PERIOD_SECS = 2.0   # re-randomize pattern every 2 seconds
+NOTE_MAX_COUNT = 4                     # 1–4 notes per pattern
+NOTE_DURATION  = 2.0                   # each pattern lives ~2s
+NOTE_SPAWN_PERIOD_SECS = 2.0           # re-randomize every 2s
 NOTE_FADE_IN   = 150
 NOTE_FADE_OUT  = 200
 
-# Minimum time a lyric line should stay on-screen (when timeline allows)
+# Minimum time a line (or title) should be on-screen before notes
 MIN_LYRIC_VISIBLE_SECS = 4.0
+
+# Notes must go away this many seconds before the next lyric starts
+NOTE_EARLY_END_SECS = 1.0
+
 
 def log(prefix: str, msg: str, color: str = RESET) -> None:
     ts = time.strftime("%H:%M:%S")
@@ -159,35 +171,31 @@ def rgb_to_bgr(rrggbb: str) -> str:
 
 
 def is_music_only(text: str) -> bool:
+    """
+    Heuristic: "music-only" lines for which we should NOT spawn lyric-driven notes.
+    Any line that has alphanumeric characters is considered "vocal" (even low-confidence).
+    """
     if not text:
         return False
     stripped = text.strip()
     if not stripped:
         return False
+    # If it has alphanumerics, treat it as vocal/worded content.
+    if any(ch.isalnum() for ch in stripped):
+        return False
+    # Music-note-only, punctuation-only, or explicit 'instrumental' keywords: treat as music-only.
     if any(ch in MUSIC_NOTE_CHARS for ch in stripped):
-        return True
-    if not any(ch.isalnum() for ch in stripped):
         return True
     lower = stripped.lower()
     for kw in ["instrumental", "solo", "guitar solo", "piano solo"]:
         if kw in lower:
             return True
-    return False
+    # Default: if no alnum and not obviously something else, treat as music-only.
+    return True
 
 
 def random_note() -> str:
     return random.choice(MUSIC_NOTE_CHARS)
-
-
-def random_pos_fullscreen() -> tuple[int,int]:
-    sx_min = int(VIDEO_WIDTH  * NOTE_SAFE_INSET)
-    sx_max = int(VIDEO_WIDTH  * (1 - NOTE_SAFE_INSET))
-    sy_min = int(VIDEO_HEIGHT * NOTE_SAFE_INSET)
-    sy_max = int(VIDEO_HEIGHT * 0.55)
-    return (
-        random.randint(sx_min, sx_max),
-        random.randint(sy_min, sy_max),
-    )
 
 
 def read_meta(slug: str) -> tuple[str,str]:
@@ -347,7 +355,41 @@ def build_ass(
 
     unified.sort(key=lambda x: x[0])
 
+    # Pre-compute note slots (fixed positions, no overlap)
+    # Four slots across the horizontal center: visually "1 2 3 4"
+    slot_fractions = [0.2, 0.4, 0.6, 0.8]
+    note_slots_x = [int(playresx * f) for f in slot_fractions]
+    note_slot_y = playresy // 2
+
+    def emit_notes_block(t_start: float, t_end: float) -> None:
+        """Emit a sequence of note patterns from t_start to t_end."""
+        if t_end <= t_start + 0.05:
+            return
+        t = t_start
+        while t < t_end - 0.05:
+            frame_end = min(t + NOTE_DURATION, t_end)
+            if frame_end <= t:
+                break
+            # Choose unique slots for this frame
+            k = random.randint(NOTE_MIN_COUNT, NOTE_MAX_COUNT)
+            slot_indices = random.sample(range(len(note_slots_x)), k=k)
+            for idx in slot_indices:
+                x = note_slots_x[idx]
+                y = note_slot_y
+                note_char = random_note()
+                note_tag = (
+                    f"{{\\an5\\pos({x},{y})"
+                    f"\\fs{preview_font*2}"
+                    f"\\fad({NOTE_FADE_IN},{NOTE_FADE_OUT})}}"
+                )
+                events.append(
+                    f"Dialogue: 2,{seconds_to_ass_time(t)},{seconds_to_ass_time(frame_end)},"
+                    f"Default,,0,0,0,,{note_tag}{note_char}"
+                )
+            t += NOTE_SPAWN_PERIOD_SECS
+
     if not unified:
+        # No lyrics at all; just a static title card
         block = "\\N".join([title, f"by {artist}"] if artist else [title])
         events.append(
             f"Dialogue: 0,{seconds_to_ass_time(0)},{seconds_to_ass_time(audio_duration)},"
@@ -356,19 +398,11 @@ def build_ass(
         ass_path.write_text("\n".join(header + events) + "\n", encoding="utf-8")
         return ass_path
 
-    # Title card (no notes in intro for now; keep simple)
-    first_t = unified[0][0]
-    intro_end = min(first_t, 5.0) if first_t > 0.1 else first_t
-    if intro_end > 0.05:
-        block = "\\N".join([title, f"by {artist}"] if artist else [title])
-        events.append(
-            f"Dialogue: 0,{seconds_to_ass_time(0)},{seconds_to_ass_time(intro_end)},"
-            f"Default,,0,0,0,,{{\\an5\\pos({x_center},{y_title})}}{esc(block)}"
-        )
-
     fade_tag = f"\\fad({FADE_IN_MS},{FADE_OUT_MS})" if (FADE_IN_MS or FADE_OUT_MS) else ""
 
     n = len(unified)
+    first_lyric_start = unified[0][0]
+
     next_color       = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
     divider_color    = rgb_to_bgr(DIVIDER_COLOR_RGB)
     next_label_color = rgb_to_bgr(NEXT_LABEL_COLOR_RGB)
@@ -384,6 +418,53 @@ def build_ass(
     label_y = y_div + NEXT_LABEL_TOP_MARGIN_PX
 
     # =====================================================================
+    # INTRO TITLE + POSSIBLE NOTES BEFORE FIRST LYRIC
+    # =====================================================================
+    # Treat intro [0, first_lyric_start) as a special case with title and optional notes.
+    if first_lyric_start > 0.05:
+        title_start = 0.0
+        # Base title end (like an "end_i" for a pseudo-line).
+        # Keep a soft cap at 5s, but allow MIN_LYRIC_VISIBLE_SECS logic to extend/clamp.
+        base_title_end = min(first_lyric_start, 5.0)
+
+        # Where notes are allowed to end in the intro:
+        # They must end NOTE_EARLY_END_SECS before the first lyric.
+        reserved_notes_end = max(0.0, first_lyric_start - NOTE_EARLY_END_SECS)
+        # If there is no room for notes, we just show title until first lyric.
+        intro_instrument_start = None
+        intro_instrument_end = None
+
+        if reserved_notes_end <= title_start:
+            title_display_end = first_lyric_start
+        else:
+            # Minimum title visibility (like a lyric line)
+            desired_min_title_end = max(base_title_end, title_start + MIN_LYRIC_VISIBLE_SECS)
+            # Can't extend beyond where notes would have to end, or beyond the lyric itself
+            desired_min_title_end = min(desired_min_title_end, reserved_notes_end, first_lyric_start)
+
+            remaining_after_desired = reserved_notes_end - desired_min_title_end
+
+            if remaining_after_desired >= NOTE_GAP_THRESHOLD_SECS:
+                # Title ends at desired_min_title_end, notes occupy [desired_min_title_end, reserved_notes_end]
+                title_display_end = desired_min_title_end
+                intro_instrument_start = desired_min_title_end
+                intro_instrument_end = reserved_notes_end
+            else:
+                # Not enough room for a ≥4s note block; keep title until lyric starts.
+                title_display_end = first_lyric_start
+
+        # Title card event
+        block = "\\N".join([title, f"by {artist}"] if artist else [title])
+        events.append(
+            f"Dialogue: 0,{seconds_to_ass_time(title_start)},{seconds_to_ass_time(title_display_end)},"
+            f"Default,,0,0,0,,{{\\an5\\pos({x_center},{y_title})}}{esc(block)}"
+        )
+
+        # Intro notes (pure instrumental; no lyrics overlap)
+        if intro_instrument_start is not None and intro_instrument_end is not None:
+            emit_notes_block(intro_instrument_start, intro_instrument_end)
+
+    # =====================================================================
     # MAIN LOOP: per-lyric line
     # =====================================================================
     for i, (start_i, end_i, text_i, li_i, mus_i) in enumerate(unified):
@@ -392,49 +473,50 @@ def build_ass(
         if i < n - 1:
             next_start, next_end, next_text, _li_n, next_mus = unified[i+1]
             gap_end = next_start
+            # Notes must end NOTE_EARLY_END_SECS before next lyric
+            reserved_notes_end = max(start_i, next_start - NOTE_EARLY_END_SECS)
         else:
             next_start, next_end, next_text, next_mus = audio_duration, audio_duration, "", False
             gap_end = audio_duration
+            # For the final line, we can allow notes up to the audio end
+            reserved_notes_end = gap_end
 
         if gap_end < start_i:
             gap_end = start_i
+        if reserved_notes_end < start_i:
+            reserved_notes_end = start_i
 
         # Decide how long the lyric should remain on-screen
-        # Rule:
-        #   - Try to keep line visible at least MIN_LYRIC_VISIBLE_SECS
-        #   - But not beyond gap_end (so next line can show)
-        #   - If we can then still fit ≥ NOTE_GAP_THRESHOLD_SECS after that,
-        #     we carve out an instrumental notes block there.
         display_end = end_i
         instrument_start = None
         instrument_end = None
 
         if not mus_i:
-            # Minimum desired end for the lyric (subject to timeline constraints)
+            # Minimum desired display end for this lyric
             desired_min_end = max(end_i, start_i + MIN_LYRIC_VISIBLE_SECS)
-            desired_min_end = min(desired_min_end, audio_duration)
+            # Can't exceed gap_end or reserved_notes_end (notes must have room)
+            desired_min_end = min(desired_min_end, reserved_notes_end, gap_end)
 
-            # Clamp to gap_end for "until next line"
-            desired_min_end = min(desired_min_end, gap_end)
+            # How much room remains after giving the lyric its minimum visibility,
+            # within the notes-eligible region?
+            remaining_for_notes = reserved_notes_end - desired_min_end
 
-            # Check if we can fit notes AFTER this point for at least NOTE_GAP_THRESHOLD_SECS
-            remaining_after_desired = gap_end - desired_min_end
-
-            # If we can fit both: ≥4s of lyric + ≥4s of notes
             if (
-                remaining_after_desired >= NOTE_GAP_THRESHOLD_SECS
+                i < n - 1
+                and remaining_for_notes >= NOTE_GAP_THRESHOLD_SECS
                 and not mus_i
                 and not next_mus
             ):
-                # Line stays until desired_min_end, notes fill the rest until next line
+                # Use [desired_min_end, reserved_notes_end] for notes,
+                # keep lyric visible until desired_min_end.
                 display_end = desired_min_end
                 instrument_start = desired_min_end
-                instrument_end = gap_end
+                instrument_end = reserved_notes_end
             else:
-                # No notes: keep lyric all the way to next line (or audio end)
+                # Not enough room for a ≥4s notes block (or final line): keep lyric to gap_end.
                 display_end = gap_end
         else:
-            # Music-only line: treat as-is; no overlay notes or previews around it
+            # Music-only line: just use its natural [start_i, end_i] and do not spawn lyric-driven notes.
             display_end = end_i
 
         # Safety clamp
@@ -450,28 +532,9 @@ def build_ass(
 
         # ----- MUSIC NOTES BLOCK (if any) -----
         if instrument_start is not None and instrument_end is not None:
-            # Build a sequence of "frames" every NOTE_SPAWN_PERIOD_SECS
-            t = instrument_start
-            while t < instrument_end - 0.05:
-                t_end = min(t + NOTE_DURATION, instrument_end)
-                if t_end <= t:
-                    break
-
-                count = random.randint(NOTE_MIN_COUNT, NOTE_MAX_COUNT)
-                for _ in range(count):
-                    x, y = random_pos_fullscreen()
-                    note_char = random_note()
-                    note_tag = (
-                        f"{{\\an5\\pos({x},{y})"
-                        f"\\fs{preview_font*2}"
-                        f"\\fad({NOTE_FADE_IN},{NOTE_FADE_OUT})}}"
-                    )
-                    events.append(
-                        f"Dialogue: 2,{seconds_to_ass_time(t)},{seconds_to_ass_time(t_end)},"
-                        f"Default,,0,0,0,,{note_tag}{note_char}"
-                    )
-
-                t += NOTE_SPAWN_PERIOD_SECS
+            # By construction, [instrument_start, instrument_end] does not overlap lyrics
+            # and ends NOTE_EARLY_END_SECS before the next lyric.
+            emit_notes_block(instrument_start, instrument_end)
 
         # Nothing to preview if there's no "next" lyric line
         if i >= n - 1:
@@ -482,9 +545,9 @@ def build_ass(
             continue
 
         # ----- DIVIDER + NEXT PREVIEW (no overlap with notes) -----
-        # Preview lives from the line's start until the earlier of:
+        # Preview lives from the lyric's start until the earlier of:
         #   - instrument_start (if notes exist), OR
-        #   - next_start
+        #   - gap_end (next lyric start)
         preview_start = start_i
         preview_end = instrument_start if instrument_start is not None else gap_end
 
@@ -595,7 +658,7 @@ def main(argv=None):
 
     out_mp4 = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(LYRICS_OFFSET_SECS)}.mp4"
 
-    # (You can keep any existing pre-existing MP4 menu / prompts here if you had them.)
+    # (You can keep any existing “already exists” prompts here if you had them.)
 
     # ================================================================
     # Full render
