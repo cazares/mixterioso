@@ -151,3 +151,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# end of 1_config.py
