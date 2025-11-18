@@ -24,6 +24,7 @@
 #       * each 2s “frame” picks a subset of slots (1–4) and draws one note per slot
 #       * notes are randomly chosen from ♩ ♪ ♫ ♬
 #   - Hides "Next:" preview during music-note sections
+#   - Annotates contiguous repeated lines as "[k / N]" (e.g. Memoria [2 / 3])
 #   - Supports global offset (--offset or KARAOKE_OFFSET_SECS)
 #   - Supports --force to re-render MP4 even if it exists
 
@@ -398,9 +399,29 @@ def build_ass(
         ass_path.write_text("\n".join(header + events) + "\n", encoding="utf-8")
         return ass_path
 
+    # Build display_texts with [k / N] suffixes for contiguous repeated lines
+    n = len(unified)
+    display_texts = [t for (_s, _e, t, _li, _mus) in unified]
+
+    i = 0
+    while i < n:
+        start_i, end_i, text_i, li_i, mus_i = unified[i]
+        norm_i = text_i.strip().lower()
+        j = i + 1
+        while j < n:
+            _sj, _ej, text_j, _lij, _musj = unified[j]
+            if text_j.strip().lower() != norm_i:
+                break
+            j += 1
+        run_len = j - i
+        if run_len > 1:
+            for k in range(run_len):
+                base_text = unified[i + k][2]
+                display_texts[i + k] = f"{base_text} [{k + 1} / {run_len}]"
+        i = j
+
     fade_tag = f"\\fad({FADE_IN_MS},{FADE_OUT_MS})" if (FADE_IN_MS or FADE_OUT_MS) else ""
 
-    n = len(unified)
     first_lyric_start = unified[0][0]
 
     next_color       = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
@@ -523,11 +544,13 @@ def build_ass(
         if display_end < start_i:
             display_end = start_i
 
+        display_text_i = display_texts[i]
+
         # ----- MAIN LYRIC -----
         y_line = (VIDEO_HEIGHT // 2) if mus_i else y_main_top
         events.append(
             f"Dialogue: 1,{seconds_to_ass_time(start_i)},{seconds_to_ass_time(display_end)},Default,,0,0,0,,"
-            f"{{\\an5\\pos({playresx//2},{y_line}){fade_tag}}}{esc(text_i)}"
+            f"{{\\an5\\pos({playresx//2},{y_line}){fade_tag}}}{esc(display_text_i)}"
         )
 
         # ----- MUSIC NOTES BLOCK (if any) -----
@@ -578,11 +601,12 @@ def build_ass(
             f"\\1c&H{next_label_color}&\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&}}Next:"
         )
 
-        # Next-line preview (bottom band)
+        # Next-line preview (bottom band) with annotated text
+        next_display_text = display_texts[i+1]
         events.append(
             f"Dialogue: 2,{seconds_to_ass_time(preview_start)},{seconds_to_ass_time(preview_end)},Default,,0,0,0,,"
             f"{{\\an5\\pos({playresx//2},{y_next})\\fs{preview_font}"
-            f"\\1c&H{next_color}&\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&{fade_tag}}}{esc(next_text)}"
+            f"\\1c&H{next_color}&\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&{fade_tag}}}{esc(next_display_text)}"
         )
 
     # Write ASS
