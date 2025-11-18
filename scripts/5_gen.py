@@ -61,8 +61,8 @@ NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.45
 NEXT_LABEL_TOP_MARGIN_PX  = 10
 NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX + NEXT_LABEL_TOP_MARGIN_PX
 
-FADE_IN_MS  = 75
-FADE_OUT_MS = 75
+FADE_IN_MS  = 20
+FADE_OUT_MS = 40
 
 GLOBAL_NEXT_COLOR_RGB  = "FFFFFF"
 GLOBAL_NEXT_ALPHA_HEX  = "4D"
@@ -99,6 +99,8 @@ NOTE_FADE_IN   = 150
 NOTE_FADE_OUT  = 200
 MIN_LYRIC_VISIBLE_SECS = 4.0
 NOTE_EARLY_END_SECS = 1.0
+
+MIN_TITLE_SECS = 2.0
 
 # -------------------------------------------------------------------------
 def log(prefix, msg, color=RESET):
@@ -352,10 +354,21 @@ def build_ass(
             )
             t += NOTE_SPAWN_PERIOD_SECS
 
-    # INTRO TITLE
-    first_lyric_start = unified[0][0]
-    if first_lyric_start > 0.05:
-        title_start = 0.0
+        # INTRO TITLE
+        # Force all lyrics to start AFTER the title duration
+        block = "\\N".join([title, f"by {artist}"] if artist else [title])
+        events.append(
+            f"Dialogue: 0,{seconds_to_ass_time(title_start)},{seconds_to_ass_time(title_end)},"
+            f"Default,,0,0,0,,{{\\an5\\pos({x_center},{y_center_full})}}{esc(block)}"
+        )
+
+        for idx, (s, e, t, li, mus) in enumerate(unified):
+            if s < title_end:
+                shift = title_end - s
+                s = title_end
+                e = max(e + shift, s + 0.01)
+                unified[idx] = (s, e, t, li, mus)
+
         base_title_end = min(first_lyric_start, 5.0)
         reserved_notes_end = max(0.0, first_lyric_start - NOTE_EARLY_END_SECS)
 
