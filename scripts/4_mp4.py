@@ -9,12 +9,16 @@
 #   - Uses 1920x1080 video
 #   - Renders main lyrics in the top band
 #   - Renders "Next:" preview in the bottom band
-#   - Inserts randomized music-note overlays in gaps >= NOTE_GAP_THRESHOLD_SECS
+#   - Extends each lyric line on screen until:
+#       * the next lyric line, or
+#       * a music-note block starts (instrumental region)
+#   - Inserts randomized music-note overlays in gaps where:
+#       * the pre-gap lyric line has been visible ≥ 4s, AND
+#       * the notes themselves can stay ≥ 4s
 #   - Never overlays notes on top of active lyrics
-#   - Hides "Next:" preview during note sections
+#   - Hides "Next:" preview during music-note sections
 #   - Supports global offset (--offset or KARAOKE_OFFSET_SECS)
 #   - Supports --force to re-render MP4 even if it exists
-#   - Can call 5_upload.py to upload to YouTube
 
 from __future__ import annotations
 
@@ -72,13 +76,13 @@ DIVIDER_RIGHT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX
 VERTICAL_OFFSET_FRACTION = 0.0
 TITLE_EXTRA_OFFSET_FRACTION = -0.20
 
-NEXT_LINE_FONT_SCALE  = 0.35
+NEXT_LINE_FONT_SCALE  = 0.55
 NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.45
 NEXT_LABEL_TOP_MARGIN_PX  = 10
 NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX + NEXT_LABEL_TOP_MARGIN_PX
 
-FADE_IN_MS  = 50
-FADE_OUT_MS = 50
+FADE_IN_MS  = 75
+FADE_OUT_MS = 75
 
 # =============================================================================
 # COLOR / OPACITY
@@ -112,14 +116,17 @@ LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "-0.5") or "-0.5")
 # MUSIC NOTES
 # =============================================================================
 MUSIC_NOTE_CHARS = "♪♫♩♬"   # white only
-NOTE_GAP_THRESHOLD_SECS = 4.0
+NOTE_GAP_THRESHOLD_SECS = 4.0  # minimum duration allocated for notes themselves
 NOTE_SAFE_INSET = 0.35
 NOTE_MIN_COUNT = 1
-NOTE_MAX_COUNT = 7
-NOTE_DURATION  = 2.0
+NOTE_MAX_COUNT = 4   # 1–4 notes at a time
+NOTE_DURATION  = 2.0 # each note cluster lasts ~2s (update rate)
+NOTE_SPAWN_PERIOD_SECS = 2.0   # re-randomize pattern every 2 seconds
 NOTE_FADE_IN   = 150
 NOTE_FADE_OUT  = 200
 
+# Minimum time a lyric line should stay on-screen (when timeline allows)
+MIN_LYRIC_VISIBLE_SECS = 4.0
 
 def log(prefix: str, msg: str, color: str = RESET) -> None:
     ts = time.strftime("%H:%M:%S")
@@ -231,7 +238,7 @@ def offset_tag(val: float) -> str:
 
 
 # =============================================================================
-# ASS GENERATION (D-level integrated)
+# ASS GENERATION
 # =============================================================================
 def build_ass(
     slug: str,
@@ -317,7 +324,7 @@ def build_ass(
 
     events = []
 
-    # Normalize timings with minimal safety clamps (Option C)
+    # Normalize timings with minimal safety clamps
     unified = []
     for start_raw, end_raw, raw_text, li in timings:
         t = (raw_text or "").strip()
@@ -327,7 +334,7 @@ def build_ass(
         start = start_raw + offset_applied
         end   = end_raw   + offset_applied
 
-        # Option C clamp rules
+        # Clamp rules
         if start < 0:
             start = 0.0
         if end <= start:
@@ -349,7 +356,7 @@ def build_ass(
         ass_path.write_text("\n".join(header + events) + "\n", encoding="utf-8")
         return ass_path
 
-    # Title card
+    # Title card (no notes in intro for now; keep simple)
     first_t = unified[0][0]
     intro_end = min(first_t, 5.0) if first_t > 0.1 else first_t
     if intro_end > 0.05:
@@ -377,83 +384,140 @@ def build_ass(
     label_y = y_div + NEXT_LABEL_TOP_MARGIN_PX
 
     # =====================================================================
-    # MAIN LOOP
+    # MAIN LOOP: per-lyric line
     # =====================================================================
     for i, (start_i, end_i, text_i, li_i, mus_i) in enumerate(unified):
 
-        start = start_i
-        end   = end_i
+        # Determine where the "gap" ends: either next line's start or audio end
+        if i < n - 1:
+            next_start, next_end, next_text, _li_n, next_mus = unified[i+1]
+            gap_end = next_start
+        else:
+            next_start, next_end, next_text, next_mus = audio_duration, audio_duration, "", False
+            gap_end = audio_duration
+
+        if gap_end < start_i:
+            gap_end = start_i
+
+        # Decide how long the lyric should remain on-screen
+        # Rule:
+        #   - Try to keep line visible at least MIN_LYRIC_VISIBLE_SECS
+        #   - But not beyond gap_end (so next line can show)
+        #   - If we can then still fit ≥ NOTE_GAP_THRESHOLD_SECS after that,
+        #     we carve out an instrumental notes block there.
+        display_end = end_i
+        instrument_start = None
+        instrument_end = None
+
+        if not mus_i:
+            # Minimum desired end for the lyric (subject to timeline constraints)
+            desired_min_end = max(end_i, start_i + MIN_LYRIC_VISIBLE_SECS)
+            desired_min_end = min(desired_min_end, audio_duration)
+
+            # Clamp to gap_end for "until next line"
+            desired_min_end = min(desired_min_end, gap_end)
+
+            # Check if we can fit notes AFTER this point for at least NOTE_GAP_THRESHOLD_SECS
+            remaining_after_desired = gap_end - desired_min_end
+
+            # If we can fit both: ≥4s of lyric + ≥4s of notes
+            if (
+                remaining_after_desired >= NOTE_GAP_THRESHOLD_SECS
+                and not mus_i
+                and not next_mus
+            ):
+                # Line stays until desired_min_end, notes fill the rest until next line
+                display_end = desired_min_end
+                instrument_start = desired_min_end
+                instrument_end = gap_end
+            else:
+                # No notes: keep lyric all the way to next line (or audio end)
+                display_end = gap_end
+        else:
+            # Music-only line: treat as-is; no overlay notes or previews around it
+            display_end = end_i
+
+        # Safety clamp
+        if display_end < start_i:
+            display_end = start_i
 
         # ----- MAIN LYRIC -----
         y_line = (VIDEO_HEIGHT // 2) if mus_i else y_main_top
         events.append(
-            f"Dialogue: 1,{seconds_to_ass_time(start)},{seconds_to_ass_time(end)},Default,,0,0,0,,"
+            f"Dialogue: 1,{seconds_to_ass_time(start_i)},{seconds_to_ass_time(display_end)},Default,,0,0,0,,"
             f"{{\\an5\\pos({playresx//2},{y_line}){fade_tag}}}{esc(text_i)}"
         )
 
+        # ----- MUSIC NOTES BLOCK (if any) -----
+        if instrument_start is not None and instrument_end is not None:
+            # Build a sequence of "frames" every NOTE_SPAWN_PERIOD_SECS
+            t = instrument_start
+            while t < instrument_end - 0.05:
+                t_end = min(t + NOTE_DURATION, instrument_end)
+                if t_end <= t:
+                    break
+
+                count = random.randint(NOTE_MIN_COUNT, NOTE_MAX_COUNT)
+                for _ in range(count):
+                    x, y = random_pos_fullscreen()
+                    note_char = random_note()
+                    note_tag = (
+                        f"{{\\an5\\pos({x},{y})"
+                        f"\\fs{preview_font*2}"
+                        f"\\fad({NOTE_FADE_IN},{NOTE_FADE_OUT})}}"
+                    )
+                    events.append(
+                        f"Dialogue: 2,{seconds_to_ass_time(t)},{seconds_to_ass_time(t_end)},"
+                        f"Default,,0,0,0,,{note_tag}{note_char}"
+                    )
+
+                t += NOTE_SPAWN_PERIOD_SECS
+
+        # Nothing to preview if there's no "next" lyric line
         if i >= n - 1:
             continue
 
-        next_start, next_end, next_text, _li_n, next_mus = unified[i+1]
-        gap = next_start - end
-        has_notes = False
-
-        # ----- MUSIC NOTES -----
-        if (
-            gap >= NOTE_GAP_THRESHOLD_SECS
-            and not mus_i
-            and not next_mus
-        ):
-            ns = end + 0.5
-            ne = next_start - 0.5
-            if ne > ns + 0.25:
-                has_notes = True
-                count = random.randint(NOTE_MIN_COUNT, NOTE_MAX_COUNT)
-                for _ in range(count):
-                    span = ne - ns
-                    if span < 0.25:
-                        break
-                    spawn = ns + random.random() * span
-                    deatht = min(spawn + NOTE_DURATION, next_start)
-                    if deatht <= spawn:
-                        continue
-                    x, y = random_pos_fullscreen()
-                    note = random_note()
-                    tag  = f"{{\\an5\\pos({x},{y})\\fs{preview_font*2}\\fad({NOTE_FADE_IN},{NOTE_FADE_OUT})}}"
-                    events.append(
-                        f"Dialogue: 2,{seconds_to_ass_time(spawn)},{seconds_to_ass_time(deatht)},"
-                        f"Default,,0,0,0,,{tag}{note}"
-                    )
-
-        if has_notes:
-            continue
+        # Skip previews around music-only lines; treat them as special effects
         if mus_i or next_mus:
             continue
 
-        # ----- DIVIDER -----
+        # ----- DIVIDER + NEXT PREVIEW (no overlap with notes) -----
+        # Preview lives from the line's start until the earlier of:
+        #   - instrument_start (if notes exist), OR
+        #   - next_start
+        preview_start = start_i
+        preview_end = instrument_start if instrument_start is not None else gap_end
+
+        if preview_end <= preview_start + 0.05:
+            continue
+
+        # Divider bar across entire width
         div_tag = (
             f"{{\\an7\\pos(0,{line_y})"
             f"\\1c&H{divider_color}&"
             f"\\1a&H{DIVIDER_ALPHA_HEX}&"
             f"\\bord0\\shad0\\p1}}"
         )
-        shape = f"m {x_left} 0 l {x_right} 0 l {x_right} {divider_height} l {x_left} {divider_height}{{\\p0}}"
+        shape = (
+            f"m {x_left} 0 l {x_right} 0 "
+            f"l {x_right} {divider_height} l {x_left} {divider_height}{{\\p0}}"
+        )
 
         events.append(
-            f"Dialogue: 0,{seconds_to_ass_time(start)},{seconds_to_ass_time(next_start)},"
+            f"Dialogue: 0,{seconds_to_ass_time(preview_start)},{seconds_to_ass_time(preview_end)},"
             f"Default,,0,0,0,,{div_tag}{shape}"
         )
 
-        # ----- "NEXT:" LABEL -----
+        # "Next:" label
         events.append(
-            f"Dialogue: 0,{seconds_to_ass_time(start)},{seconds_to_ass_time(next_start)},Default,,0,0,0,,"
+            f"Dialogue: 0,{seconds_to_ass_time(preview_start)},{seconds_to_ass_time(preview_end)},Default,,0,0,0,,"
             f"{{\\an7\\pos({label_x},{label_y})\\fs{next_label_font}"
             f"\\1c&H{next_label_color}&\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&}}Next:"
         )
 
-        # ----- NEXT-LINE PREVIEW -----
+        # Next-line preview (bottom band)
         events.append(
-            f"Dialogue: 2,{seconds_to_ass_time(start)},{seconds_to_ass_time(next_start)},Default,,0,0,0,,"
+            f"Dialogue: 2,{seconds_to_ass_time(preview_start)},{seconds_to_ass_time(preview_end)},Default,,0,0,0,,"
             f"{{\\an5\\pos({playresx//2},{y_next})\\fs{preview_font}"
             f"\\1c&H{next_color}&\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&{fade_tag}}}{esc(next_text)}"
         )
@@ -531,7 +595,7 @@ def main(argv=None):
 
     out_mp4 = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(LYRICS_OFFSET_SECS)}.mp4"
 
-    # (Existing pre-existing MP4 menu / prompts live here in your version.)
+    # (You can keep any existing pre-existing MP4 menu / prompts here if you had them.)
 
     # ================================================================
     # Full render
