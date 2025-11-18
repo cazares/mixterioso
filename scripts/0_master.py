@@ -1,505 +1,256 @@
 #!/usr/bin/env python3
 # scripts/0_master.py
+#
+# FULL PIPELINE ORCHESTRATOR
+# Compatible with Option A (2_download.py expects --task)
+# Steps:
+# 1_config.py
+# 2_download.py  (lyrics, mp3, meta)
+# 3_mix.py
+# 4_merge.py
+# 5_gen.py
+# 6_upload.py
+#
 
-import argparse
-import json
 import subprocess
 import sys
+import json
+import shlex
 import time
 from pathlib import Path
 
-# ============================================================================
-# COLORS
-# ============================================================================
-RESET   = "\033[0m"
-BOLD    = "\033[1m"
-WHITE   = "\033[97m"
-CYAN    = "\033[36m"
-GREEN   = "\033[32m"
-YELLOW  = "\033[33m"
-RED     = "\033[31m"
-BLUE    = "\033[34m"
-MAGENTA = "\033[35m"
+RESET="\033[0m"
+CYAN="\033[36m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+BLUE="\033[34m"
 
-def log(section: str, msg: str, color: str = CYAN) -> None:
-    print(f"{color}[{section}]{RESET} {msg}")
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-# ============================================================================
-# PATHS
-# ============================================================================
-BASE_DIR    = Path(__file__).resolve().parent.parent
-SCRIPTS_DIR = BASE_DIR / "scripts"
-TXT_DIR     = BASE_DIR / "txts"
-MP3_DIR     = BASE_DIR / "mp3s"
-TIMINGS_DIR = BASE_DIR / "timings"
-OFFSETS_DIR = BASE_DIR / "offsets"
-MIXES_DIR   = BASE_DIR / "mixes"
-META_DIR    = BASE_DIR / "meta"
-OUTPUT_DIR  = BASE_DIR / "output"
-UPLOAD_LOG  = BASE_DIR / "uploaded"
 
-# ============================================================================
-# Helpers
-# ============================================================================
-def slugify(text: str) -> str:
-    import re
-    base = text.strip().lower()
-    base = re.sub(r"\s+", "_", base)
-    base = re.sub(r"[^\w\-]+", "", base)
-    return base or "song"
+# ----------------------------------------------------------------------
+# HIGH-LEVEL LOG WRAPPER
+# ----------------------------------------------------------------------
+def log(section, msg, color=CYAN):
+    ts = time.strftime("%H:%M:%S")
+    print(f"{color}[{ts}] [{section}]{RESET} {msg}")
 
-def fmt_secs(sec: float) -> str:
-    m = int(sec // 60)
-    s = int(sec - m * 60)
-    return f"{m:02d}:{s:02d}"
 
-def format_offset_tag(offset: float) -> str:
-    sign = "p" if offset >= 0 else "m"
-    v = abs(offset)
-    sec_int = int(v)
-    ms_int  = int(round((v - sec_int) * 1000))
-    return f"{sign}{sec_int}p{ms_int:03d}s"
+# ----------------------------------------------------------------------
+# SAFE SUBPROCESS CALL
+# Reads JSON result if available.
+# Streams child output live.
+# ----------------------------------------------------------------------
+def run_step(cmd, section, timeout=9999):
+    log(section, f"START  → {' '.join(cmd)}")
 
-def detect_latest_slug() -> str | None:
-    if not META_DIR.exists():
-        return None
-    files = sorted(
-        META_DIR.glob("*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
     )
-    return files[0].stem if files else None
 
-def get_meta_title_for_slug(slug: str) -> str:
-    meta_path = META_DIR / f"{slug}.json"
-    if not meta_path.exists():
-        return slug.replace("_", " ")
+    captured_lines = []
+    start = time.time()
 
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        artist = (meta.get("artist") or "").strip()
-        title  = (meta.get("title")  or slug.replace("_", " ")).strip()
-        if artist and title:
-            return f"{title} by {artist}"
-        return title
-    except Exception:
-        return slug.replace("_", " ")
+    for line in proc.stdout:
+        captured_lines.append(line)
+        print(f"{CYAN}[{section}]{RESET} {line.rstrip()}")
 
-# ============================================================================
-# Step Status — FULLY OFFSET-AWARE
-# ============================================================================
-def detect_step_status(slug: str, profile: str) -> dict[str, str]:
-    """
-    ZERO-RISK ENHANCEMENT:
-    Now checks *all* MP4s, not just “any exists”.
-    This prevents a WRONG “DONE” status when an offset changed.
-    """
-    status = {"slug": slug, "profile": profile}
+        if time.time() - start > timeout:
+            proc.kill()
+            log(section, f"TIMEOUT after {timeout}s", RED)
+            return None, 124
 
-    mp3 = MP3_DIR / f"{slug}.mp3"
-    txt = TXT_DIR / f"{slug}.txt"
-    meta = META_DIR / f"{slug}.json"
-    status["1"] = "DONE" if (mp3.exists() and txt.exists() and meta.exists()) else "MISSING"
+    proc.wait()
+    rc = proc.returncode
 
-    mix = MIXES_DIR / f"{slug}_{profile}.wav"
-    status["2"] = "DONE" if mix.exists() else "MISSING"
+    if rc != 0:
+        log(section, f"FAILED (code {rc})", RED)
+        return None, rc
 
-    csv = TIMINGS_DIR / f"{slug}.csv"
-    status["3"] = "DONE" if csv.exists() else "MISSING"
+    # Try to extract final JSON from the bottom of output
+    json_obj = None
+    for line in reversed(captured_lines):
+        try:
+            json_obj = json.loads(line)
+            break
+        except:
+            continue
 
-    # More accurate: mp4 must match slug/profile/ANY offset
-    outputs = list(OUTPUT_DIR.glob(f"{slug}_{profile}_offset_*.mp4"))
-    status["4"] = "DONE" if outputs else "MISSING"
+    return json_obj, rc
 
-    # Upload-json check
-    if UPLOAD_LOG.exists() and any(UPLOAD_LOG.glob(f"{slug}_{profile}_offset_*.json")):
-        status["5"] = "DONE"
-    else:
-        status["5"] = "MISSING"
 
-    return status
-
-# ============================================================================
-# Utilities
-# ============================================================================
-def prompt_yes_no(msg: str, default_yes=True) -> bool:
-    default = "Y/n" if default_yes else "y/N"
-    while True:
-        ans = input(f"{msg} [{default}]: ").lower().strip()
-        if ans == "" and default_yes:
-            return True
-        if ans == "" and not default_yes:
-            return False
-        if ans in ("y","yes"): return True
-        if ans in ("n","no"):  return False
-        print(f"{RED}Please answer Y or N.{RESET}")
-
-def run(cmd: list[str], section: str) -> float:
-    log(section, " ".join(cmd), BLUE)
-    t0 = time.perf_counter()
-    subprocess.run(cmd, check=True)
-    return time.perf_counter() - t0
-
-def run_capture(cmd: list[str], section: str) -> tuple[float, str]:
-    log(section, " ".join(cmd), BLUE)
-    t0 = time.perf_counter()
-    cp = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    return (time.perf_counter() - t0, cp.stdout)
-
-def read_offset(slug: str) -> float:
-    p = OFFSETS_DIR / f"{slug}.txt"
-    if not p.exists():
-        return 0.0
-    try: return float(p.read_text().strip())
-    except Exception: return 0.0
-
-def write_offset(slug: str, offset: float) -> None:
-    OFFSETS_DIR.mkdir(parents=True, exist_ok=True)
-    (OFFSETS_DIR / f"{slug}.txt").write_text(f"{offset:.3f}")
-
-# ============================================================================
-# Step 1 — unchanged
-# ============================================================================
-def run_step1(slug: str, query: str | None, no_ui: bool) -> float:
-    cmd = [sys.executable, str(SCRIPTS_DIR / "1_txt_mp3.py")]
-    cmd += ["--slug", slug]
-    if no_ui:
-        cmd.append("--no-ui")
-    if query:
-        for w in query.split():
-            cmd.append(w)
-    return run(cmd, "STEP1")
-
-# ============================================================================
-# Step 2 — unchanged
-# ============================================================================
-def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
-    mp3 = MP3_DIR / f"{slug}.mp3"
-    mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
-
-    if interactive:
-        use_orig = prompt_yes_no("Use original mp3 (skip Demucs)?", default_yes=False)
-    else:
-        use_orig = False
-
-    if use_orig:
-        MIXES_DIR.mkdir(parents=True, exist_ok=True)
-        cmd = ["ffmpeg", "-y", "-i", str(mp3), str(mix_wav)]
-        return run(cmd, "STEP2-BYPASS")
-
-    if profile == "karaoke":
-        effective_model = "htdemucs_6s"
-        two_stems = False
-    else:
-        effective_model = model
-        two_stems = True
-
-    stems_root = BASE_DIR / "separated" / effective_model
-    stems_dir = stems_root / slug
-    stems_exist = stems_dir.exists() and any(stems_dir.glob("*.wav"))
-
-    if stems_exist:
-        reuse = prompt_yes_no("Stems exist. Reuse?", True) if interactive else True
-        if not reuse:
-            for p in stems_dir.glob("*.wav"):
-                try: p.unlink()
-                except Exception: pass
-            stems_exist = False
-
-    if not stems_exist:
-        cmd = [sys.executable, "-m", "demucs", "-n", effective_model, str(mp3)]
-        if two_stems:
-            cmd.insert(-1, "--two-stems")
-            cmd.insert(-1, "vocals")
-        run(cmd, "STEP2-DEMUX")
-
-    cmd = [
-        sys.executable, str(SCRIPTS_DIR / "2_stems.py"),
-        "--mp3", str(mp3),
-        "--profile", profile,
-        "--model", effective_model,
-        "--mix-ui-only",
-    ]
-    if not interactive:
-        cmd.append("--non-interactive")
-    run(cmd, "STEP2-MIXUI")
-
-    MIXES_DIR.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        sys.executable, str(SCRIPTS_DIR / "2_stems.py"),
-        "--mp3", str(mp3),
-        "--profile", profile,
-        "--model", effective_model,
-        "--render-only",
-        "--output", str(mix_wav),
-    ]
-    return run(cmd, "STEP2-RENDER")
-
-# ============================================================================
-# Step 3 — unchanged
-# ============================================================================
-def run_step3(slug: str, timing_model_size: str | None = None) -> float:
-    cmd = [sys.executable, str(SCRIPTS_DIR / "3_auto_timing.py"), "--slug", slug]
-    if timing_model_size:
-        cmd += ["--model-size", timing_model_size]
-    return run(cmd, "STEP3")
-
-# ============================================================================
-# Step 4 — **offset FIXED & VERIFIED**
-# ============================================================================
-def run_step4(slug: str, profile: str, offset: float, force: bool = False, called_from_master: bool = True) -> float:
-    cmd = [
-        sys.executable, str(SCRIPTS_DIR / "4_mp4.py"),
-        "--slug", slug,
-        "--profile", profile,
-        "--offset", str(offset),   # <— REQUIRED AND NOW ALWAYS PASSED
-    ]
-    if force:
-        cmd.append("--force")
-    return run(cmd, "STEP4")
-
-# ============================================================================
-# Step 5 — **offset FIXED & VERIFIED**
-# ============================================================================
-def run_step5(slug: str, profile: str, offset: float) -> float:
-    """
-    Upload the EXACT file generated by step 4.
-    Guarantee: filename matches offset tag.
-    """
-    fname = f"{slug}_{profile}_offset_{format_offset_tag(offset)}.mp4"
-    path = OUTPUT_DIR / fname
-    cmd = [
-        sys.executable, str(SCRIPTS_DIR / "5_upload.py"),
-        "--file", str(path),
-    ]
-    return run(cmd, "STEP5")
-
-# ============================================================================
-# Step selection UI — unchanged
-# ============================================================================
-def show_pipeline_status(status: dict[str, str]) -> None:
-    print()
-    print(f"{BOLD}{CYAN}Pipeline status for slug={WHITE}{status['slug']}{CYAN}, "
-          f"profile={WHITE}{status['profile']}{RESET}")
-    print(f"{WHITE}[1]{RESET} txt+mp3           -> {GREEN if status['1']=='DONE' else RED}{status['1']}{RESET}")
-    print(f"{WHITE}[2]{RESET} stems/mix         -> {GREEN if status['2']=='DONE' else RED}{status['2']}{RESET}")
-    print(f"{WHITE}[3]{RESET} timings           -> {GREEN if status['3']=='DONE' else RED}{status['3']}{RESET}")
-    print(f"{WHITE}[4]{RESET} mp4               -> {GREEN if status['4']=='DONE' else RED}{status['4']}{RESET}")
-    print(f"{WHITE}[5]{RESET} upload            -> {GREEN if status['5']=='DONE' else RED}{status['5']}{RESET}")
-    print()
-
-def choose_steps_interactive(status: dict[str, str]) -> list[int]:
-    if status["1"] == "DONE" and status["2"] == "DONE" and status["3"] == "DONE":
-        default = "45"
-    elif status["1"] != "DONE":
-        default = "1234"
-    else:
-        default = "234"
-
-    raw = input(
-        f"{WHITE}Steps to run "
-        f"(1=txt/mp3,2=stems,3=timing,4=mp4,5=upload,0=none){RESET} "
-        f"[{MAGENTA}ENTER for {default}{RESET}]: "
-    ).strip()
-
-    if not raw:
-        raw = default
-    if raw == "0":
-        return []
-
-    chosen: list[int] = []
-    for ch in raw:
-        if ch.isdigit():
-            i = int(ch)
-            if 1 <= i <= 5 and i not in chosen:
-                chosen.append(i)
-    return chosen
-
-# ============================================================================
-# Slug / Query Menu — unchanged
-# ============================================================================
-def choose_slug_and_query(no_ui: bool):
-    latest = detect_latest_slug()
-
-    if no_ui:
-        if latest:
-            log("SLUG", f'Using latest slug "{latest}" (no-ui mode)', CYAN)
-            return latest, None
-        return "", None
-
-    print()
-    print(f"{BOLD}{CYAN}=== Slug / Query Menu ==={RESET}")
-
-    if latest:
-        pretty = get_meta_title_for_slug(latest)
-        print(f"{WHITE}1.{RESET} Reuse slug for {GREEN}{pretty}{RESET}")
-    else:
-        print(f"{WHITE}1.{RESET} {YELLOW}(no previous slug available){RESET}")
-
-    print(f"{WHITE}2.{RESET} Search for a new song")
-    print(f"{WHITE}3.{RESET} Pipeline menu")
-    print(f"{WHITE}4.{RESET} Exit")
-
-    choice = input(f"{MAGENTA}Choose an option [1-4]: {RESET}").strip()
-
-    if choice == "1":
-        if not latest:
-            print(f"{RED}No previous slug found.{RESET}")
-            return choose_slug_and_query(False)
-        pretty = get_meta_title_for_slug(latest)
-        log("SLUG", f'Reusing slug "{latest}" ({pretty})', GREEN)
-        return latest, None
-
-    if choice == "2":
-        query = input(
-            f"{WHITE}Enter new search query (e.g. 'nirvana come as you are'): {RESET}"
-        ).strip()
-        if not query:
-            print(f"{RED}Query cannot be empty.{RESET}")
-            return choose_slug_and_query(False)
-        slug = slugify(query)
-        log("SLUG", f'Using slug "{slug}" for new query', GREEN)
-        return slug, query
-
-    if choice == "3":
-        if latest:
-            log("SLUG", f'Using current slug "{latest}"', GREEN)
-            return latest, None
-        print(f"{YELLOW}No previous slug; search required.{RESET}")
-        return choose_slug_and_query(False)
-
-    if choice == "4":
-        print(f"{CYAN}Exiting…{RESET}")
-        sys.exit(0)
-
-    print(f"{RED}Invalid choice. Please enter 1–4.{RESET}")
-    return choose_slug_and_query(False)
-
-# ============================================================================
-# ARGS — unchanged
-# ============================================================================
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--slug")
-    p.add_argument("--query")
-    p.add_argument("--offset", type=float)
-    p.add_argument("--model", default="htdemucs")
-    p.add_argument("--profile", default="karaoke")
-    p.add_argument("--steps")
-    p.add_argument("--no-ui", action="store_true")
-    p.add_argument("--force-mp4", action="store_true")
-    p.add_argument("--no-upload", action="store_true")
-    p.add_argument(
-        "--timing-model-size",
-        type=str,
-        default=None,
-        help="Model size for step 3 auto-timing (tiny/base/small/medium).",
-    )
-    return p.parse_args()
-
-# ============================================================================
-# MAIN — unchanged behavior, now with perfect offset propagation
-# ============================================================================
+# ----------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------
 def main():
-    args = parse_args()
-    no_ui = args.no_ui
+    import argparse
 
-    slug: str | None = None
-    query: str | None = None
+    p = argparse.ArgumentParser()
+    p.add_argument("--query", required=True)
+    p.add_argument("--offset", type=float, default=-0.50)
+    p.add_argument("--language", default=None)
+    p.add_argument("--mode", default=None)
+    args = p.parse_args()
 
-    if args.slug:
-        slug = slugify(args.slug)
-        log("SLUG", f'Using slug from CLI: "{slug}"', CYAN)
-    elif args.query:
-        raw_q = args.query.strip()
-        slug = slugify(raw_q)
-        query = raw_q
-        log("SLUG", f'Using slug "{slug}" from CLI query', CYAN)
+    log("Master", f"Pipeline starting for query: {args.query}")
+
+    # ------------------------------------------------------------------
+    # STEP 1 — CONFIG
+    # ------------------------------------------------------------------
+    log("Config", "Launching mixer & mode selector...")
+
+    cfg_json, rc = run_step(
+        ["python3", "scripts/1_config.py"],
+        "Config"
+    )
+
+    if cfg_json is None:
+        log("Config", "Falling back to defaults", YELLOW)
+        cfg_json = {
+            "vocals": 100,
+            "bass": 100,
+            "guitar": 100,
+            "drums": 100,
+            "mode": args.mode or "vocals-100",
+            "language": args.language or "en"
+        }
+
+    selected_lang = args.language or cfg_json["language"]
+    selected_mode = args.mode or cfg_json["mode"]
+
+    log("Config", f"Selected config: {cfg_json}", GREEN)
+
+    # ------------------------------------------------------------------
+    # STEP 2 — DOWNLOAD (A mode = three tasks)
+    # ------------------------------------------------------------------
+    # ---- A: LYRICS ----------------------------------------------------
+    lyrics_json, rc = run_step(
+        [
+            "python3",
+            "scripts/2_download.py",
+            "--task", "lyrics",
+            "--query", args.query,
+            "--language", selected_lang
+        ],
+        "Step2:Download"
+    )
+
+    if not lyrics_json or "slug" not in lyrics_json:
+        log("Master", "ERROR: lyrics step failed to produce a slug", RED)
+        sys.exit(1)
+
+    slug = lyrics_json["slug"]
+    log("Master", f"Slug detected: {slug}", GREEN)
+
+    # ---- B: META ------------------------------------------------------
+    meta_json, rc = run_step(
+        [
+            "python3", "scripts/2_download.py",
+            "--task", "meta",
+            "--slug", slug,
+            "--query", args.query
+        ],
+        "Step2:Download"
+    )
+
+    # Keep working even if meta fails; it's optional
+    if meta_json:
+        log("Master", f"Metadata received: {meta_json}", GREEN)
     else:
-        slug, query = choose_slug_and_query(no_ui=no_ui)
-        if not slug:
-            print(f"{RED}No slug provided and no previous slug exists.{RESET}")
-            sys.exit(1)
+        log("Master", f"No metadata returned; continuing.", YELLOW)
 
-    # offset load/store
-    if args.offset is not None:
-        offset = args.offset
-        write_offset(slug, offset)
-        log("OFFSET", f"Using CLI offset={offset:+.3f}s", YELLOW)
-    else:
-        offset = read_offset(slug)
-        log("OFFSET", f"Using stored offset={offset:+.3f}s", CYAN)
+    # ---- C: MP3 -------------------------------------------------------
+    mp3_json, rc = run_step(
+        [
+            "python3",
+            "scripts/2_download.py",
+            "--task", "mp3",
+            "--slug", slug
+        ],
+        "Step2:Download"
+    )
 
-    if args.timing_model_size:
-        log("TIMING", f"Using timing model size={args.timing_model_size}", CYAN)
+    if not mp3_json:
+        log("Master", "ERROR: mp3 step failed", RED)
+        sys.exit(1)
 
-    status = detect_step_status(slug, args.profile)
-    show_pipeline_status(status)
+    log("Master", "MP3 downloaded.", GREEN)
 
-    # Determine steps
-    if args.steps:
-        steps: list[int] = []
-        for ch in args.steps:
-            if ch.isdigit():
-                i = int(ch)
-                if 1 <= i <= 5 and i not in steps:
-                    steps.append(i)
-        log("MASTER", f"Running requested steps: {steps}", CYAN)
-    else:
-        if no_ui:
-            if status["1"] == "MISSING":
-                steps = [1, 2, 3, 4]
-            elif status["2"] == "MISSING":
-                steps = [2, 3, 4]
-            elif status["3"] == "MISSING":
-                steps = [3, 4]
-            elif status["4"] == "MISSING":
-                steps = [4]
-            else:
-                steps = []
-            log("MASTER", f"--no-ui auto-selected steps: {steps}", CYAN)
-        else:
-            steps = choose_steps_interactive(status)
-            log("MASTER", f"Running steps: {steps}", CYAN)
+    # ------------------------------------------------------------------
+    # STEP 3 — MIX (demucs)
+    # ------------------------------------------------------------------
+    mix_json, rc = run_step(
+        [
+            "python3", "scripts/3_mix.py",
+            "--slug", slug,
+            "--mode", selected_mode
+        ],
+        "Step3:Mix"
+    )
+    if not mix_json:
+        log("Master", "Mixing failed!", RED)
+        sys.exit(1)
 
-    # Run steps
-    t1 = t2 = t3 = t4 = t5 = 0.0
+    # ------------------------------------------------------------------
+    # STEP 4 — MERGE (timings)
+    # ------------------------------------------------------------------
+    merge_json, rc = run_step(
+        [
+            "python3", "scripts/4_merge.py",
+            "--slug", slug,
+            "--language", selected_lang,
+        ],
+        "Step4:Merge"
+    )
+    if not merge_json:
+        log("Master", "Auto-timing failed!", RED)
+        sys.exit(1)
 
-    if 1 in steps:
-        t1 = run_step1(slug, query, no_ui)
+    # ------------------------------------------------------------------
+    # STEP 5 — GEN (mp4)
+    # ------------------------------------------------------------------
+    gen_json, rc = run_step(
+        [
+            "python3", "scripts/5_gen.py",
+            "--slug", slug,
+            "--offset", str(args.offset),
+            "--profile", selected_mode  # may not be needed
+        ],
+        "Step5:Gen"
+    )
+    if not gen_json:
+        log("Master", "MP4 generation failed!", RED)
+        sys.exit(1)
 
-    if 2 in steps:
-        t2 = run_step2(slug, args.profile, args.model, interactive=not no_ui)
+    mp4_path = gen_json.get("mp4")
+    log("Master", f"MP4 generated: {mp4_path}", GREEN)
 
-    if 3 in steps:
-        t3 = run_step3(slug, args.timing_model_size)
+    # ------------------------------------------------------------------
+    # STEP 6 — UPLOAD
+    # ------------------------------------------------------------------
+    upload_json, rc = run_step(
+        [
+            "python3", "scripts/6_upload.py",
+            "--file", mp4_path,
+            "--slug", slug,
+            "--profile", selected_mode,
+            "--offset", str(args.offset)
+        ],
+        "Step6:Upload"
+    )
 
-    if 4 in steps:
-        t4 = run_step4(
-            slug, args.profile, offset,
-            force=args.force_mp4,
-            called_from_master=True
-        )
+    if not upload_json:
+        log("Master", "Upload failed!", RED)
+        sys.exit(1)
 
-    if 5 in steps and not args.no_upload:
-        t5 = run_step5(slug, args.profile, offset)
-    elif 5 in steps and args.no_upload:
-        log("STEP5", "Upload requested but --no-upload is set; skipping.", YELLOW)
+    log("Master", f"Upload complete → {upload_json}", GREEN)
+    log("Master", "Pipeline complete", GREEN)
 
-    total = t1 + t2 + t3 + t4 + t5
-
-    if total > 0:
-        print()
-        print(f"{BOLD}{CYAN}======== PIPELINE SUMMARY ========{RESET}")
-        if t1: print(f"{WHITE}Step1 txt/mp3:{RESET}  {GREEN}{fmt_secs(t1)}{RESET}")
-        if t2: print(f"{WHITE}Step2 stems:{RESET}    {GREEN}{fmt_secs(t2)}{RESET}")
-        if t3: print(f"{WHITE}Step3 timing:{RESET}   {GREEN}{fmt_secs(t3)}{RESET}")
-        if t4: print(f"{WHITE}Step4 mp4:{RESET}      {GREEN}{fmt_secs(t4)}{RESET}")
-        if t5: print(f"{WHITE}Step5 upload:{RESET}   {GREEN}{fmt_secs(t5)}{RESET}")
-        print(f"{GREEN}Total time:{RESET}       {BOLD}{fmt_secs(total)}{RESET}")
-        print(f"{BOLD}{CYAN}=================================={RESET}")
 
 if __name__ == "__main__":
     main()
-
-# end of 0_master.py

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# scripts/5_upload.py
+# scripts/6_upload.py
 #
 # Upload a video to YouTube via the official YouTube Data API.
 #
@@ -80,7 +80,7 @@ except ImportError as e:
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
-def get_creds() -> Credentials:
+def get_creds() -> "Credentials":
     """
     Load or create OAuth credentials.
 
@@ -120,7 +120,7 @@ def get_creds() -> Credentials:
         sys.exit(1)
 
     token_path = secrets_path.with_name("youtube_token.json")
-    creds: Optional[Credentials] = None
+    creds: Optional["Credentials"] = None
 
     if token_path.exists():
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
@@ -165,7 +165,7 @@ def get_creds() -> Credentials:
     return creds
 
 
-def build_youtube(creds: Credentials):
+def build_youtube(creds: "Credentials"):
     return build("youtube", "v3", credentials=creds)
 
 
@@ -398,4 +398,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-# end of 5_upload.py
+# end of 6_upload.py
