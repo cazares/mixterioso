@@ -54,7 +54,6 @@ DIVIDER_LEFT_MARGIN_PX  = VIDEO_WIDTH * 0.035
 DIVIDER_RIGHT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX
 
 VERTICAL_OFFSET_FRACTION = 0.0
-TITLE_EXTRA_OFFSET_FRACTION = -0.20  
 
 NEXT_LINE_FONT_SCALE  = 0.55
 NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.45
@@ -177,6 +176,7 @@ def offset_tag(val):
 # -------------------------------------------------------------------------
 # CORE ASS GENERATOR — UNCHANGED except MP4 filename logic
 # -------------------------------------------------------------------------
+
 def build_ass(
     slug: str,
     profile: str,
@@ -192,17 +192,14 @@ def build_ass(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ass_path = OUTPUT_DIR / f"{slug}_{profile}{offset_tag(offset_applied)}.ass"
 
-    # Audio duration fallback
-    if audio_duration <= 0.0 and timings:
-        last_end = max(end for (start, end, _t, _li) in timings)
-        audio_duration = last_end + 5.0
-    if audio_duration <= 0.0:
-        audio_duration = 5.0
+    # Audio fallback
+    if audio_duration <= 0 and timings:
+        audio_duration = max(end for _, end, _, _ in timings) + 5
+    if audio_duration <= 0:
+        audio_duration = 5
 
     playresx = VIDEO_WIDTH
     playresy = VIDEO_HEIGHT
-
-    # Geometry
     top_band_height = int(playresy * TOP_BAND_FRACTION)
     y_div = top_band_height
     bottom_band_height = playresy - y_div
@@ -213,20 +210,13 @@ def build_ass(
 
     x_center = playresx // 2
     y_center_full = playresy // 2
-
-    line_y = max(0, y_div - DIVIDER_LINE_OFFSET_UP_PX)
-
-    inner_bottom_height = max(
-        1,
-        bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX
-    )
-    y_next = y_div + NEXT_LYRIC_TOP_MARGIN_PX + inner_bottom_height // 2
+    y_next = y_div + NEXT_LYRIC_TOP_MARGIN_PX + (bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX) // 2
 
     preview_font    = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
     next_label_font = max(1, int(font_size_script * NEXT_LABEL_FONT_SCALE))
     margin_v = 0
 
-    # ASS colors
+    # Style header
     top_primary = f"&H{TOP_LYRIC_TEXT_ALPHA_HEX}{rgb_to_bgr(TOP_LYRIC_TEXT_COLOR_RGB)}"
     secondary   = "&H000000FF"
     outline     = "&H00000000"
@@ -237,278 +227,202 @@ def build_ass(
         "ScriptType: v4.00+",
         f"PlayResX: {playresx}",
         f"PlayResY: {playresy}",
-        "ScaledBorderAndShadow: yes",
         "",
         "[V4+ Styles]",
-        ("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
-         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
-         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-         "Alignment, MarginL, MarginR, MarginV, Encoding"),
         (
-            f"Style: Default,{font_name},{font_size_script},"
-            f"{top_primary},{secondary},{outline},{back},"
-            "0,0,0,0,100,100,0,0,1,4,0,5,50,50,"
-            f"{margin_v},0"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+            "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+            "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding"
+        ),
+        (
+            f"Style: Default,{font_name},{font_size_script},{top_primary},{secondary},"
+            f"{outline},{back},0,0,0,0,100,100,0,0,1,4,0,5,50,50,{margin_v},0"
         ),
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
     ]
 
-    def esc(s: str) -> str:
-        return s.replace("{","(").replace("}"," )").replace("\n", r"\N")
-
     events = []
 
     # Normalize timings
     unified = []
     for start_raw, end_raw, raw_text, li in timings:
-        t = (raw_text or "").strip()
+        t = raw_text.strip()
         if not t:
             continue
 
-        start = start_raw + offset_applied
-        end   = end_raw   + offset_applied
+        s = start_raw + offset_applied
+        e = end_raw   + offset_applied
+        if s < 0: s = 0
+        if e <= s: e = s + 0.01
+        if e > audio_duration: e = audio_duration
 
-        if start < 0:
-            start = 0
-        if end <= start:
-            end = start + 0.01
-        if audio_duration > 0 and end > audio_duration:
-            end = audio_duration
-
-        music_only = is_music_only(t)
-        unified.append((start, end, t, li, music_only))
+        unified.append((s, e, t, li, is_music_only(t)))
 
     unified.sort(key=lambda x: x[0])
-
     if not unified:
         block = "\\N".join([title, f"by {artist}"] if artist else [title])
         events.append(
-            f"Dialogue: 0,{seconds_to_ass_time(0)},{seconds_to_ass_time(audio_duration)},"
-            f"Default,,0,0,0,,{{\\an5\\pos({x_center},{y_center_full})}}{esc(block)}"
+            f"Dialogue: 0,0,{seconds_to_ass_time(audio_duration)},Default,,0,0,0,,"
+            f"{{\\an5\\pos({x_center},{y_center_full})}}{block}"
         )
-        ass_path.write_text("\n".join(header + events) + "\n", encoding="utf-8")
+        ass_path.write_text("\n".join(header + events), encoding="utf-8")
         return ass_path
 
     n = len(unified)
 
-    # Build repeated-line display_texts
-    display_texts = [t for (_s, _e, t, _li, _mus) in unified]
-
+    # Handle repeated-text decoration
+    display_texts = [u[2] for u in unified]
     i = 0
     while i < n:
-        base_text = unified[i][2]
-        norm = base_text.strip().lower()
+        base = unified[i][2].strip().lower()
         j = i + 1
-        while j < n and unified[j][2].strip().lower() == norm:
+        while j < n and unified[j][2].strip().lower() == base:
             j += 1
-        run_len = j - i
-        if run_len > 1:
+        run = j - i
+        if run > 1:
             prev_note = None
-            for k in range(run_len):
+            for k in range(run):
+                text = unified[i+k][2]
                 if k == 0:
-                    display_texts[i+k] = unified[i+k][2]
+                    display_texts[i+k] = text
                 else:
-                    choices = [c for c in MUSIC_NOTE_CHARS if c != prev_note] or [MUSIC_NOTE_CHARS[0]]
+                    choices = [c for c in MUSIC_NOTE_CHARS if c != prev_note] or MUSIC_NOTE_CHARS
                     note = random.choice(choices)
                     prev_note = note
-                    display_texts[i+k] = f"{unified[i+k][2]} {note}"
+                    display_texts[i+k] = f"{text} {note}"
         i = j
 
     fade_tag = f"\\fad({FADE_IN_MS},{FADE_OUT_MS})"
 
-    next_color       = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
-    divider_color    = rgb_to_bgr(DIVIDER_COLOR_RGB)
-    next_label_color = rgb_to_bgr(NEXT_LABEL_COLOR_RGB)
+    # ≡≡≡ INTRO TITLE — ALWAYS SHOWN ≥ MIN_TITLE_SECS ≡≡≡
+    first_lyric_start = unified[0][0]
+    title_start = 0.0
+    title_end = max(MIN_TITLE_SECS, min(first_lyric_start, 5.0))
 
-    divider_height = max(0.5, DIVIDER_HEIGHT_PX)
-    x_left  = float(DIVIDER_LEFT_MARGIN_PX)
-    x_right = float(playresx - DIVIDER_RIGHT_MARGIN_PX)
+    # Shift all lyrics AFTER title_end
+    shifted = []
+    for (s, e, t, li, mus) in unified:
+        if s < title_end:
+            shift = title_end - s
+            s = title_end
+            e = max(e + shift, s + 0.01)
+        shifted.append((s, e, t, li, mus))
+    unified = sorted(shifted, key=lambda x: x[0])
 
-    label_x = NEXT_LABEL_LEFT_MARGIN_PX
-    label_y = y_div + NEXT_LABEL_TOP_MARGIN_PX
+    # Emit title
+    title_block = "\\N".join([title, f"by {artist}"] if artist else [title])
+    events.append(
+        f"Dialogue: 0,{seconds_to_ass_time(title_start)},{seconds_to_ass_time(title_end)},"
+        f"Default,,0,0,0,,{{\\an5\\pos({x_center},{y_center_full})}}{title_block}"
+    )
 
-    # Notes emitter
-    def emit_notes_block(t_start, t_end):
-        if t_end <= t_start + 0.05:
+    # Note block helper
+    def emit_notes_block(start, end):
+        if end <= start + 0.01:
             return
-        t = t_start
-        while t < t_end - 0.05:
-            frame_end = min(t + NOTE_DURATION, t_end)
+        t = start
+        while t < end:
+            frame_end = min(t + NOTE_DURATION, end)
             k = random.randint(NOTE_MIN_COUNT, NOTE_MAX_COUNT)
-            if k >= len(MUSIC_NOTE_CHARS):
-                seq = list(MUSIC_NOTE_CHARS)
-                random.shuffle(seq)
-                cluster = "".join(seq)
-            else:
-                cluster = "".join(random.sample(MUSIC_NOTE_CHARS, k))
-
-            tag = (
-                f"{{\\an5\\pos({x_center},{y_center_full})"
-                f"\\fs{preview_font*2}\\fad({NOTE_FADE_IN},{NOTE_FADE_OUT})}}"
-            )
+            seq = random.sample(MUSIC_NOTE_CHARS, min(k, len(MUSIC_NOTE_CHARS)))
+            text = "".join(seq)
+            tag = f"{{\\an5\\pos({x_center},{y_center_full})\\fs{preview_font*2}}}"
             events.append(
                 f"Dialogue: 2,{seconds_to_ass_time(t)},{seconds_to_ass_time(frame_end)},"
-                f"Default,,0,0,0,,{tag}{cluster}"
+                f"Default,,0,0,0,,{tag}{text}"
             )
             t += NOTE_SPAWN_PERIOD_SECS
 
-        # INTRO TITLE
-        # Force all lyrics to start AFTER the title duration
-        block = "\\N".join([title, f"by {artist}"] if artist else [title])
-        events.append(
-            f"Dialogue: 0,{seconds_to_ass_time(title_start)},{seconds_to_ass_time(title_end)},"
-            f"Default,,0,0,0,,{{\\an5\\pos({x_center},{y_center_full})}}{esc(block)}"
-        )
+    # ≡≡≡ MAIN LOOP ≡≡≡
+    for i, (s, e, text, li, mus) in enumerate(unified):
+        is_last = (i == n - 1)
+        display_text = display_texts[i]
+        y_line = (VIDEO_HEIGHT//2) if mus else y_main_top
 
-        for idx, (s, e, t, li, mus) in enumerate(unified):
-            if s < title_end:
-                shift = title_end - s
-                s = title_end
-                e = max(e + shift, s + 0.01)
-                unified[idx] = (s, e, t, li, mus)
-
-        base_title_end = min(first_lyric_start, 5.0)
-        reserved_notes_end = max(0.0, first_lyric_start - NOTE_EARLY_END_SECS)
-
-        if reserved_notes_end <= title_start:
-            title_end = first_lyric_start
-            intro_start = intro_end = None
-        else:
-            min_title_display = max(base_title_end, title_start + MIN_LYRIC_VISIBLE_SECS)
-            min_title_display = min(min_title_display, reserved_notes_end, first_lyric_start)
-            remaining = reserved_notes_end - min_title_display
+        if is_last:
+            reserved_notes_end = max(e, audio_duration - NOTE_EARLY_END_SECS)
+            remaining = reserved_notes_end - e
 
             if remaining >= NOTE_GAP_THRESHOLD_SECS:
-                title_end = min_title_display
-                intro_start = min_title_display
-                intro_end   = reserved_notes_end
-            else:
-                title_end = first_lyric_start
-                intro_start = intro_end = None
-
-        block = "\\N".join([title, f"by {artist}"] if artist else [title])
-        events.append(
-            f"Dialogue: 0,{seconds_to_ass_time(title_start)},{seconds_to_ass_time(title_end)},"
-            f"Default,,0,0,0,,{{\\an5\\pos({x_center},{y_center_full})}}{esc(block)}"
-        )
-
-        if intro_start is not None:
-            emit_notes_block(intro_start, intro_end)
-
-    # MAIN LINES ------------------------------------------
-    for i, (start_i, end_i, text_i, li_i, mus_i) in enumerate(unified):
-
-        # ===========================
-        # LAST LYRIC LINE
-        # ===========================
-        if i == n - 1:
-            display_text_i = display_texts[i]
-            y_line = (VIDEO_HEIGHT // 2) if mus_i else y_main_top
-
-            song_end = audio_duration
-            reserved = max(end_i, song_end - NOTE_EARLY_END_SECS)
-            remaining = reserved - end_i
-
-            if remaining >= NOTE_GAP_THRESHOLD_SECS:
-                lyric_end = min(end_i + MIN_LYRIC_VISIBLE_SECS, reserved)
-
+                lyric_end = min(e + MIN_LYRIC_VISIBLE_SECS, reserved_notes_end)
                 events.append(
-                    f"Dialogue: 1,{seconds_to_ass_time(start_i)},{seconds_to_ass_time(lyric_end)},"
-                    f"Default,,0,0,0,,{{\\an5\\pos({playresx//2},{y_line}){fade_tag}}}{esc(display_text_i)}"
+                    f"Dialogue: 1,{seconds_to_ass_time(s)},{seconds_to_ass_time(lyric_end)},"
+                    f"Default,,0,0,0,,{{\\an5\\pos({playresx//2},{y_line}){fade_tag}}}{display_text}"
                 )
-
-                emit_notes_block(lyric_end, reserved)
-
+                emit_notes_block(lyric_end, reserved_notes_end)
             else:
-                lyric_end = reserved
                 events.append(
-                    f"Dialogue: 1,{seconds_to_ass_time(start_i)},{seconds_to_ass_time(lyric_end)},"
-                    f"Default,,0,0,0,,{{\\an5\\pos({playresx//2},{y_line}){fade_tag}}}{esc(display_text_i)}"
+                    f"Dialogue: 1,{seconds_to_ass_time(s)},{seconds_to_ass_time(reserved_notes_end)},"
+                    f"Default,,0,0,0,,{{\\an5\\pos({playresx//2},{y_line}){fade_tag}}}{display_text}"
                 )
-
             continue
 
-        # ===========================
-        # NORMAL LINES
-        # ===========================
-        next_start, next_end, next_text, _li_n, next_mus = unified[i+1]
-        gap_end = next_start
-        reserved_notes_end = max(start_i, next_start - NOTE_EARLY_END_SECS)
+        # Normal line gap
+        next_s, _, _, _, next_mus = unified[i+1]
+        gap_end = next_s
+        reserved_notes_end = max(s, next_s - NOTE_EARLY_END_SECS)
 
-        if gap_end < start_i:
-            gap_end = start_i
-        if reserved_notes_end < start_i:
-            reserved_notes_end = start_i
-
-        display_end = end_i
+        display_end = e
         instrument_start = None
-        instrument_end = None
+        instrument_end   = None
 
-        if not mus_i:
-            min_end = max(end_i, start_i + MIN_LYRIC_VISIBLE_SECS)
+        if not mus:
+            min_end = max(e, s + MIN_LYRIC_VISIBLE_SECS)
             min_end = min(min_end, reserved_notes_end, gap_end)
             remaining = reserved_notes_end - min_end
 
             if remaining >= NOTE_GAP_THRESHOLD_SECS and not next_mus:
                 display_end = min_end
                 instrument_start = min_end
-                instrument_end = reserved_notes_end
+                instrument_end   = reserved_notes_end
             else:
                 display_end = gap_end
 
-        display_text_i = display_texts[i]
-        y_line = (VIDEO_HEIGHT // 2) if mus_i else y_main_top
-
         events.append(
-            f"Dialogue: 1,{seconds_to_ass_time(start_i)},{seconds_to_ass_time(display_end)},"
-            f"Default,,0,0,0,,{{\\an5\\pos({playresx//2},{y_line}){fade_tag}}}{esc(display_text_i)}"
+            f"Dialogue: 1,{seconds_to_ass_time(s)},{seconds_to_ass_time(display_end)},"
+            f"Default,,0,0,0,,{{\\an5\\pos({playresx//2},{y_line}){fade_tag}}}{display_text}"
         )
 
-        if instrument_start is not None:
+        if instrument_start:
             emit_notes_block(instrument_start, instrument_end)
 
-        if mus_i or next_mus:
+        # Skip previews for music lines
+        if mus or next_mus:
             continue
 
-        preview_start = start_i
-        preview_end = instrument_start if instrument_start is not None else gap_end
-
+        preview_start = s
+        preview_end   = instrument_start if instrument_start else gap_end
         if preview_end <= preview_start + 0.05:
             continue
 
-        # Divider bar
-        div_tag = (
-            f"{{\\an7\\pos(0,{line_y})"
-            f"\\1c&H{divider_color}&"
-            f"\\1a&H{DIVIDER_ALPHA_HEX}&"
-            f"\\bord0\\shad0\\p1}}"
+        divider_color = rgb_to_bgr(DIVIDER_COLOR_RGB)
+        next_color    = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
+        divider_tag = (
+            f"{{\\an7\\pos(0,{y_div})\\1c&H{divider_color}&\\bord0\\shad0\\p1}}"
         )
-        shape = (
-            f"m {x_left} 0 l {x_right} 0 "
-            f"l {x_right} {divider_height} l {x_left} {divider_height}{{\\p0}}"
+        shape = f"m {0} 0 l {playresx} 0 l {playresx} 1 l 0 1{{\\p0}}"
+
+        events.append(
+            f"Dialogue: 0,{seconds_to_ass_time(preview_start)},{seconds_to_ass_time(preview_end)},"
+            f"Default,,0,0,0,,{divider_tag}{shape}"
         )
 
         events.append(
             f"Dialogue: 0,{seconds_to_ass_time(preview_start)},{seconds_to_ass_time(preview_end)},"
-            f"Default,,0,0,0,,{div_tag}{shape}"
-        )
-
-        events.append(
-            f"Dialogue: 0,{seconds_to_ass_time(preview_start)},{seconds_to_ass_time(preview_end)},"
-            f"Default,,0,0,0,,{{\\an7\\pos({label_x},{label_y})\\fs{next_label_font}"
-            f"\\1c&H{next_label_color}&\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&}}Next:"
+            f"Default,,0,0,0,,{{\\an7\\pos({NEXT_LABEL_LEFT_MARGIN_PX},{y_div+NEXT_LABEL_TOP_MARGIN_PX})"
+            f"\\fs{next_label_font}}}Next:"
         )
 
         events.append(
             f"Dialogue: 2,{seconds_to_ass_time(preview_start)},{seconds_to_ass_time(preview_end)},"
-            f"Default,,0,0,0,,{{\\an5\\pos({playresx//2},{y_next})\\fs{preview_font}"
-            f"\\1c&H{next_color}&\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&{fade_tag}}}"
-            f"{esc(display_texts[i+1])}"
+            f"Default,,0,0,0,,{{\\an5\\pos({playresx//2},{y_next})\\fs{preview_font}{fade_tag}}}"
+            f"{display_texts[i+1]}"
         )
 
-    ass_path.write_text("\n".join(header + events) + "\n", encoding="utf-8")
+    ass_path.write_text("\n".join(header + events), encoding="utf-8")
     return ass_path
 
 # -------------------------------------------------------------------------

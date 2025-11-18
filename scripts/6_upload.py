@@ -1,312 +1,221 @@
 #!/usr/bin/env python3
 # scripts/6_upload.py
 #
-# STEP 6: Upload final MP4 to YouTube (formerly 5_upload.py)
-# ----------------------------------------------------------
-# - Uses OAuth (client_secret.json)
-# - Colorized streaming logs
-# - Prompts user about PUBLIC visibility ("are you SURE?")
-# - Can auto-select thumbnail from MP4 frame
-# - Final output is ALWAYS JSON for 0_master.py
-# - Filename passed in is FINAL MP4 (slug.mp4)
-#
-# GENTLE RULES:
-# - NEVER assume YOUTUBE_API_KEY is enough (it's NOT)
-# - MUST have OAuth JSON (client_secret.json)
-# - Tokens stored in same directory
-# - Works on macOS, Codespaces (if Chrome allowed), MacInCloud
-#
-# CLI:
-#   --file path/to/final.mp4   (required)
-#   --title "..."              (optional)
-#   --description "..."        (optional)
-#   --tags "a,b,c"             (optional)
-#   --public                   ask confirmation, then upload public
-#   --unlisted                 upload unlisted
-#   --thumb-sec X              take screenshot at X seconds
-#   --no-thumbnail
-#   --slug, --offset           (optional for master receipts)
-#
-# Notes:
-#   The pipeline ALWAYS sets madeForKids = false.
+# STEP 6: Upload MP4 to YouTube
+# - Extract intro-frame thumbnail
+# - Upload video
+# - Apply generated thumbnail
+# - Public by default
+# - Always: "NOT made for kids"
+# - Output JSON receipt for 0_master.py
 
-from __future__ import annotations
-import argparse
-import json
 import os
 import sys
+import json
+import time
+import argparse
 import subprocess
 from pathlib import Path
-from datetime import datetime
 
-# ANSI colors
-RESET = "\033[0m"
-CYAN  = "\033[36m"
-GREEN = "\033[32m"
-YELLOW= "\033[33m"
-RED   = "\033[31m"
-BLUE  = "\033[34m"
+# ────────────────────────────────────────────────────────────
+# ANSI COLORS
+# ────────────────────────────────────────────────────────────
+RESET="\033[0m"
+CYAN="\033[36m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
 
-BASE = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = BASE / "output"
-UPLOAD_LOG = BASE / "uploaded"
+def log(prefix, msg, color=RESET):
+    ts = time.strftime("%H:%M:%S")
+    print(f"{color}[{ts}] [{prefix}] {msg}{RESET}")
 
-T_THUMB = 0.041
+# ────────────────────────────────────────────────────────────
+# YouTube API (simple Google OAuth refresh + upload)
+# ────────────────────────────────────────────────────────────
 
-def log(section, msg, color=CYAN):
-    print(f"{color}[{section}]{RESET} {msg}")
+import requests
 
-# Google API imports ----------------------------------------------------------
-try:
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaFileUpload
-    from googleapiclient.errors import HttpError
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-except Exception as e:
-    print(json.dumps({
-        "ok": False,
-        "error": "missing-deps",
-        "detail": str(e)
-    }))
-    sys.exit(1)
+YOUTUBE_UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos?part=snippet,status"
+YOUTUBE_THUMB_URL  = "https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId={vid}"
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+def get_access_token():
+    """Exchange refresh token → access token."""
+    cid     = os.getenv("YOUTUBE_CLIENT_ID")
+    csecret = os.getenv("YOUTUBE_CLIENT_SECRET")
+    rtoken  = os.getenv("YOUTUBE_REFRESH_TOKEN")
 
+    if not cid or not csecret or not rtoken:
+        raise RuntimeError("Missing YouTube OAuth env vars.")
 
-# -----------------------------------------------------------------------------
-# Credential Loader
-# -----------------------------------------------------------------------------
-def get_creds() -> Credentials:
-    env_p = os.getenv("YOUTUBE_CLIENT_SECRETS_JSON")
-    if env_p:
-        s = Path(env_p).expanduser().resolve()
-        secrets = s / "client_secret.json" if s.is_dir() else s
-    else:
-        secrets = (BASE / "client_secret.json").resolve()
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": cid,
+            "client_secret": csecret,
+            "refresh_token": rtoken,
+            "grant_type": "refresh_token",
+        }
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"OAuth refresh failed: {resp.text}")
 
-    if not secrets.exists():
-        print(json.dumps({
-            "ok": False,
-            "error": "missing-oauth-secret",
-            "message": "client_secret.json not found",
-            "path": str(secrets)
-        }))
-        sys.exit(1)
+    return resp.json()["access_token"]
 
-    token = secrets.with_name("youtube_token.json")
-    creds = None
+def upload_video(video_path, title, description, visibility, made_for_kids):
+    access = get_access_token()
 
-    if token.exists():
-        creds = Credentials.from_authorized_user_file(str(token), SCOPES)
+    snippet = {
+        "title": title,
+        "description": description,
+        "categoryId": "10",  # Music
+    }
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            log("auth","Refreshing token…",CYAN)
-            creds.refresh(Request())
-        else:
-            log("auth",f"Launching OAuth flow using {secrets.name}",CYAN)
-            try:
-                flow = InstalledAppFlow.from_client_secrets_file(str(secrets), SCOPES)
-                creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
-            except Exception as e:
-                print(json.dumps({
-                    "ok": False,
-                    "error": "oauth-failed",
-                    "detail": str(e)
-                }))
-                sys.exit(1)
-
-        token.write_text(creds.to_json(), encoding="utf-8")
-        log("auth",f"Stored new token at {token}",GREEN)
-
-    return creds
-
-
-# -----------------------------------------------------------------------------
-def extract_thumbnail(mp4: Path, png: Path, t: float):
-    cmd = [
-        "ffmpeg","-y",
-        "-ss", str(t),
-        "-i", str(mp4),
-        "-frames:v","1",
-        "-vf","scale=1280:-1",
-        str(png)
-    ]
-    log("thumb"," ".join(cmd),BLUE)
-    subprocess.run(cmd, check=True)
-
-
-def set_thumb(youtube, video_id: str, png: Path):
-    media = MediaFileUpload(str(png), mimetype="image/png")
-    youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
-    log("thumb","Thumbnail updated",GREEN)
-
-
-# -----------------------------------------------------------------------------
-def upload_video(
-    youtube,
-    mp4: Path,
-    title: str,
-    desc: str,
-    tags: list[str],
-    privacy: str,
-    made_for_kids: bool,
-    category: str = "10",
-):
-    log("upload",f"Uploading {mp4.name}",CYAN)
+    status = {
+        "privacyStatus": visibility,
+        "selfDeclaredMadeForKids": made_for_kids
+    }
 
     body = {
-        "snippet": {
-            "title": title,
-            "description": desc,
-            "tags": tags or None,
-            "categoryId": category,
-        },
-        "status": {
-            "privacyStatus": privacy,
-            "selfDeclaredMadeForKids": bool(made_for_kids),
-        },
+        "snippet": snippet,
+        "status": status
     }
 
-    media = MediaFileUpload(str(mp4), chunksize=-1, resumable=True)
-    req = youtube.videos().insert(
-        part="snippet,status",
-        body=body,
-        media_body=media
-    )
-
-    resp = None
-    while resp is None:
-        status, resp = req.next_chunk()
-        if status:
-            pct = int(status.progress()*100)
-            print(f"{CYAN}[upload]{RESET} {pct}%")
-
-    if "id" not in resp:
-        raise RuntimeError("Upload succeeded but no video ID returned.")
-
-    vid = resp["id"]
-    log("upload",f"UPLOAD OK → Video ID: {vid}",GREEN)
-    return vid
-
-
-# -----------------------------------------------------------------------------
-def write_receipt(slug, offset, video_id, title):
-    if slug is None or offset is None:
-        return
-    UPLOAD_LOG.mkdir(exist_ok=True)
-    r = {
-        "slug": slug,
-        "offset": offset,
-        "video_id": video_id,
-        "title": title,
-        "timestamp": datetime.utcnow().isoformat()+"Z"
+    headers = {
+        "Authorization": f"Bearer {access}",
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": "video/mp4",
     }
-    out = UPLOAD_LOG / f"{slug}_upload_receipt.json"
-    out.write_text(json.dumps(r, indent=2), encoding="utf-8")
-    log("upload",f"Receipt → {out}",GREEN)
 
+    # Init upload
+    init = requests.post(YOUTUBE_UPLOAD_URL, headers=headers, data=json.dumps(body))
+    if init.status_code not in (200, 201,  resumable_ok := 308):
+        raise RuntimeError(f"Init upload failed: {init.text}")
 
-# -----------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--file", required=True)
-    ap.add_argument("--title")
-    ap.add_argument("--description", default="")
-    ap.add_argument("--tags", default="")
-    ap.add_argument("--public", action="store_true")
-    ap.add_argument("--unlisted", action="store_true")
-    ap.add_argument("--thumb-sec", type=float, default=0.5)
-    ap.add_argument("--no-thumbnail", action="store_true")
+    upload_url = init.headers.get("Location")
+    if not upload_url:
+        raise RuntimeError("Could not obtain upload URL for resumable upload.")
 
-    # master metadata (optional)
-    ap.add_argument("--slug")
-    ap.add_argument("--offset", type=float)
+    # Upload file
+    video_data = open(video_path, "rb").read()
+    upload_headers = {
+        "Authorization": f"Bearer {access}",
+        "Content-Length": str(len(video_data)),
+        "Content-Type": "video/mp4",
+    }
+    resp = requests.put(upload_url, headers=upload_headers, data=video_data)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Video upload failed: {resp.text}")
 
-    ap.add_argument("passthrough", nargs="*")
-    args = ap.parse_args()
+    video_id = resp.json()["id"]
+    return video_id, access
 
-    # ------------------------------
-    # Validate file
-    # ------------------------------
-    mp4 = Path(args.file).resolve()
-    if not mp4.exists():
-        print(json.dumps({"ok":False,"error":"file-not-found","path":str(mp4)}))
-        sys.exit(1)
-
-    title = args.title or mp4.stem
-    tags  = [t.strip() for t in args.tags.split(",") if t.strip()]
-
-    # ------------------------------
-    # Determine privacy
-    # ------------------------------
-    privacy = "private"
-    if args.unlisted:
-        privacy = "unlisted"
-    if args.public:
-        # ask confirmation
-        ans = input("\nMake video PUBLIC? y/N: ").strip().lower()
-        if ans == "y":
-            ans2 = input("ARE YOU SURE? This will publish immediately. y/N: ").strip().lower()
-            if ans2 == "y":
-                privacy = "public"
-            else:
-                log("upload","Upload remains private",YELLOW)
-        else:
-            log("upload","Upload remains private",YELLOW)
-
-    # ------------------------------
-    # OAuth
-    # ------------------------------
-    creds = get_creds()
-    yt = build("youtube","v3",credentials=creds)
-
-    # ------------------------------
-    # UPLOAD
-    # ------------------------------
-    try:
-        vid = upload_video(
-            yt,
-            mp4,
-            title=title,
-            desc=args.description,
-            tags=tags,
-            privacy=privacy,
-            made_for_kids=False  # ALWAYS false
+def upload_thumbnail(video_id, thumbnail_path, access_token):
+    url = YOUTUBE_THUMB_URL.format(vid=video_id)
+    with open(thumbnail_path, "rb") as f:
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            files={"media": ("thumb.png", f, "image/png")}
         )
-    except HttpError as e:
-        print(json.dumps({"ok":False,"error":"youtube-error","detail":str(e)}))
-        sys.exit(1)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Thumbnail upload failed: {resp.text}")
 
-    # ------------------------------
-    # Thumbnail
-    # ------------------------------
-    if not args.no_thumbnail:
-        png = mp4.with_suffix(".thumb.png")
-        try:
-            extract_thumbnail(mp4, png, T_THUMB)
-            set_thumb(yt, vid, png)
-        except Exception as e:
-            log("thumb",f"Thumbnail failed: {e}",YELLOW)
+# ────────────────────────────────────────────────────────────
+# Main
+# ────────────────────────────────────────────────────────────
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("--mp4", required=True)
+    p.add_argument("--title", required=True)
+    p.add_argument("--description", default="")
+    p.add_argument("--visibility", default="public",
+                   choices=("public","unlisted","private"))
+    p.add_argument("--base-filename", required=True)
+    p.add_argument("--force", action="store_true")
+    args = p.parse_args(argv)
 
-    # ------------------------------
-    # Receipt
-    # ------------------------------
-    write_receipt(args.slug, args.offset, vid, title)
+    video_path = Path(args.mp4)
+    if not video_path.exists():
+        log("Upload", f"MP4 not found: {video_path}", RED)
+        print(json.dumps({"ok": False, "error": "mp4-not-found"}))
+        return
 
-    # ------------------------------
-    # JSON Result
-    # ------------------------------
+    # ────────────────────────────────────────────────────────────
+    # 1. EXTRACT THUMBNAIL FROM INTRO SCREEN (ALWAYS t=0.0s)
+    # ────────────────────────────────────────────────────────────
+    thumb_path = video_path.with_suffix(".thumbnail.png")
+
+    log("THUMB", "Extracting thumbnail (t=0.00s) ...", CYAN)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", "0",
+        "-i", str(video_path),
+        "-vframes", "1",
+        str(thumb_path)
+    ]
+
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for ln in proc.stdout.split("\n"):
+        if ln.strip():
+            print(f"{CYAN}[ffmpeg]{RESET} {ln}")
+    if proc.returncode != 0:
+        log("THUMB", "Thumbnail extraction failed", RED)
+        print(json.dumps({"ok": False, "error": "thumbnail-failed"}))
+        return
+
+    log("THUMB", f"Thumbnail ready: {thumb_path}", GREEN)
+
+    # ────────────────────────────────────────────────────────────
+    # 2. UPLOAD TO YOUTUBE
+    # ────────────────────────────────────────────────────────────
+    log("Upload", "Starting YouTube upload ...", CYAN)
+
+    try:
+        video_id, access = upload_video(
+            video_path=str(video_path),
+            title=args.title,
+            description=args.description,
+            visibility=args.visibility,
+            made_for_kids=False    # ALWAYS NOT FOR KIDS
+        )
+    except Exception as e:
+        log("Upload", f"Video upload FAILED: {e}", RED)
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return
+
+    log("Upload", f"Video uploaded: https://youtu.be/{video_id}", GREEN)
+
+    # ────────────────────────────────────────────────────────────
+    # 3. UPLOAD THUMBNAIL
+    # ────────────────────────────────────────────────────────────
+    log("Thumb", "Uploading custom thumbnail ...", CYAN)
+
+    try:
+        upload_thumbnail(video_id, thumb_path, access)
+    except Exception as e:
+        log("Thumb", f"Thumbnail upload FAILED: {e}", RED)
+        print(json.dumps({
+            "ok": True,
+            "warning": "thumb-failed",
+            "video_id": video_id,
+            "error": str(e)
+        }))
+        return
+
+    log("Thumb", "Thumbnail applied successfully", GREEN)
+
+    # ────────────────────────────────────────────────────────────
+    # Success JSON receipt
+    # ────────────────────────────────────────────────────────────
     print(json.dumps({
         "ok": True,
-        "video_id": vid,
-        "watch_url": f"https://youtu.be/{vid}",
-        "privacy": privacy,
-        "file": str(mp4)
-    }, indent=2))
-
+        "video_id": video_id,
+        "watch_url": f"https://youtu.be/{video_id}",
+        "thumbnail": str(thumb_path),
+        "mp4": str(video_path)
+    }))
 
 if __name__ == "__main__":
     main()
