@@ -134,6 +134,7 @@ def musixmatch_fetch_lyrics(track_id, api_key):
         lyr = data.get("message", {}).get("body", {}).get("lyrics", {})
         text = lyr.get("lyrics_body")
         if text:
+            # Strip Musixmatch footer
             return re.sub(r"\*\*\*.+", "", text).strip()
     except Exception:
         return None
@@ -141,7 +142,7 @@ def musixmatch_fetch_lyrics(track_id, api_key):
 
 
 # ======================================================================
-# GENIUS (METADATA)
+# GENIUS (METADATA ONLY — NO LYRICS)
 # ======================================================================
 def genius_search(query, token):
     import requests
@@ -161,7 +162,7 @@ def genius_search(query, token):
 
 
 # ======================================================================
-# YOUTUBE METADATA
+# YOUTUBE METADATA (FALLBACK SOURCE)
 # ======================================================================
 def youtube_metadata(query):
     cmd = ["yt-dlp", "--dump-json", f"ytsearch1:{query}"]
@@ -219,29 +220,28 @@ def main():
 
         log("Lyrics", f"Searching lyrics for query: {query}")
 
-        # Step 1: Genius metadata (preferred source for artist/title)
         artist, title = None, None
+
+        # 1) GENIUS → artist/title (primary metadata source)
         if GENIUS:
             ga, gt = genius_search(query, GENIUS)
             if ga and gt:
-                artist = ga.strip()
-                title = gt.strip()
+                artist, title = ga.strip(), gt.strip()
                 log("Lyrics", f"Genius metadata → {artist} - {title}", BLUE)
         else:
-            log("Lyrics", "GENIUS_ACCESS_TOKEN not set; skipping Genius.", YELLOW)
+            log("Lyrics", "GENIUS_ACCESS_TOKEN not set; skipping Genius metadata.", YELLOW)
 
-        # Step 2: YouTube metadata as backup / enhancer
+        # 2) YouTube metadata fallback if Genius didn't give both
         if not artist or not title:
             yta, ytt = youtube_metadata(query)
             if yta and ytt:
-                yta_clean, ytt_clean = clean_youtube_title(yta, ytt)
-                log("Lyrics", f"YouTube metadata → {yta_clean} - {ytt_clean}", YELLOW)
-                if not artist:
-                    artist = yta_clean
-                if not title:
-                    title = ytt_clean
+                artist_yt, title_yt = clean_youtube_title(yta, ytt)
+                # Only fill what we don't have yet so Genius wins when present
+                artist = artist or artist_yt
+                title = title or title_yt
+                log("Lyrics", f"YouTube metadata → {artist} - {title}", YELLOW)
 
-        # Step 3: Musixmatch as primary lyrics source (not a fallback)
+        # 3) MUSIXMATCH: lyrics source (primary, not fallback)
         if MUSIX and artist and title:
             track_id = musixmatch_search_track_by_artist_title(artist, title, MUSIX)
             if track_id:
@@ -251,19 +251,28 @@ def main():
                     out = TXT_DIR / f"{slug}.txt"
                     out.write_text(lyr, encoding="utf-8")
                     log("Lyrics", f"Lyrics saved → {out}", GREEN)
-                    print(json.dumps({"ok": True, "slug": slug, "lyrics_path": str(out)}))
+                    print(
+                        json.dumps(
+                            {
+                                "ok": True,
+                                "slug": slug,
+                                "lyrics_path": str(out),
+                            }
+                        )
+                    )
                     return
                 else:
-                    log("Lyrics", "Musixmatch: lyrics_body empty", YELLOW)
+                    log("Lyrics", "Musixmatch: lyrics_body empty or missing.", YELLOW)
             else:
-                log("Lyrics", "Musixmatch: no matching track for artist/title", YELLOW)
-        elif not MUSIX:
-            log("Lyrics", "MUSIXMATCH_API_KEY not set; cannot fetch lyrics.", RED)
+                log("Lyrics", "Musixmatch: No track_id", YELLOW)
         else:
-            log("Lyrics", "No usable artist/title for Musixmatch search.", YELLOW)
+            if not MUSIX:
+                log("Lyrics", "MUSIXMATCH_API_KEY not set; cannot fetch lyrics.", RED)
+            if not (artist and title):
+                log("Lyrics", "No usable artist/title for Musixmatch search.", RED)
 
-        # Step 4: FAIL HARD (no silent 'lyrics not found' videos)
-        log("Lyrics", "No lyrics found via Musixmatch. FAILING HARD.", RED)
+        # 4) FAIL HARD if we reach here
+        log("Lyrics", "No lyrics found. FAILING HARD.", RED)
         print(json.dumps({"ok": False, "slug": slug, "error": "lyrics-not-found"}))
         sys.exit(1)
 
@@ -296,15 +305,23 @@ def main():
         if not artist:
             artist = "Unknown Artist"
         if not title:
-            # slug should always exist here, but guard anyway
-            fallback = slug or (slugify(query) if query else "song")
-            title = fallback.replace("_", " ").title()
+            title = slug.replace("_", " ").title()
 
         mp = META_DIR / f"{slug}.json"
         write_json(mp, {"slug": slug, "artist": artist, "title": title})
 
         log("Meta", f"Artist={artist}, Title={title}", GREEN)
-        print(json.dumps({"ok": True, "slug": slug, "artist": artist, "title": title, "meta_path": str(mp)}))
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "slug": slug,
+                    "artist": artist,
+                    "title": title,
+                    "meta_path": str(mp),
+                }
+            )
+        )
         return
 
     # ------------------------------------------------------------------
@@ -318,7 +335,16 @@ def main():
         final = MP3_DIR / f"{slug}.mp3"
         if final.exists():
             log("MP3", f"MP3 already exists: {final}", GREEN)
-            print(json.dumps({"ok": True, "slug": slug, "mp3_path": str(final), "video_id": None}))
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "slug": slug,
+                        "mp3_path": str(final),
+                        "video_id": None,
+                    }
+                )
+            )
             return
 
         tmp = TMP_DIR / f"{slug}.mp3"
@@ -341,10 +367,20 @@ def main():
 
         tmp.rename(final)
         log("MP3", f"Downloaded MP3: {final}", GREEN)
-        print(json.dumps({"ok": True, "slug": slug, "mp3_path": str(final), "video_id": None}))
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "slug": slug,
+                    "mp3_path": str(final),
+                    "video_id": None,
+                }
+            )
+        )
         return
 
 
 if __name__ == "__main__":
     main()
+
 # end of scripts/2_download.py
