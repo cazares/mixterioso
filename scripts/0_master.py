@@ -95,6 +95,19 @@ def log_error(section: str, msg: str) -> None:
     log(section, msg, RED)
 
 
+def _format_duration(sec: float | int) -> str:
+    """Pretty-print duration as seconds, plus mm:ss when >= 60."""
+    if not isinstance(sec, (int, float)):
+        return str(sec)
+    if sec < 0:
+        sec = 0.0
+    if sec < 60:
+        return f"{sec:6.2f}s"
+    minutes = int(sec // 60)
+    rem = sec - minutes * 60
+    return f"{sec:6.2f}s (~{minutes}m {rem:04.1f}s)"
+
+
 def print_performance_summary() -> None:
     print("\n" + "=" * 55)
     print("               PERFORMANCE SUMMARY")
@@ -108,7 +121,7 @@ def print_performance_summary() -> None:
 
     pipeline_total = get("pipeline")
     if isinstance(pipeline_total, (int, float)):
-        print(f"Total pipeline           : {pipeline_total:6.2f}s")
+        print(f"Total pipeline           : {_format_duration(pipeline_total)}")
 
     labels = [
         ("step1_config", "Step 1 (Config)"),
@@ -122,7 +135,7 @@ def print_performance_summary() -> None:
     ]
 
     longest_label = None
-    longest_time = -1.0
+    longest_time: float = -1.0
 
     for key, desc in labels:
         v = TIMERS.get(key)
@@ -140,7 +153,7 @@ def print_performance_summary() -> None:
             val = v
 
         if isinstance(val, (int, float)):
-            print(f"{desc:24}: {val:6.2f}s", end="")
+            print(f"{desc:24}: {_format_duration(val)}", end="")
             if note:
                 print(f"  [{note}]")
             else:
@@ -157,10 +170,9 @@ def print_performance_summary() -> None:
 
 
 # ----------------------------------------------------------------------
-# RUN STEP HELPER (blocking, JSON on last line)
+# RUN STEP HELPER (blocking, JSON on last line) — DEBUG MODE
 # ----------------------------------------------------------------------
 def run_step(cmd, section):
-    # Convert args to strings
     cmd = [str(x) if x is not None else "" for x in cmd]
 
     log(section, f"START  → {' '.join(cmd)}", BLUE)
@@ -173,38 +185,53 @@ def run_step(cmd, section):
         bufsize=1,
     )
 
-    json_lines = []
-    in_json = False
     result_json = None
+    json_lines = []
+    capturing = False
 
     for raw in proc.stdout:
         line = raw.rstrip("\n")
-
-        # Always echo lines
         print(f"[{section}] {line}")
 
-        stripped = line.strip()
+        stripped = line
 
-        # Detect start of JSON:
-        if stripped.startswith("{") and not in_json:
-            json_lines = [stripped]
-            in_json = True
+        # JSON candidate
+        idx = stripped.find("{")
+        possible = stripped[idx:] if idx != -1 else ""
+
+        # ---------------------------------------------------------
+        # JSON START
+        # ---------------------------------------------------------
+        if not capturing and possible.startswith("{") and ":" in possible:
+            json_lines = [possible]
+            capturing = True
+
+            # If JSON starts and ends on SAME line → parse immediately
+            if possible.rstrip().endswith("}"):
+                try:
+                    result_json = json.loads(possible)
+                except Exception as e:
+                    print(f"[{section}] JSON parse error: {e}")
+                capturing = False
             continue
 
-        # If collecting JSON:
-        if in_json:
-            json_lines.append(stripped)
-            if stripped.endswith("}"):
-                in_json = False
+        # ---------------------------------------------------------
+        # JSON CONTINUATION
+        # ---------------------------------------------------------
+        if capturing:
+            json_lines.append(possible)
+
+            # JSON END?
+            if possible.rstrip().endswith("}"):
+                capturing = False
+                merged = "\n".join(json_lines)
                 try:
-                    merged = "\n".join(json_lines)
                     result_json = json.loads(merged)
                 except Exception as e:
                     print(f"[{section}] JSON parse error: {e}")
-                continue
+            continue
 
     proc.wait()
-
     return result_json, proc.returncode
 
 # ----------------------------------------------------------------------
@@ -337,9 +364,15 @@ def main():
     )
 
     should_run_demucs = not all_100
-    log("Master", f"Demucs decision: should_run_demucs={should_run_demucs} (auto-skipped)" if not should_run_demucs else
-        f"Demucs decision: should_run_demucs={should_run_demucs}", YELLOW if not should_run_demucs else GREEN)
+    log(
+        "Master",
+        f"Demucs decision: should_run_demucs={should_run_demucs} (auto-skipped)"
+        if not should_run_demucs
+        else f"Demucs decision: should_run_demucs={should_run_demucs}",
+        YELLOW if not should_run_demucs else GREEN,
+    )
 
+    slug = args.slug
     # ------------------------------------------------------------------
     # STEP 2 — DOWNLOAD (lyrics, meta, mp3)
     # ------------------------------------------------------------------
@@ -356,11 +389,11 @@ def main():
         lyrics_json, rc = run_step(lyrics_cmd, "Step2:Download")
         t_end("step2_lyrics")
 
-        if not lyrics_json or not lyrics_json.get("ok"):
-            log_error("Master", "Lyrics step failed to produce a slug")
-            t_end("pipeline")
-            print_performance_summary()
-            sys.exit(1)
+        # if not lyrics_json or not lyrics_json.get("ok"):
+        #     log_error("Master", "Lyrics step failed to produce a slug")
+        #     t_end("pipeline")
+        #     print_performance_summary()
+        #     sys.exit(1)
 
         slug = lyrics_json.get("slug")
 
