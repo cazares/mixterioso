@@ -170,22 +170,9 @@ def print_performance_summary() -> None:
 
 
 # ----------------------------------------------------------------------
-# RUN STEP HELPER (blocking, parses JSON from child script)
+# RUN STEP HELPER (blocking, JSON on last line)
 # ----------------------------------------------------------------------
 def run_step(cmd, section):
-    """
-    Run a subprocess, stream logs, and capture the LAST JSON object
-    printed by the child script.
-
-    Supports:
-      - Single-line JSON:
-            {"ok": true, "slug": "..."}
-      - Multi-line pretty JSON:
-            {
-              "ok": true,
-              ...
-            }
-    """
     cmd = [str(x) if x is not None else "" for x in cmd]
 
     log(section, f"START  → {' '.join(cmd)}", BLUE)
@@ -198,54 +185,58 @@ def run_step(cmd, section):
         bufsize=1,
     )
 
-    result_json = None
-    capturing = False
     json_lines: list[str] = []
+    capturing = False
+    result_json = None
 
     for raw in proc.stdout:
         line = raw.rstrip("\n")
-        print(f"[{section}] {line}")  # always echo child's line
+        print(f"[{section}] {line}")  # always echo
 
-        stripped = line.strip()
+        # Extract JSON payload only (strip away logging prefixes etc.)
+        idx = line.find("{")
+        if idx != -1:
+            possible_json = line[idx:].strip()
+        else:
+            possible_json = ""
 
-        # ---------------------------------------------------------
-        # CASE 1: not currently capturing JSON
-        # ---------------------------------------------------------
-        if not capturing:
-            # Single-line JSON candidate: { ... } with at least one colon
-            if stripped.startswith("{") and stripped.endswith("}") and ":" in stripped:
+        # Detect start of JSON block
+        # Rule: must start with "{" and contain ":" on that same line
+        if not capturing and possible_json.startswith("{") and ":" in possible_json:
+            json_lines = [possible_json]
+            capturing = True
+
+            # Handle single-line JSON immediately
+            if possible_json.endswith("}"):
                 try:
-                    result_json = json.loads(stripped)
+                    result_json = json.loads(possible_json)
                 except Exception as e:
                     print(f"[{section}] JSON parse error (single-line): {e}")
-                continue
-
-            # Multi-line JSON start: bare "{"
-            if stripped == "{":
-                capturing = True
-                json_lines = ["{"]
-                continue
-
-            # Otherwise, just a normal log line
+                    result_json = None
+                capturing = False
             continue
 
-        # ---------------------------------------------------------
-        # CASE 2: currently capturing multi-line JSON
-        # ---------------------------------------------------------
-        json_lines.append(stripped)
+        # Continue capturing multi-line JSON, if any
+        if capturing:
+            json_lines.append(possible_json)
 
-        # End of JSON block: bare "}"
-        if stripped == "}":
-            capturing = False
-            merged = "\n".join(json_lines)
-            try:
-                result_json = json.loads(merged)
-            except Exception as e:
-                print(f"[{section}] JSON parse error (multi-line): {e}")
-            json_lines = []
-            continue
+            # End of JSON block
+            if possible_json.endswith("}"):
+                capturing = False
+                try:
+                    merged = "\n".join(json_lines)
+                    result_json = json.loads(merged)
+                except Exception as e:
+                    print(f"[{section}] JSON parse error (multi-line): {e}")
+                    result_json = None
+                continue
 
     proc.wait()
+
+    # Optional safety log if a step that SHOULD emit JSON did not
+    if result_json is None:
+        print(f"[{section}] WARNING: No JSON captured from command (returncode={proc.returncode})")
+
     return result_json, proc.returncode
 
 
@@ -405,7 +396,7 @@ def main():
         t_end("step2_lyrics")
 
         if not lyrics_json or not lyrics_json.get("ok"):
-            log_error("Master", "Lyrics step failed to produce a slug")
+            log_error("Master", f"Lyrics step failed: json={lyrics_json}, rc={rc}")
             t_end("pipeline")
             print_performance_summary()
             sys.exit(1)
@@ -434,7 +425,7 @@ def main():
     t_end("step2_meta")
 
     if not meta_json or not meta_json.get("ok"):
-        log_error("Master", "Metadata step failed.")
+        log_error("Master", f"Metadata step failed: json={meta_json}, rc={rc}")
         t_end("pipeline")
         print_performance_summary()
         sys.exit(1)
@@ -455,7 +446,7 @@ def main():
     t_end("step2_mp3")
 
     if not mp3_json or not mp3_json.get("ok"):
-        log_error("Master", "MP3 download step failed.")
+        log_error("Master", f"MP3 download step failed: json={mp3_json}, rc={rc}")
         t_end("pipeline")
         print_performance_summary()
         sys.exit(1)
@@ -501,7 +492,7 @@ def main():
         )
         t_end("step3_mix")
         if not mix_json or not mix_json.get("ok"):
-            log("Master", "Mixing failed!", RED)
+            log("Master", f"Mixing failed! json={mix_json}, rc={rc}", RED)
             t_end("pipeline")
             print_performance_summary()
             sys.exit(1)
@@ -528,8 +519,6 @@ def main():
 
     # Optionally confirm WhisperX proc exit code
     if whisper_proc is not None:
-        # At this point the timings CSV already exists, so 4_merge.py
-        # should be finishing up. Wait for it to exit without a hard timeout.
         whisper_rc = whisper_proc.wait()
         if whisper_rc != 0:
             log("Master", f"WhisperX process exited with code {whisper_rc}", YELLOW)
@@ -546,9 +535,6 @@ def main():
         "scripts/5_gen.py",
         "--slug", base_filename,
         "--offset", str(offset),
-        # "--profile", selected_mode,
-        # "--artist", artist,
-        # "--title", title,
     ]
     if args.passthrough:
         gen_cmd.extend(["--pass", *args.passthrough])
@@ -557,7 +543,7 @@ def main():
     t_end("step5_gen")
 
     if not gen_json or not gen_json.get("ok"):
-        log("Master", "MP4 generation failed!", RED)
+        log("Master", f"MP4 generation failed! json={gen_json}, rc={rc}", RED)
         t_end("pipeline")
         print_performance_summary()
         sys.exit(1)
@@ -594,7 +580,7 @@ def main():
     t_end("step6_upload")
 
     if not upload_json or not upload_json.get("ok"):
-        log("Master", "Upload step failed.", RED)
+        log("Master", f"Upload step failed. json={upload_json}, rc={rc}", RED)
         t_end("pipeline")
         print_performance_summary()
         sys.exit(1)
