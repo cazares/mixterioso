@@ -65,12 +65,10 @@ def t_end(label: str, note: str | None = None) -> None:
         elapsed = time.time() - start
         TIMERS[label] = elapsed if note is None else (elapsed, note)
     else:
-        # no start recorded, treat as 0
         elapsed = 0.0
         TIMERS[label] = elapsed if note is None else (elapsed, note)
 
     if note:
-        # Store note alongside duration as a tuple: (seconds, note)
         val = TIMERS[label]
         TIMERS[label] = (val, note)
 
@@ -144,7 +142,6 @@ def print_performance_summary() -> None:
             continue
         note = None
         if isinstance(v, tuple):
-            # (value, note) or ((value, note), extra_note)
             if isinstance(v[0], tuple):
                 val, note = v[0]
             else:
@@ -173,6 +170,18 @@ def print_performance_summary() -> None:
 # RUN STEP HELPER (blocking, JSON on last line)
 # ----------------------------------------------------------------------
 def run_step(cmd, section):
+    """
+    Run a subprocess, stream its output with a step prefix, and try to parse
+    a JSON object printed by the child.
+
+    Supports both:
+      - single-line JSON: {"ok": true, ...}
+      - pretty multi-line JSON:
+        {
+          "ok": true,
+          ...
+        }
+    """
     cmd = [str(x) if x is not None else "" for x in cmd]
 
     log(section, f"START  → {' '.join(cmd)}", BLUE)
@@ -185,55 +194,50 @@ def run_step(cmd, section):
         bufsize=1,
     )
 
+    result_json = None
     json_lines: list[str] = []
     capturing = False
-    result_json = None
+    brace_depth = 0
 
     for raw in proc.stdout:
         line = raw.rstrip("\n")
-        print(f"[{section}] {line}")  # always echo
+        print(f"[{section}] {line}")
+        stripped = line.strip()
 
-        # Extract JSON payload only (strip away logging prefixes etc.)
-        idx = line.find("{")
-        if idx != -1:
-            possible_json = line[idx:].strip()
-        else:
-            possible_json = ""
-
-        # Detect start of JSON block
-        # Rule: must start with "{" and contain ":" on that same line
-        if not capturing and possible_json.startswith("{") and ":" in possible_json:
-            json_lines = [possible_json]
-            capturing = True
-
-            # Handle single-line JSON immediately
-            if possible_json.endswith("}"):
-                try:
-                    result_json = json.loads(possible_json)
-                except Exception as e:
-                    print(f"[{section}] JSON parse error (single-line): {e}")
-                    result_json = None
-                capturing = False
-            continue
-
-        # Continue capturing multi-line JSON, if any
+        # If we're already inside a JSON block, keep accumulating
         if capturing:
-            json_lines.append(possible_json)
-
-            # End of JSON block
-            if possible_json.endswith("}"):
+            json_lines.append(stripped)
+            brace_depth += stripped.count("{") - stripped.count("}")
+            if brace_depth <= 0:
                 capturing = False
                 try:
                     merged = "\n".join(json_lines)
                     result_json = json.loads(merged)
                 except Exception as e:
-                    print(f"[{section}] JSON parse error (multi-line): {e}")
+                    print(f"[{section}] JSON parse error: {e}")
                     result_json = None
+            continue
+
+        # Not currently capturing — see if this line starts JSON
+        if "{" in stripped:
+            idx = stripped.find("{")
+            possible_json = stripped[idx:]
+            if possible_json.startswith("{"):
+                json_lines = [possible_json]
+                capturing = True
+                brace_depth = possible_json.count("{") - possible_json.count("}")
+                # Single-line JSON
+                if brace_depth <= 0:
+                    capturing = False
+                    try:
+                        result_json = json.loads(possible_json)
+                    except Exception as e:
+                        print(f"[{section}] JSON parse error: {e}")
+                        result_json = None
                 continue
 
     proc.wait()
 
-    # Optional safety log if a step that SHOULD emit JSON did not
     if result_json is None:
         print(f"[{section}] WARNING: No JSON captured from command (returncode={proc.returncode})")
 
@@ -479,7 +483,7 @@ def main():
 
     # ------------------------------------------------------------------
     # STEP 3 — MIX (Demucs), OPTIONAL
-    # ----------------------------------------------
+    # ------------------------------------------------------------------
     if should_run_demucs:
         t_start("step3_mix")
         mix_json, rc = run_step(

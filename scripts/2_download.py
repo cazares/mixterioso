@@ -24,18 +24,18 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
-RESET="\033[0m"
-CYAN="\033[36m"
-GREEN="\033[32m"
-YELLOW="\033[33m"
-RED="\033[31m"
-BLUE="\033[34m"
+RESET = "\033[0m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+BLUE = "\033[34m"
 
 BASE = Path(__file__).resolve().parent.parent
-TXT_DIR   = BASE / "txts"
-MP3_DIR   = BASE / "mp3s"
-META_DIR  = BASE / "meta"
-TMP_DIR   = BASE / "tmp"
+TXT_DIR = BASE / "txts"
+MP3_DIR = BASE / "mp3s"
+META_DIR = BASE / "meta"
+TMP_DIR = BASE / "tmp"
 
 TXT_DIR.mkdir(exist_ok=True)
 MP3_DIR.mkdir(exist_ok=True)
@@ -59,6 +59,7 @@ def slugify(text):
     s = re.sub(r"[^\w\s-]", "", s)
     s = re.sub(r"\s+", "_", s)
     return s[:200] or "song"
+
 
 def write_json(path, data):
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -97,7 +98,9 @@ def clean_youtube_title(artist, title):
 # MUSIXMATCH
 # ======================================================================
 def musixmatch_search_track_by_artist_title(artist, title, api_key):
-    import urllib.parse, urllib.request
+    import urllib.parse
+    import urllib.request
+
     params = {
         "q_track": title,
         "q_artist": artist,
@@ -118,7 +121,9 @@ def musixmatch_search_track_by_artist_title(artist, title, api_key):
 
 
 def musixmatch_fetch_lyrics(track_id, api_key):
-    import urllib.parse, urllib.request
+    import urllib.parse
+    import urllib.request
+
     url = (
         "https://api.musixmatch.com/ws/1.1/track.lyrics.get?"
         + urllib.parse.urlencode({"track_id": track_id, "apikey": api_key})
@@ -136,10 +141,11 @@ def musixmatch_fetch_lyrics(track_id, api_key):
 
 
 # ======================================================================
-# GENIUS (METADATA ONLY — LAST FALLBACK)
+# GENIUS (METADATA)
 # ======================================================================
 def genius_search(query, token):
     import requests
+
     headers = {"Authorization": f"Bearer {token}"}
     url = "https://api.genius.com/search"
     try:
@@ -155,7 +161,7 @@ def genius_search(query, token):
 
 
 # ======================================================================
-# YOUTUBE METADATA (PRIMARY SOURCE)
+# YOUTUBE METADATA
 # ======================================================================
 def youtube_metadata(query):
     cmd = ["yt-dlp", "--dump-json", f"ytsearch1:{query}"]
@@ -167,7 +173,7 @@ def youtube_metadata(query):
 
     # Music metadata direct fields
     artist = data.get("artist")
-    track  = data.get("track")
+    track = data.get("track")
     if artist and track:
         return artist.strip(), track.strip()
 
@@ -213,41 +219,51 @@ def main():
 
         log("Lyrics", f"Searching lyrics for query: {query}")
 
-        # 1) YouTube metadata FIRST
+        # Step 1: Genius metadata (preferred source for artist/title)
         artist, title = None, None
-        yta, ytt = youtube_metadata(query)
-        if yta and ytt:
-            artist, title = clean_youtube_title(yta, ytt)
-            log("Lyrics", f"YouTube metadata → {artist} - {title}", YELLOW)
-
-        # 2) Musixmatch SECOND
-        if MUSIX:
-            if artist and title:
-                track_id = musixmatch_search_track_by_artist_title(artist, title, MUSIX)
-                if track_id:
-                    log("Lyrics", f"Musixmatch track_id={track_id}", GREEN)
-                    lyr = musixmatch_fetch_lyrics(track_id, MUSIX)
-                    if lyr:
-                        out = TXT_DIR / f"{slug}.txt"
-                        out.write_text(lyr, encoding="utf-8")
-                        log("Lyrics", f"Lyrics saved → {out}", GREEN)
-                        print(json.dumps({"ok": True, "slug": slug, "lyrics_path": str(out)}))
-                        return
-                else:
-                    log("Lyrics", "Musixmatch: No track_id", YELLOW)
-            else:
-                log("Lyrics", "YouTube gave no usable artist/title; Musixmatch search skipped.", YELLOW)
-        else:
-            log("Lyrics", "MUSIXMATCH_API_KEY not set; skipping Musixmatch.", RED)
-
-        # 3) Genius LAST (metadata only)
         if GENIUS:
             ga, gt = genius_search(query, GENIUS)
             if ga and gt:
-                log("Lyrics", f"Genius metadata → {ga} - {gt}", BLUE)
+                artist = ga.strip()
+                title = gt.strip()
+                log("Lyrics", f"Genius metadata → {artist} - {title}", BLUE)
+        else:
+            log("Lyrics", "GENIUS_ACCESS_TOKEN not set; skipping Genius.", YELLOW)
 
-        # 4) FAIL HARD
-        log("Lyrics", "No lyrics found. FAILING HARD.", RED)
+        # Step 2: YouTube metadata as backup / enhancer
+        if not artist or not title:
+            yta, ytt = youtube_metadata(query)
+            if yta and ytt:
+                yta_clean, ytt_clean = clean_youtube_title(yta, ytt)
+                log("Lyrics", f"YouTube metadata → {yta_clean} - {ytt_clean}", YELLOW)
+                if not artist:
+                    artist = yta_clean
+                if not title:
+                    title = ytt_clean
+
+        # Step 3: Musixmatch as primary lyrics source (not a fallback)
+        if MUSIX and artist and title:
+            track_id = musixmatch_search_track_by_artist_title(artist, title, MUSIX)
+            if track_id:
+                log("Lyrics", f"Musixmatch track_id={track_id}", GREEN)
+                lyr = musixmatch_fetch_lyrics(track_id, MUSIX)
+                if lyr:
+                    out = TXT_DIR / f"{slug}.txt"
+                    out.write_text(lyr, encoding="utf-8")
+                    log("Lyrics", f"Lyrics saved → {out}", GREEN)
+                    print(json.dumps({"ok": True, "slug": slug, "lyrics_path": str(out)}))
+                    return
+                else:
+                    log("Lyrics", "Musixmatch: lyrics_body empty", YELLOW)
+            else:
+                log("Lyrics", "Musixmatch: no matching track for artist/title", YELLOW)
+        elif not MUSIX:
+            log("Lyrics", "MUSIXMATCH_API_KEY not set; cannot fetch lyrics.", RED)
+        else:
+            log("Lyrics", "No usable artist/title for Musixmatch search.", YELLOW)
+
+        # Step 4: FAIL HARD (no silent 'lyrics not found' videos)
+        log("Lyrics", "No lyrics found via Musixmatch. FAILING HARD.", RED)
         print(json.dumps({"ok": False, "slug": slug, "error": "lyrics-not-found"}))
         sys.exit(1)
 
@@ -273,14 +289,16 @@ def main():
             ga, gt = genius_search(query, GENIUS)
             if ga and gt:
                 artist = artist or ga
-                title  = title  or gt
+                title = title or gt
                 log("Meta", f"Genius metadata → {artist} - {title}", BLUE)
 
         # Last fallback
         if not artist:
             artist = "Unknown Artist"
         if not title:
-            title = slug.replace("_", " ").title()
+            # slug should always exist here, but guard anyway
+            fallback = slug or (slugify(query) if query else "song")
+            title = fallback.replace("_", " ").title()
 
         mp = META_DIR / f"{slug}.json"
         write_json(mp, {"slug": slug, "artist": artist, "title": title})
@@ -306,9 +324,12 @@ def main():
         tmp = TMP_DIR / f"{slug}.mp3"
         cmd = [
             "yt-dlp",
-            "-x", "--audio-format", "mp3",
-            "-o", str(tmp),
-            f"ytsearch1:{slug}"
+            "-x",
+            "--audio-format",
+            "mp3",
+            "-o",
+            str(tmp),
+            f"ytsearch1:{slug}",
         ]
         log("MP3", f"Running yt-dlp: {' '.join(cmd)}", BLUE)
         try:
@@ -326,3 +347,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# end of scripts/2_download.py
