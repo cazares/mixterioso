@@ -160,13 +160,11 @@ def print_performance_summary() -> None:
 # RUN STEP HELPER (blocking, JSON on last line)
 # ----------------------------------------------------------------------
 def run_step(cmd, section):
-    """
-    Run a subprocess step synchronously, streaming its logs,
-    and return (json_obj, returncode).
+    # Convert args to strings
+    cmd = [str(x) if x is not None else "" for x in cmd]
 
-    Expects the last line of stdout to be a JSON object.
-    """
     log(section, f"START  → {' '.join(cmd)}", BLUE)
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -174,24 +172,40 @@ def run_step(cmd, section):
         text=True,
         bufsize=1,
     )
-    last_line = None
-    for line in proc.stdout:
-        stripped = line.rstrip()
-        last_line = stripped
-        print(f"{CYAN}[{section}]{RESET} {stripped}", flush=True)
-    proc.stdout.close()
+
+    json_lines = []
+    in_json = False
+    result_json = None
+
+    for raw in proc.stdout:
+        line = raw.rstrip("\n")
+
+        # Always echo lines
+        print(f"[{section}] {line}")
+
+        stripped = line.strip()
+
+        # Detect start of JSON:
+        if stripped.startswith("{") and not in_json:
+            json_lines = [stripped]
+            in_json = True
+            continue
+
+        # If collecting JSON:
+        if in_json:
+            json_lines.append(stripped)
+            if stripped.endswith("}"):
+                in_json = False
+                try:
+                    merged = "\n".join(json_lines)
+                    result_json = json.loads(merged)
+                except Exception as e:
+                    print(f"[{section}] JSON parse error: {e}")
+                continue
+
     proc.wait()
-    rc = proc.returncode
-    log(section, f"END (exit={rc})", BLUE)
 
-    json_obj = None
-    if last_line:
-        try:
-            json_obj = json.loads(last_line)
-        except Exception:
-            json_obj = None
-    return json_obj, rc
-
+    return result_json, proc.returncode
 
 # ----------------------------------------------------------------------
 # ASYNC LAUNCH (for WhisperX step)
@@ -500,7 +514,11 @@ def main():
         print_performance_summary()
         sys.exit(1)
 
-    mp4_path = gen_json.get("mp4_path")
+    mp4_path = (
+        gen_json.get("file")
+        or gen_json.get("mp4")
+        or gen_json.get("mp4_path")
+    )
     log("Master", f"MP4 generated at: {mp4_path}", GREEN)
 
     # ------------------------------------------------------------------
@@ -517,8 +535,8 @@ def main():
     upload_cmd = [
         "python3",
         "scripts/6_upload.py",
-        "--mp4", mp4_path,
-        "--base-filename", base_filename,
+        "--file", mp4_path,
+        "--slug", base_filename,
         "--title", title,
     ]
     if args.passthrough:
