@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from dotenv import load_dotenv
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -35,7 +36,8 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 BLUE = "\033[34m"
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = REPO_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(REPO_ROOT / ".env")
 TXT_DIR = BASE_DIR / "txts"
 MP3_DIR = BASE_DIR / "mp3s"
 TIMINGS_DIR = BASE_DIR / "timings"
@@ -515,8 +517,8 @@ def main():
     upload_cmd = [
         "python3",
         "scripts/6_upload.py",
-        "--file", mp4_path,
-        "--artist", artist,
+        "--mp4", mp4_path,
+        "--base-filename", base_filename,
         "--title", title,
     ]
     if args.passthrough:
