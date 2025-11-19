@@ -482,11 +482,11 @@ def main():
     gen_cmd = [
         "python3",
         "scripts/5_gen.py",
-        "--base-filename", base_filename,
+        "--slug", base_filename,
         "--offset", str(offset),
-        "--profile", selected_mode,
-        "--artist", artist,
-        "--title", title,
+        # "--profile", selected_mode,
+        # "--artist", artist,
+        # "--title", title,
     ]
     if args.passthrough:
         gen_cmd.extend(["--pass", *args.passthrough])
