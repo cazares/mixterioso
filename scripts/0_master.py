@@ -170,9 +170,22 @@ def print_performance_summary() -> None:
 
 
 # ----------------------------------------------------------------------
-# RUN STEP HELPER (blocking, JSON on last line) — DEBUG MODE
+# RUN STEP HELPER (blocking, parses JSON from child script)
 # ----------------------------------------------------------------------
 def run_step(cmd, section):
+    """
+    Run a subprocess, stream logs, and capture the LAST JSON object
+    printed by the child script.
+
+    Supports:
+      - Single-line JSON:
+            {"ok": true, "slug": "..."}
+      - Multi-line pretty JSON:
+            {
+              "ok": true,
+              ...
+            }
+    """
     cmd = [str(x) if x is not None else "" for x in cmd]
 
     log(section, f"START  → {' '.join(cmd)}", BLUE)
@@ -186,53 +199,55 @@ def run_step(cmd, section):
     )
 
     result_json = None
-    json_lines = []
     capturing = False
+    json_lines: list[str] = []
 
     for raw in proc.stdout:
         line = raw.rstrip("\n")
-        print(f"[{section}] {line}")
+        print(f"[{section}] {line}")  # always echo child's line
 
-        stripped = line
-
-        # JSON candidate
-        idx = stripped.find("{")
-        possible = stripped[idx:] if idx != -1 else ""
+        stripped = line.strip()
 
         # ---------------------------------------------------------
-        # JSON START
+        # CASE 1: not currently capturing JSON
         # ---------------------------------------------------------
-        if not capturing and possible.startswith("{") and ":" in possible:
-            json_lines = [possible]
-            capturing = True
-
-            # If JSON starts and ends on SAME line → parse immediately
-            if possible.rstrip().endswith("}"):
+        if not capturing:
+            # Single-line JSON candidate: { ... } with at least one colon
+            if stripped.startswith("{") and stripped.endswith("}") and ":" in stripped:
                 try:
-                    result_json = json.loads(possible)
+                    result_json = json.loads(stripped)
                 except Exception as e:
-                    print(f"[{section}] JSON parse error: {e}")
-                capturing = False
+                    print(f"[{section}] JSON parse error (single-line): {e}")
+                continue
+
+            # Multi-line JSON start: bare "{"
+            if stripped == "{":
+                capturing = True
+                json_lines = ["{"]
+                continue
+
+            # Otherwise, just a normal log line
             continue
 
         # ---------------------------------------------------------
-        # JSON CONTINUATION
+        # CASE 2: currently capturing multi-line JSON
         # ---------------------------------------------------------
-        if capturing:
-            json_lines.append(possible)
+        json_lines.append(stripped)
 
-            # JSON END?
-            if possible.rstrip().endswith("}"):
-                capturing = False
-                merged = "\n".join(json_lines)
-                try:
-                    result_json = json.loads(merged)
-                except Exception as e:
-                    print(f"[{section}] JSON parse error: {e}")
+        # End of JSON block: bare "}"
+        if stripped == "}":
+            capturing = False
+            merged = "\n".join(json_lines)
+            try:
+                result_json = json.loads(merged)
+            except Exception as e:
+                print(f"[{section}] JSON parse error (multi-line): {e}")
+            json_lines = []
             continue
 
     proc.wait()
     return result_json, proc.returncode
+
 
 # ----------------------------------------------------------------------
 # ASYNC LAUNCH (for WhisperX step)
@@ -389,11 +404,11 @@ def main():
         lyrics_json, rc = run_step(lyrics_cmd, "Step2:Download")
         t_end("step2_lyrics")
 
-        # if not lyrics_json or not lyrics_json.get("ok"):
-        #     log_error("Master", "Lyrics step failed to produce a slug")
-        #     t_end("pipeline")
-        #     print_performance_summary()
-        #     sys.exit(1)
+        if not lyrics_json or not lyrics_json.get("ok"):
+            log_error("Master", "Lyrics step failed to produce a slug")
+            t_end("pipeline")
+            print_performance_summary()
+            sys.exit(1)
 
         slug = lyrics_json.get("slug")
 
