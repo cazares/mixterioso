@@ -14,18 +14,21 @@
 # New behavior:
 # - As soon as lyrics + mp3 are ready (end of Step 2), launch 4_merge.py ASYNC.
 # - WhisperX ALWAYS uses mp3s/<slug>.mp3 for alignment (not stems).
-# - Demucs (3_mix.py) runs ONLY if needed (volumes != 100 or forced).
-# - Full timing instrumentation + performance summary at the end.
+# - Demucs can run in parallel with WhisperX (if needed).
+# - Master waits for timings CSV before Step 5.
+# - Always prints performance summary at the end.
 
+import argparse
+import json
+import os
 import subprocess
 import sys
-import json
-import shlex
-import time
 import threading
+import time
 from pathlib import Path
 
 RESET = "\033[0m"
+BOLD = "\033[1m"
 CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
@@ -33,27 +36,37 @@ RED = "\033[31m"
 BLUE = "\033[34m"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+TXT_DIR = BASE_DIR / "txts"
+MP3_DIR = BASE_DIR / "mp3s"
 TIMINGS_DIR = BASE_DIR / "timings"
+MIXES_DIR = BASE_DIR / "mixes"
+OUTPUT_DIR = BASE_DIR / "output"
+META_DIR = BASE_DIR / "meta"
 
-# ----------------------------------------------------------------------
-# TIMING HELPERS
-# ----------------------------------------------------------------------
-TIMERS = {}
+TIMINGS_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+META_DIR.mkdir(exist_ok=True)
+
+# -------------------------------------------------
+# Simple timing/performance bookkeeping
+# -------------------------------------------------
+TIMERS: dict[str, float | tuple[float, str]] = {}
 
 
 def t_start(label: str) -> None:
-    """Mark the start time of a timed section."""
     TIMERS[label] = time.time()
 
 
 def t_end(label: str, note: str | None = None) -> None:
-    """Mark the end time of a timed section."""
-    start = TIMERS.get(label)
-    if isinstance(start, (int, float)):
-        TIMERS[label] = time.time() - start
+    if label in TIMERS and isinstance(TIMERS[label], (int, float)):
+        start = float(TIMERS[label])
+        elapsed = time.time() - start
+        TIMERS[label] = elapsed if note is None else (elapsed, note)
     else:
-        # If there was no start, record zero but keep any note.
-        TIMERS[label] = 0.0
+        # no start recorded, treat as 0
+        elapsed = 0.0
+        TIMERS[label] = elapsed if note is None else (elapsed, note)
+
     if note:
         # Store note alongside duration as a tuple: (seconds, note)
         val = TIMERS[label]
@@ -68,21 +81,90 @@ def t_mark(label: str, value: float | str, note: str | None = None) -> None:
         TIMERS[label] = value
 
 
-# ----------------------------------------------------------------------
-# LOGGING
-# ----------------------------------------------------------------------
-def log(section, msg, color=CYAN):
+# -------------------------------------------------
+# Logging helpers
+# -------------------------------------------------
+def log(section: str, msg: str, color: str = CYAN) -> None:
     ts = time.strftime("%H:%M:%S")
-    print(f"{color}[{ts}] [{section}]{RESET} {msg}")
+    print(f"{color}[{ts}] [{section}]{RESET} {msg}", flush=True)
+
+
+def log_error(section: str, msg: str) -> None:
+    log(section, msg, RED)
+
+
+def print_performance_summary() -> None:
+    print("\n" + "=" * 55)
+    print("               PERFORMANCE SUMMARY")
+    print("=" * 55)
+
+    def get(label, default=None):
+        v = TIMERS.get(label, default)
+        if isinstance(v, tuple):
+            return v[0]
+        return v
+
+    pipeline_total = get("pipeline")
+    if isinstance(pipeline_total, (int, float)):
+        print(f"Total pipeline           : {pipeline_total:6.2f}s")
+
+    labels = [
+        ("step1_config", "Step 1 (Config)"),
+        ("step2_lyrics", "Step 2a (Lyrics)"),
+        ("step2_meta",   "Step 2b (Meta)"),
+        ("step2_mp3",    "Step 2c (MP3)"),
+        ("whisperx",     "WhisperX (timings)"),
+        ("step3_mix",    "Step 3 (Demucs Mix)"),
+        ("step5_gen",    "Step 5 (MP4 Gen)"),
+        ("step6_upload", "Step 6 (Upload)"),
+    ]
+
+    longest_label = None
+    longest_time = -1.0
+
+    for key, desc in labels:
+        v = TIMERS.get(key)
+        if v is None:
+            print(f"{desc:24}: (n/a)")
+            continue
+        note = None
+        if isinstance(v, tuple):
+            # (value, note) or ((value, note), extra_note)
+            if isinstance(v[0], tuple):
+                val, note = v[0]
+            else:
+                val, note = v
+        else:
+            val = v
+
+        if isinstance(val, (int, float)):
+            print(f"{desc:24}: {val:6.2f}s", end="")
+            if note:
+                print(f"  [{note}]")
+            else:
+                print()
+            if desc.startswith("Step") or desc.startswith("WhisperX"):
+                if val > longest_time:
+                    longest_time = val
+                    longest_label = desc
+        else:
+            print(f"{desc:24}: {val}")
+    if longest_label is not None:
+        print(f"Longest component: {longest_label} ({longest_time:0.2f}s)")
+    print("=" * 55 + "\n")
 
 
 # ----------------------------------------------------------------------
-# SAFE SUBPROCESS CALL (SYNC)
-# Reads JSON result if available. Streams child output live.
+# RUN STEP HELPER (blocking, JSON on last line)
 # ----------------------------------------------------------------------
-def run_step(cmd, section, timeout=9999):
-    log(section, f"START  → {' '.join(cmd)}")
+def run_step(cmd, section):
+    """
+    Run a subprocess step synchronously, streaming its logs,
+    and return (json_obj, returncode).
 
+    Expects the last line of stdout to be a JSON object.
+    """
+    log(section, f"START  → {' '.join(cmd)}", BLUE)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -90,40 +172,27 @@ def run_step(cmd, section, timeout=9999):
         text=True,
         bufsize=1,
     )
-
-    captured_lines = []
-    start = time.time()
-
+    last_line = None
     for line in proc.stdout:
-        captured_lines.append(line)
-        print(f"{CYAN}[{section}]{RESET} {line.rstrip()}")
-
-        if time.time() - start > timeout:
-            proc.kill()
-            log(section, f"TIMEOUT after {timeout}s", RED)
-            return None, 124
-
+        stripped = line.rstrip()
+        last_line = stripped
+        print(f"{CYAN}[{section}]{RESET} {stripped}", flush=True)
+    proc.stdout.close()
     proc.wait()
     rc = proc.returncode
+    log(section, f"END (exit={rc})", BLUE)
 
-    if rc != 0:
-        log(section, f"FAILED (code {rc})", RED)
-        return None, rc
-
-    # Try to extract final JSON from the bottom of output
     json_obj = None
-    for line in reversed(captured_lines):
+    if last_line:
         try:
-            json_obj = json.loads(line)
-            break
+            json_obj = json.loads(last_line)
         except Exception:
-            continue
-
+            json_obj = None
     return json_obj, rc
 
 
 # ----------------------------------------------------------------------
-# ASYNC STEP LAUNCHER (no JSON capture, just logs)
+# ASYNC LAUNCH (for WhisperX step)
 # ----------------------------------------------------------------------
 def launch_async_step(cmd, section):
     """
@@ -155,92 +224,70 @@ def launch_async_step(cmd, section):
 # ----------------------------------------------------------------------
 def wait_for_file(path: Path, timeout: float = 900.0, poll: float = 1.0, label: str = "file"):
     """
-    Wait until a file exists and is non-empty, or raise TimeoutError.
+    Wait for a file to appear, polling at `poll` seconds, up to `timeout` seconds.
+    Raises TimeoutError on failure.
     """
     start = time.time()
-    while time.time() - start < timeout:
-        if path.exists() and path.stat().st_size > 0:
-            return True
+    while True:
+        if path.exists():
+            return
+        if time.time() - start > timeout:
+            raise TimeoutError(f"Timed out waiting for {label}: {path}")
         time.sleep(poll)
-    raise TimeoutError(f"Timed out waiting for {label}: {path}")
 
 
 # ----------------------------------------------------------------------
-# PERFORMANCE SUMMARY
+# CLI
 # ----------------------------------------------------------------------
-def print_performance_summary():
-    print("\n" + "=" * 55)
-    print("               PERFORMANCE SUMMARY")
-    print("=" * 55)
-
-    def _extract(label):
-        val = TIMERS.get(label, None)
-        note = None
-        if isinstance(val, tuple) and len(val) == 2:
-            val, note = val
-        return val, note
-
-    label_map = [
-        ("pipeline", "Total pipeline"),
-        ("step1_config", "Step 1 (Config)"),
-        ("step2_lyrics", "Step 2a (Lyrics)"),
-        ("step2_meta", "Step 2b (Meta)"),
-        ("step2_mp3", "Step 2c (MP3)"),
-        ("whisperx", "WhisperX (timings)"),
-        ("step3_mix", "Step 3 (Demucs Mix)"),
-        ("step5_gen", "Step 5 (MP4 Gen)"),
-        ("step6_upload", "Step 6 (Upload)"),
-    ]
-
-    durations = []
-
-    for key, label in label_map:
-        val, note = _extract(key)
-        if isinstance(val, (int, float)):
-            print(f"{label:25s}: {val:6.2f}s" + (f"  [{note}]" if note else ""))
-            if key != "pipeline":
-                durations.append((label, val))
-        elif isinstance(val, str):
-            print(f"{label:25s}: {val}")
-        elif val is None:
-            print(f"{label:25s}: (n/a)")
-        else:
-            print(f"{label:25s}: {val}")
-
-    # Longest component (excluding total pipeline)
-    if durations:
-        longest_label, longest_val = max(durations, key=lambda x: x[1])
-        print("-" * 55)
-        print(f"Longest component: {longest_label} ({longest_val:.2f}s)")
-
-    print("=" * 55 + "\n")
+def build_arg_parser():
+    p = argparse.ArgumentParser(description="Karaoke Time pipeline master.")
+    p.add_argument("--slug", help="Slug (if known).")
+    p.add_argument("--query", help="Search query (if slug not provided).")
+    p.add_argument("--offset", type=float, default=None, help="Global offset for MP4.")
+    p.add_argument("--mode", help="Mix mode (e.g., vocals-100).")
+    p.add_argument("--language", help="Lyrics/ASR language (e.g., en, es).")
+    p.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Skip YouTube upload step.",
+    )
+    p.add_argument(
+        "--pass",
+        dest="passthrough",
+        nargs="*",
+        default=[],
+        help="Additional args to pass through to underlying scripts.",
+    )
+    return p
 
 
-# ----------------------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------------------
 def main():
-    import argparse
-
-    p = argparse.ArgumentParser()
-    p.add_argument("--query", required=True)
-    p.add_argument("--offset", type=float, default=-0.50)
-    p.add_argument("--language", default=None)
-    p.add_argument("--mode", default=None)
-    # New CLI knobs for Demucs behavior:
-    p.add_argument("--skip-demucs", action="store_true", help="Force skipping Demucs (mp3-only).")
-    p.add_argument("--force-demucs", action="store_true", help="Force running Demucs regardless of config.")
-    p.add_argument("--mp3-only", action="store_true", help="Alias for --skip-demucs.")
-    args = p.parse_args()
-
     t_start("pipeline")
 
-    log("Master", f"Pipeline starting for query: {args.query}")
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    slug = args.slug
+    query = args.query
+
+    if not slug and not query:
+        # Interactive slug/query prompt
+        print(f"{BOLD}{CYAN}Enter slug or query for the song:{RESET}")
+        print("  - Leave blank to cancel")
+        entered = input("> ").strip()
+        if not entered:
+            log("Master", "No slug or query provided. Exiting.", YELLOW)
+            t_end("pipeline")
+            print_performance_summary()
+            sys.exit(1)
+        # For now, treat as query; slug will be inferred later.
+        query = entered
+
+    log("Master", f"Pipeline starting for query: {query or slug}", CYAN)
 
     # ------------------------------------------------------------------
-    # STEP 1 — CONFIG
+    # STEP 1 — CONFIG (Mixer/Mode Selector)
     # ------------------------------------------------------------------
-    log("Config", "Launching mixer & mode selector...")
     t_start("step1_config")
 
     cfg_json, rc = run_step(
@@ -272,87 +319,86 @@ def main():
         cfg_json.get("guitar", 100) == 100 and
         cfg_json.get("drums", 100) == 100
     )
-    skip_flag = args.skip_demucs or args.mp3_only
-    force_flag = args.force_demucs
 
-    if force_flag:
-        should_run_demucs = True
-        note = "forced"
-    elif skip_flag:
-        should_run_demucs = False
-        note = "skipped-via-cli"
-    else:
-        # Default rule: if user didn't change any levels and mode is vocals-100 → no Demucs.
-        should_run_demucs = not (all_100 and selected_mode == "vocals-100")
-        note = "auto" if should_run_demucs else "auto-skipped"
-
-    log("Master", f"Demucs decision: should_run_demucs={should_run_demucs} ({note})", BLUE)
+    should_run_demucs = not all_100
+    log("Master", f"Demucs decision: should_run_demucs={should_run_demucs} (auto-skipped)" if not should_run_demucs else
+        f"Demucs decision: should_run_demucs={should_run_demucs}", YELLOW if not should_run_demucs else GREEN)
 
     # ------------------------------------------------------------------
-    # STEP 2 — DOWNLOAD (three tasks)
+    # STEP 2 — DOWNLOAD (lyrics, meta, mp3)
     # ------------------------------------------------------------------
-    # ---- A: LYRICS ----------------------------------------------------
-    t_start("step2_lyrics")
-    lyrics_json, rc = run_step(
-        [
+    if not slug and query:
+        # First call: lyrics by query (also infers slug)
+        t_start("step2_lyrics")
+        lyrics_cmd = [
             "python3",
             "scripts/2_download.py",
             "--task", "lyrics",
-            "--query", args.query,
+            "--query", query,
             "--language", selected_lang,
-        ],
-        "Step2:Download"
-    )
-    t_end("step2_lyrics")
+        ]
+        lyrics_json, rc = run_step(lyrics_cmd, "Step2:Download")
+        t_end("step2_lyrics")
 
-    if not lyrics_json or "slug" not in lyrics_json:
-        log("Master", "ERROR: lyrics step failed to produce a slug", RED)
+        if not lyrics_json or not lyrics_json.get("ok"):
+            log_error("Master", "Lyrics step failed to produce a slug")
+            t_end("pipeline")
+            print_performance_summary()
+            sys.exit(1)
+
+        slug = lyrics_json.get("slug")
+
+    if not slug:
+        log_error("Master", "Slug could not be determined from lyrics step.")
         t_end("pipeline")
         print_performance_summary()
         sys.exit(1)
 
-    slug = lyrics_json["slug"]
     log("Master", f"Slug detected: {slug}", GREEN)
 
-    # ---- B: META ------------------------------------------------------
+    # STEP 2b: META
     t_start("step2_meta")
-    meta_json, rc = run_step(
-        [
-            "python3", "scripts/2_download.py",
-            "--task", "meta",
-            "--slug", slug,
-            "--query", args.query,
-        ],
-        "Step2:Download"
-    )
+    meta_cmd = [
+        "python3",
+        "scripts/2_download.py",
+        "--task", "meta",
+        "--slug", slug,
+    ]
+    if query:
+        meta_cmd.extend(["--query", query])
+    meta_json, rc = run_step(meta_cmd, "Step2:Download")
     t_end("step2_meta")
 
-    # Fallback metadata
-    meta_title = slug.replace("_", " ")
-    meta_artist = ""
+    if not meta_json or not meta_json.get("ok"):
+        log_error("Master", "Metadata step failed.")
+        t_end("pipeline")
+        print_performance_summary()
+        sys.exit(1)
 
-    if meta_json and meta_json.get("ok"):
-        meta_title = meta_json.get("title", meta_title)
-        meta_artist = meta_json.get("artist", meta_artist)
-        log("Master", f"Metadata received: {meta_json}", GREEN)
-    else:
-        log("Master", "No metadata returned; continuing.", YELLOW)
+    artist = meta_json.get("artist", "Unknown Artist")
+    title = meta_json.get("title", slug)
+    log("Master", f"Metadata received: {meta_json}", GREEN)
 
-    # ---- C: MP3 -------------------------------------------------------
+    # STEP 2c: MP3
     t_start("step2_mp3")
-    mp3_json, rc = run_step(
-        [
-            "python3",
-            "scripts/2_download.py",
-            "--task", "mp3",
-            "--slug", slug,
-        ],
-        "Step2:Download"
-    )
+    mp3_cmd = [
+        "python3",
+        "scripts/2_download.py",
+        "--task", "mp3",
+        "--slug", slug,
+    ]
+    mp3_json, rc = run_step(mp3_cmd, "Step2:Download")
     t_end("step2_mp3")
 
     if not mp3_json or not mp3_json.get("ok"):
-        log("Master", "ERROR: mp3 step failed", RED)
+        log_error("Master", "MP3 download step failed.")
+        t_end("pipeline")
+        print_performance_summary()
+        sys.exit(1)
+
+    mp3_path = mp3_json.get("mp3_path")
+    if not mp3_path:
+        log_error("Master", "MP3 path missing from Step 2 JSON.")
         t_end("pipeline")
         print_performance_summary()
         sys.exit(1)
@@ -378,7 +424,7 @@ def main():
 
     # ------------------------------------------------------------------
     # STEP 3 — MIX (Demucs), OPTIONAL
-    # ------------------------------------------------------------------
+    # ----------------------------------------------
     if should_run_demucs:
         t_start("step3_mix")
         mix_json, rc = run_step(
@@ -418,11 +464,9 @@ def main():
 
     # Optionally confirm WhisperX proc exit code
     if whisper_proc is not None:
-        whisper_rc = whisper_proc.poll()
-        if whisper_rc is None:
-            # Still running; wait briefly
-            whisper_proc.wait(timeout=5)
-            whisper_rc = whisper_proc.returncode
+        # At this point the timings CSV already exists, so 4_merge.py
+        # should be finishing up. Wait for it to exit without a hard timeout.
+        whisper_rc = whisper_proc.wait()
         if whisper_rc != 0:
             log("Master", f"WhisperX process exited with code {whisper_rc}", YELLOW)
 
@@ -430,15 +474,22 @@ def main():
     # STEP 5 — GEN (mp4)
     # ------------------------------------------------------------------
     t_start("step5_gen")
-    gen_json, rc = run_step(
-        [
-            "python3", "scripts/5_gen.py",
-            "--base-filename", slug,
-            "--offset", str(args.offset),
-            "--profile", selected_mode,
-        ],
-        "Step5:Gen"
-    )
+
+    offset = args.offset if args.offset is not None else 0.0
+    base_filename = slug
+    gen_cmd = [
+        "python3",
+        "scripts/5_gen.py",
+        "--base-filename", base_filename,
+        "--offset", str(offset),
+        "--profile", selected_mode,
+        "--artist", artist,
+        "--title", title,
+    ]
+    if args.passthrough:
+        gen_cmd.extend(["--pass", *args.passthrough])
+
+    gen_json, rc = run_step(gen_cmd, "Step5:Gen")
     t_end("step5_gen")
 
     if not gen_json or not gen_json.get("ok"):
@@ -447,32 +498,35 @@ def main():
         print_performance_summary()
         sys.exit(1)
 
-    mp4_path = gen_json.get("mp4")
-    log("Master", f"MP4 generated: {mp4_path}", GREEN)
+    mp4_path = gen_json.get("mp4_path")
+    log("Master", f"MP4 generated at: {mp4_path}", GREEN)
 
     # ------------------------------------------------------------------
-    # STEP 6 — UPLOAD (new CLI)
+    # STEP 6 — UPLOAD (optional)
     # ------------------------------------------------------------------
+    if args.no_upload:
+        log("Master", "Upload skipped (--no-upload).", YELLOW)
+        t_mark("step6_upload", "skipped")
+        t_end("pipeline")
+        print_performance_summary()
+        return
+
     t_start("step6_upload")
+    upload_cmd = [
+        "python3",
+        "scripts/6_upload.py",
+        "--file", mp4_path,
+        "--artist", artist,
+        "--title", title,
+    ]
+    if args.passthrough:
+        upload_cmd.extend(["--pass", *args.passthrough])
 
-    yt_title = f"{meta_title} - {meta_artist}" if meta_artist else meta_title
-    yt_description = f"Karaoke generated automatically for '{meta_title}'"
-
-    upload_json, rc = run_step(
-        [
-            "python3", "scripts/6_upload.py",
-            "--mp4", mp4_path,
-            "--title", yt_title,
-            "--description", yt_description,
-            "--base-filename", slug,
-            "--visibility", "public",
-        ],
-        "Step6:Upload"
-    )
+    upload_json, rc = run_step(upload_cmd, "Step6:Upload")
     t_end("step6_upload")
 
     if not upload_json or not upload_json.get("ok"):
-        log("Master", "Upload failed!", RED)
+        log("Master", "Upload step failed.", RED)
         t_end("pipeline")
         print_performance_summary()
         sys.exit(1)
