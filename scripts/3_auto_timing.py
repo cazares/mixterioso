@@ -784,6 +784,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Enable verbose debug logging.",
     )
+    p.add_argument("--test", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--release", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args(argv)
 
 
@@ -819,6 +821,22 @@ def main(argv: Optional[List[str]] = None) -> None:
         out_csv = Path(args.out_csv)
     else:
         out_csv = TIMINGS_DIR / f"{slug}.csv"
+
+    if args.test:
+        log("MODE", "TEST mode: steps=12345, no-ui, model=htdemucs, timing-model-size=base, no-upload.", CYAN)
+        args.no_ui = True
+        args.steps = "12345"
+        args.model = "htdemucs_tiny"
+        args.timing_model_size = "base"   
+        args.no_upload = True
+
+    if args.release:
+        log("MODE", "RELEASE mode: steps=12345, no-ui, model=htdemucs_6s, timing-model-size=large-v3.", CYAN)
+        args.no_ui = True
+        args.steps = "12345"
+        args.model = "htdemucs"
+        args.timing_model_size = "large-v3"
+
 
     device = guess_device() if args.device == "auto" else args.device
 
