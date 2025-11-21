@@ -32,7 +32,7 @@ DEFAULT_DESCRIPTION = (
     "engineered by 𝗠𝗶𝗴𝘂𝗲𝗹 𝗖𝗮𝘇𝗮𝗿𝗲𝘀. It separates vocals, bass, guitar, and drums, remixes levels, and "
     "produces fully timed on-screen lyrics for karaoke, sing-along, backing tracks, and musician practice.\n"
     "Learn more about the creator, Miguel Cazares, at 🔗 https://miguelengineer.com\n"
-    "Mobile app coming soon."
+    "Mobile app coming soon!"
 )
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
