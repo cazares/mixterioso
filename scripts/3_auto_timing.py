@@ -823,20 +823,19 @@ def main(argv: Optional[List[str]] = None) -> None:
         out_csv = TIMINGS_DIR / f"{slug}.csv"
 
     if args.test:
-        log("MODE", "TEST mode: steps=12345, no-ui, model=htdemucs, timing-model-size=base, no-upload.", CYAN)
+        log("MODE", "TEST mode: steps=12345, no-ui, model=htdemucs_tiny, timing-model-size=base, no-upload.", CYAN)
         args.no_ui = True
         args.steps = "12345"
         args.model = "htdemucs_tiny"
-        args.timing_model_size = "base"   
-        args.no_upload = True
+        args.timing_model_size = "base"
+        # args.no_upload = True
 
     if args.release:
-        log("MODE", "RELEASE mode: steps=12345, no-ui, model=htdemucs_6s, timing-model-size=large-v3.", CYAN)
+        log("MODE", "RELEASE mode: steps=12345, no-ui, model=htdemucs, timing-model-size=large-v3.", CYAN)
         args.no_ui = True
         args.steps = "12345"
         args.model = "htdemucs"
         args.timing_model_size = "large-v3"
-
 
     device = guess_device() if args.device == "auto" else args.device
 
