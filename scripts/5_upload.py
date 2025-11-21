@@ -27,6 +27,12 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 BLUE = "\033[34m"
 
+DEFAULT_DESCRIPTION = (
+    "This video was generated automatically by Mixterioso, an advanced audio mixer and karaoke engine "
+    "engineered by 𝗠𝗶𝗴𝘂𝗲𝗹 𝗖𝗮𝘇𝗮𝗿𝗲𝘀. It separates vocals, bass, guitar, and drums, remixes levels, and "
+    "produces fully timed on-screen lyrics for karaoke, sing-along, backing tracks, and musician practice.\n"
+    "Learn more about the creator, Miguel Cazares, at 🔗 https://miguelengineer.com"
+)
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
@@ -289,6 +295,9 @@ def parse_args():
     p.add_argument("--slug", default=None)
     p.add_argument("--profile", default=None)
     p.add_argument("--offset", type=float, default=None)
+
+    # Video description on the YouTube video itself (persistent after upload)
+    p.add_argument("--description", default=DEFAULT_DESCRIPTION, help="Video description")
 
     args, unknown = p.parse_known_args()
     args._unknown = unknown  # store unknown flags minimally
