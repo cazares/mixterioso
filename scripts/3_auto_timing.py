@@ -130,7 +130,7 @@ MIXES_DIR = BASE_DIR / "mixes"
 TIMINGS_DIR = BASE_DIR / "timings"
 WAVS_DIR = BASE_DIR / "wavs"
 
-DEFAULT_MODEL_SIZE = os.environ.get("WX_MODEL_SIZE", "medium")
+DEFAULT_MODEL_SIZE = os.environ.get("WX_MODEL_SIZE", "distil-large-v3")
 DEFAULT_MIN_LINE_DURATION = 0.8
 DEFAULT_FALLBACK_LINE_DURATION = 2.5
 DEFAULT_GAP_AFTER_LINE = 0.1
@@ -734,6 +734,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--language",
         type=str,
+        default="en",
         help="Language code (e.g. 'en', 'es') or 'auto'.",
     )
     p.add_argument(
