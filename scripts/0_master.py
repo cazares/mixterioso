@@ -90,7 +90,7 @@ def log_error(section: str, msg: str) -> None:
 
 
 # -------------------------------------------------
-# run_step — JSON capture
+# run_step — stream all output + capture JSON + surface return code
 # -------------------------------------------------
 def run_step(cmd, section: str):
     cmd = [str(x) for x in cmd]
@@ -114,6 +114,7 @@ def run_step(cmd, section: str):
         print(f"[{section}] {line}")
         stripped = line.strip()
 
+        # JSON capture (last object printed by child)
         if capturing:
             json_lines.append(stripped)
             brace_depth += stripped.count("{") - stripped.count("}")
@@ -140,7 +141,14 @@ def run_step(cmd, section: str):
                         result_json = None
                 continue
 
+    proc.stdout.close()
     proc.wait()
+
+    # Surface the return code regardless of JSON success
+    print(
+        f"{YELLOW}[{section}] RETURN CODE: {proc.returncode}{RESET}",
+        flush=True,
+    )
 
     if result_json is None:
         print(f"[{section}] WARNING: No JSON captured (rc={proc.returncode})")
@@ -149,9 +157,10 @@ def run_step(cmd, section: str):
 
 
 # -------------------------------------------------
-# Async step runner
+# Async step runner — stream all output + surface exit code when done
 # -------------------------------------------------
 def launch_async_step(cmd, section: str):
+    cmd = [str(x) for x in cmd]
     log(section, f"START (async) → {' '.join(cmd)}")
 
     proc = subprocess.Popen(
@@ -163,11 +172,17 @@ def launch_async_step(cmd, section: str):
     )
 
     def reader():
-        for line in proc.stdout:
-            print(f"{CYAN}[{section}]{RESET} {line.rstrip()}")
-        proc.stdout.close()
-        rc = proc.wait()
-        print(f"{RED}[{section}] Process exited with code {rc}{RESET}", flush=True)
+        try:
+            for line in proc.stdout:
+                print(f"{CYAN}[{section}]{RESET} {line.rstrip()}")
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+            rc = proc.wait()
+            print(
+                f"{YELLOW}[{section}] (async) EXIT CODE: {rc}{RESET}",
+                flush=True,
+            )
 
     threading.Thread(target=reader, daemon=True).start()
     return proc
