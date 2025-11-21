@@ -622,6 +622,24 @@ def choose_audio(slug: str, profile: str) -> Path:
     sys.exit(1)
 
 
+def reset_cache_for_slug(slug: str) -> None:
+    """
+    Delete any file, in any directory under BASE_DIR, whose filename is exactly:
+        <slug>.<extension>
+    i.e., the part before the first '.' is exactly slug; no prefixes/suffixes.
+    """
+    for root, _dirs, files in os.walk(BASE_DIR):
+        for name in files:
+            stem, dot, _ext = name.partition(".")
+            if stem == slug and dot:
+                path = Path(root) / name
+                try:
+                    print(f"[CACHE] Deleting {path}")
+                    path.unlink()
+                except Exception as e:
+                    print(f"[CACHE] Failed to delete {path}: {e}")
+
+
 def open_path(path: Path)->None:
     try:
         if sys.platform == "darwin":
@@ -682,6 +700,11 @@ def main(argv=None):
 
     profile = args.profile
 
+    # Minimal caching behavior: reset-cache deletes <slug>.<ext> anywhere under BASE_DIR
+    if getattr(args, "reset_cache", False):
+        print(f"[CACHE] --reset-cache: deleting any '{slug}.*' files under {BASE_DIR}")
+        reset_cache_for_slug(slug)
+
     if args.offset is not None:
         LYRICS_OFFSET_SECS = float(args.offset)
     print(f"[OFFSET] Using lyrics offset {LYRICS_OFFSET_SECS:+.3f}s")
@@ -731,6 +754,13 @@ def main(argv=None):
     subprocess.run(cmd, check=True)
     t1 = time.perf_counter()
     print(f"[MP4] Wrote {out_mp4} in {t1-t0:6.2f} s")
+
+    # YouTube title template + JSON output (Patch Chunks 3 & 4)
+    if artist:
+        final_title = f"{artist} - {title}"
+    else:
+        final_title = title
+    print(json.dumps({"title": final_title}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
