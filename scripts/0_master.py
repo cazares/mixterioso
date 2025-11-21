@@ -405,13 +405,21 @@ def parse_args():
     p.add_argument("--no-ui", action="store_true")
     p.add_argument("--force-mp4", action="store_true")
     p.add_argument("--no-upload", action="store_true")
+    # Level controls (parsed but not wired yet)
+    p.add_argument("--vocals", type=int)
+    p.add_argument("--bass", type=int)
+    p.add_argument("--drums", type=int)
+    p.add_argument("--guitar", type=int)
+    # Cache behavior flags (parsed but not wired yet)
+    p.add_argument("--use-cache", action="store_true")
+    p.add_argument("--reset-cache", action="store_true")
     p.add_argument(
         "--timing-model-size",
         type=str,
         default=None,
         help="Model size for step 3 auto-timing (tiny/base/small/medium).",
     )
-    return p  # changed from p.parse_args() to return the parser
+    return p  # parser, used with parse_known_args in main()
 
 # ============================================================================
 # MAIN
