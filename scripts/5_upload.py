@@ -183,3 +183,179 @@ except ImportError as e:
         )
     )
     sys.exit(1)
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+
+
+def get_creds() -> Credentials:
+    env_val = os.getenv("YOUTUBE_CLIENT_SECRETS_JSON")
+    if env_val:
+        base_path = Path(env_val).expanduser().resolve()
+        if base_path.is_dir():
+            secrets_path = base_path / "client_secret.json"
+        else:
+            secrets_path = base_path
+    else:
+        secrets_path = (BASE_DIR / "client_secret.json").resolve()
+
+    if not secrets_path.exists():
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "MissingOAuthClientSecrets",
+                    "message": (
+                        "Missing OAuth client secrets JSON. "
+                        "Set env YOUTUBE_CLIENT_SECRETS_JSON or place client_secret.json in project root."
+                    ),
+                    "expected_path": str(secrets_path),
+                }
+            )
+        )
+        sys.exit(1)
+
+    token_path = secrets_path.with_name("youtube_token.json")
+    creds = None
+
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            log("auth", "Refreshing OAuth token...", CYAN)
+            creds.refresh(Request())
+        else:
+            log("auth", f"Launching OAuth flow using {secrets_path.name}...", CYAN)
+            flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
+            try:
+                creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+            except TypeError:
+                try:
+                    creds = flow.run_local_server(port=0)
+                except AttributeError as e:
+                    print(
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": "OAuthFlowUnsupported",
+                                "message": (
+                                    "Your google-auth-oauthlib version is too old. "
+                                    "Upgrade via: pip3 install --upgrade google-auth-oauthlib"
+                                ),
+                                "detail": str(e),
+                            }
+                        )
+                    )
+                    sys.exit(1)
+
+        token_path.write_text(creds.to_json(), encoding="utf-8")
+        log("auth", f"Stored credentials in {token_path}", GREEN)
+
+    return creds
+
+
+def build_youtube(creds: Credentials):
+    return build("youtube", "v3", credentials=creds)
+
+
+def parse_args():
+    # MINIMAL DIFF: use parse_known_args to allow pass-through flags
+    p = argparse.ArgumentParser(description="Upload a video to YouTube with OAuth.", add_help=True)
+
+    p.add_argument("--file", required=True, help="Path to the MP4 to upload")
+    p.add_argument("--title", help="Video title; overrides auto-title")
+    p.add_argument("--description", default="", help="Video description")
+    p.add_argument("--tags", default="", help="Comma-separated tags")
+
+    p.add_argument("--category-id", default="10", help="YouTube categoryId (default=10 Music)")
+
+    p.add_argument(
+        "--privacy",
+        default="private",
+        choices=["public", "unlisted", "private"],
+        help="Privacy status",
+    )
+
+    p.add_argument("--made-for-kids", action="store_true")
+
+    p.add_argument(
+        "--thumb-from-sec",
+        type=float,
+        default=0.5,
+        help="Timestamp to capture thumbnail frame (sec)",
+    )
+    p.add_argument("--no-thumbnail", action="store_true")
+
+    # Extra metadata for receipts
+    p.add_argument("--slug", default=None)
+    p.add_argument("--profile", default=None)
+    p.add_argument("--offset", type=float, default=None)
+
+    args, unknown = p.parse_known_args()
+    args._unknown = unknown  # store unknown flags minimally
+    return args
+
+
+def main():
+    args = parse_args()
+
+    mp4 = Path(args.file).resolve()
+    if not mp4.exists():
+        print(json.dumps({"ok": False, "error": "FileNotFound", "message": str(mp4)}))
+        sys.exit(1)
+
+    # Load meta + volumes
+    artist, song_title = load_meta(args.slug)
+    volumes = load_mix_config(args.slug, args.profile)
+
+    # Build dynamic title only if user did not override --title
+    if args.title:
+        final_title = args.title
+        title_debug = {}
+    else:
+        final_title, title_debug = build_dynamic_title(artist, song_title, volumes)
+
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
+
+    # OAuth
+    creds = get_creds()
+    yt = build_youtube(creds)
+
+    try:
+        video_id = upload_video(
+            yt,
+            mp4,
+            title=final_title,
+            description=args.description,
+            tags=tags,
+            category_id=args.category_id,
+            privacy_status=args.privacy,
+            made_for_kids=args.made_for_kids,
+        )
+    except HttpError as e:
+        print(json.dumps({"ok": False, "error": "YouTubeUploadError", "message": str(e)}))
+        sys.exit(1)
+
+    # Thumbnail
+    if not args.no_thumbnail:
+        thumb_png = mp4.with_suffix(".mp4.thumb.png")
+        try:
+            extract_thumbnail_frame(mp4, thumb_png, args.thumb_from_sec)
+            set_thumbnail(yt, video_id, thumb_png)
+        except subprocess.CalledProcessError:
+            log("thumb", "ffmpeg failed to capture thumbnail; skipping.", YELLOW)
+        except HttpError as e:
+            log("thumb", f"Failed to set thumbnail: {e}", YELLOW)
+
+    # Enhanced receipt (patch)
+    write_upload_receipt(
+        slug=args.slug,
+        profile=args.profile,
+        offset=args.offset,
+        video_id=video_id,
+        title=final_title,
+        volumes=volumes,
+        debug=title_debug,
+    )
+
+    print(json.dumps({"ok": True, "video_id": video_id, "watch_url": f"https://youtu.be/{video_id}"},
+                     indent=2))
