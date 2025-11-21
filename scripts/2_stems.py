@@ -145,10 +145,10 @@ def mix_ui(slug: str, profile: str, model: str) -> dict:
         curses.curs_set(0)
         curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)   # header
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)                 # instructions
-        curses.init_pair(3, curses.COLOR_GREEN, -1)                  # selected
-        curses.init_pair(4, curses.COLOR_CYAN, -1)                   # normal
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        curses.init_pair(3, curses.COLOR_GREEN, -1)
+        curses.init_pair(4, curses.COLOR_CYAN, -1)
 
         selected = 0
         last_msg = ""
@@ -255,7 +255,6 @@ def mix_ui(slug: str, profile: str, model: str) -> dict:
 
 
 def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path) -> None:
-    # Expect stems at separated/<model>/<stemname>.wav relative to BASE_DIR
     separated_dir = BASE_DIR / "separated" / model / slug
     stems = {}
     for t in TRACKS:
@@ -298,22 +297,47 @@ def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path)
     log("MIX", f"Wrote mixed WAV to {output}", GREEN)
 
 
+# ===========================
+# MINIMAL-DIFF UPDATES BEGIN
+# ===========================
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Stem mix UI and renderer.")
-    p.add_argument("--mp3", type=str, required=True, help="Original mp3 path (to derive slug).")
-    p.add_argument(
-        "--profile",
+    p = argparse.ArgumentParser(description="Stem mix UI and renderer.", add_help=True)
+
+    p.add_argument("--mp3", type=str, required=True)
+
+    p.add_argument("--profile",
         type=str,
         default="karaoke",
         choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
     )
-    p.add_argument("--model", type=str, default="htdemucs_6s", help="Demucs model name.")
-    p.add_argument("--mix-ui-only", action="store_true", help="Only run mix UI and save config.")
-    p.add_argument("--render-only", action="store_true", help="Only render mix WAV from config.")
-    p.add_argument("--output", type=str, help="Output WAV path (optional).")
-    return p.parse_args(argv)
 
+    p.add_argument("--model", type=str, default="htdemucs_6s")
+    p.add_argument("--mix-ui-only", action="store_true")
+    p.add_argument("--render-only", action="store_true")
+    p.add_argument("--output", type=str)
+
+    # ↓↓↓ NEW: CLI LEVEL FLAGS (minimal additive diff)
+    p.add_argument("--vocals", type=float)
+    p.add_argument("--bass", type=float)
+    p.add_argument("--guitar", type=float)
+    p.add_argument("--piano", type=float)
+    p.add_argument("--other", type=float)
+
+    # allow ignoring unknown pass-through flags from 0_master
+    args, _unknown = p.parse_known_args(argv)
+    return args
+
+
+def cli_levels_present(args) -> bool:
+    return any(
+        getattr(args, t) is not None
+        for t in ["vocals", "bass", "guitar", "piano", "other"]
+    )
+
+# =======================
+# MINIMAL-DIFF MAIN LOGIC
+# =======================
 
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
@@ -321,6 +345,7 @@ def main(argv=None):
     mp3_path = Path(args.mp3).resolve()
     if not mp3_path.exists():
         raise SystemExit(f"mp3 not found: {mp3_path}")
+
     slug = slugify(mp3_path.stem)
 
     if args.profile == "lyrics":
@@ -329,19 +354,49 @@ def main(argv=None):
     if args.mix_ui_only and args.render_only:
         raise SystemExit("Cannot use --mix-ui-only and --render-only together.")
 
-    out_wav = Path(args.output).resolve() if args.output else (MIXES_DIR / f"{slug}_{args.profile}.wav")
+    out_wav = (
+        Path(args.output).resolve()
+        if args.output
+        else (MIXES_DIR / f"{slug}_{args.profile}.wav")
+    )
+
+    # =====================================
+    # NEW LOGIC: CLI LEVELS → SKIP MIX UI
+    # =====================================
+    if cli_levels_present(args):
+        log("MIX", "CLI levels provided; skipping Mix UI.", YELLOW)
+
+        defaults = profile_defaults(args.profile)
+        vols = {}
+
+        for t in TRACKS:
+            cli_val = getattr(args, t)
+            if cli_val is not None:
+                vols[t] = float(cli_val)
+            else:
+                vols[t] = defaults[t]
+
+        # save config (keeps original behavior consistent)
+        save_config(slug, args.profile, args.model, vols)
+
+        # immediately render
+        render_mix(slug, args.profile, args.model, vols, out_wav)
+        return
+
+    # =====================================
+    # ORIGINAL BEHAVIOR (unchanged)
+    # =====================================
 
     if args.mix_ui_only:
         vols = mix_ui(slug, args.profile, args.model)
         save_config(slug, args.profile, args.model, vols)
         return
 
-    # render-only or default render
     cfg_vols, cfg_path = load_existing_config(slug, args.profile)
     if cfg_vols is None:
         raise SystemExit(
             f"No mix config found for slug={slug}, profile={args.profile}. "
-            f"Run with --mix-ui-only first."
+            f"Run with --mix-ui-only first or provide CLI level flags."
         )
     log("MIXCFG", f"Using config from {cfg_path}", GREEN)
     render_mix(slug, args.profile, args.model, cfg_vols, out_wav)
