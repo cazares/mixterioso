@@ -359,3 +359,48 @@ def main():
 
     print(json.dumps({"ok": True, "video_id": video_id, "watch_url": f"https://youtu.be/{video_id}"},
                      indent=2))
+def write_upload_receipt(
+    slug: Optional[str],
+    profile: Optional[str],
+    offset: Optional[float],
+    video_id: str,
+    title: str,
+    volumes: dict,
+    debug: dict,
+) -> None:
+    """
+    Enhanced receipt:
+      - slug
+      - profile
+      - offset
+      - video_id
+      - final title
+      - volumes used
+      - title classification debugging
+    Only writes when slug/profile/offset exist.
+    """
+    if slug is None or profile is None or offset is None:
+        return
+
+    UPLOAD_LOG.mkdir(parents=True, exist_ok=True)
+    tag = f"{offset:+.3f}"
+
+    out_path = UPLOAD_LOG / f"{slug}_{profile}_offset_{tag}.json"
+    payload = {
+        "slug": slug,
+        "profile": profile,
+        "offset": offset,
+        "video_id": video_id,
+        "title": title,
+        "volumes": volumes,
+        "title_debug": debug,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    log("upload", f"Saved upload receipt to {out_path}", GREEN)
+
+
+# END OF FILE
+if __name__ == "__main__":
+    main()
