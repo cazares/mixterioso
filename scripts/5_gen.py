@@ -637,7 +637,7 @@ def open_path(path: Path)->None:
 def parse_args(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--slug", required=True)
-    p.add_argument("--profile", required=True,
+    p.add_argument("--profile", required=False,
                   choices=["lyrics","karaoke","car-karaoke","no-bass","car-bass-karaoke"])
     p.add_argument("--font-size", type=int)
     p.add_argument("--font-name", type=str, default="Helvetica")
@@ -700,7 +700,7 @@ def main(argv=None):
     subprocess.run(cmd, check=True)
     t1 = time.perf_counter()
     print(f"[MP4] Wrote {out_mp4} in {t1-t0:6.2f} s")
-
+    print(json.dumps({"ok": True, "mp4": str(out_mp4)}))
 
 if __name__ == "__main__":
     main()
