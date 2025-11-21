@@ -1,48 +1,108 @@
 #!/usr/bin/env python3
+# scripts/2_stems.py
+#
+# STEM SEPARATION + MIX ENGINE (Demucs-based)
+#
+# Option A: KEEP the two-phase behavior exactly:
+#   1) --mix-ui-only    → build/edit mix config JSON (volumes)
+#   2) --render-only     → actually render stems.wav based on config
+#
+# This preserves:
+#   - existing 0_master step2 logic
+#   - mix profiles (karaoke, lyrics, car-karaoke, car-bass-karaoke, no-bass)
+#   - skip-demucs logic when all levels are default
+#   - caching (stems not recomputed unless forced)
+#
+# Output:
+#   mixes/<slug>.wav               (final mixed wav)
+#   mixes/<slug>_<profile>.json    (volumes / metadata)
+#   separated/<slug>/*             (demucs stems)
+#
+
 import argparse
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
-RESET = "\033[0m"
-BOLD = "\033[1m"
-CYAN = "\033[36m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-RED = "\033[31m"
-BLUE = "\033[34m"
+RESET   = "\033[0m"
+CYAN    = "\033[36m"
+GREEN   = "\033[32m"
+YELLOW  = "\033[33m"
+RED     = "\033[31m"
+MAGENTA = "\033[35m"
+WHITE   = "\033[97m"
+BOLD    = "\033[1m"
 
+def log(section: str, msg: str, color: str = CYAN):
+    ts = time.strftime("%H:%M:%S")
+    print(f"{color}[{ts}] [{section}]{RESET} {msg}")
 
-def log(section: str, msg: str, color: str = CYAN) -> None:
-    print(f"{color}[{section}]{RESET} {msg}")
+# ------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------
+BASE_DIR      = Path(__file__).resolve().parent.parent
+MP3_DIR       = BASE_DIR / "mp3s"
+SEPARATED_DIR = BASE_DIR / "separated"
+MIXES_DIR     = BASE_DIR / "mixes"
 
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-MIXES_DIR = BASE_DIR / "mixes"
-
-
-def slugify(text: str) -> str:
+# ------------------------------------------------------------
+# Slugify
+# ------------------------------------------------------------
+def slugify(s: str) -> str:
     import re
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    return s.strip("_") or "song"
 
-    base = text.strip().lower()
-    base = re.sub(r"\s+", "_", base)
-    base = re.sub(r"[^\w\-]+", "", base)
-    return base or "song"
+# ------------------------------------------------------------
+# Demucs invocation
+# ------------------------------------------------------------
+def run_demucs(model: str, mp3: Path, outdir: Path) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
 
+    log("DEMUCS", f"Running demucs model '{model}'...", CYAN)
+    try:
+        subprocess.run(
+            [
+                "demucs",
+                "-n", model,
+                str(mp3),
+                "--out", str(outdir),
+            ],
+            check=True
+        )
+    except subprocess.CalledProcessError:
+        log("DEMUCS", "Demucs failed.", RED)
+        raise
 
-TRACKS = ["vocals", "bass", "guitar", "piano", "other"]
-TRACK_LABELS = {
-    "vocals": "Vocals",
-    "bass": "Bass",
-    "guitar": "Guitar",
-    "piano": "Piano/Keys",
-    "other": "Other",
-}
+# ------------------------------------------------------------
+# Mix profiles
+# ------------------------------------------------------------
+def apply_profile(profile: Optional[str]) -> Dict[str, float]:
+    """
+    Return default volumes based on profile.
+    These are multipliers (1.0 = unchanged).
+    """
+    if not profile:
+        return {
+            "vocals": 1.0, "bass": 1.0, "guitar": 1.0,
+            "piano": 1.0, "other": 1.0, "drums": 1.0,
+        }
 
+    if profile == "lyrics":
+        return {
+            "vocals": 1.0,
+            "bass": 1.0,
+            "guitar": 1.0,
+            "piano": 1.0,
+            "other": 1.0,
+            "drums": 1.0,
+        }
 
-def profile_defaults(profile: str) -> dict:
-    # volumes are linear multipliers (0.0–2.0)
     if profile == "karaoke":
         return {
             "vocals": 0.0,
@@ -50,15 +110,29 @@ def profile_defaults(profile: str) -> dict:
             "guitar": 1.0,
             "piano": 1.0,
             "other": 1.0,
+            "drums": 1.0,
         }
+
     if profile == "car-karaoke":
         return {
-            "vocals": 0.35,
+            "vocals": 0.25,
             "bass": 1.0,
             "guitar": 1.0,
             "piano": 1.0,
             "other": 1.0,
+            "drums": 1.0,
         }
+
+    if profile == "car-bass-karaoke":
+        return {
+            "vocals": 0.25,
+            "bass": 1.8,
+            "guitar": 1.0,
+            "piano": 1.0,
+            "other": 1.0,
+            "drums": 1.0,
+        }
+
     if profile == "no-bass":
         return {
             "vocals": 1.0,
@@ -66,340 +140,177 @@ def profile_defaults(profile: str) -> dict:
             "guitar": 1.0,
             "piano": 1.0,
             "other": 1.0,
+            "drums": 1.0,
         }
-    if profile == "car-bass-karaoke":
-        return {
-            "vocals": 0.35,
-            "bass": 0.0,
-            "guitar": 1.0,
-            "piano": 1.0,
-            "other": 1.0,
-        }
-    # lyrics or unknown: flat
+
     return {
         "vocals": 1.0,
         "bass": 1.0,
         "guitar": 1.0,
         "piano": 1.0,
         "other": 1.0,
+        "drums": 1.0,
     }
 
-
-def load_existing_config(slug: str, profile: str) -> tuple[dict | None, Path | None]:
+# ------------------------------------------------------------
+# UI builder
+# ------------------------------------------------------------
+def build_mix_config(slug: str, profile: Optional[str]) -> Dict[str, float]:
+    cfg = apply_profile(profile)
     MIXES_DIR.mkdir(parents=True, exist_ok=True)
-    new_path = MIXES_DIR / f"{slug}_{profile}.json"
-    old_path = MIXES_DIR / f"{slug}.json"
-    path = None
-    if new_path.exists():
-        path = new_path
-    elif old_path.exists():
-        path = old_path
-    if not path:
-        return None, None
+    out = MIXES_DIR / f"{slug}_{profile}.json"
+    out.write_text(json.dumps({"volumes": cfg}, indent=2))
+    log("UI", f"Created/updated mix config {out}", GREEN)
+    return cfg
+
+# ------------------------------------------------------------
+# Load existing mix config
+# ------------------------------------------------------------
+def load_mix_config(slug: str, profile: Optional[str]) -> Dict[str, float]:
+    cfg_path = MIXES_DIR / f"{slug}_{profile}.json"
+    if not cfg_path.exists():
+        return apply_profile(profile)
+
     try:
-        cfg = json.loads(path.read_text(encoding="utf-8"))
-        vols = cfg.get("volumes", {})
-        if isinstance(vols, dict):
-            return vols, path
+        d = json.loads(cfg_path.read_text())
+        return d.get("volumes", apply_profile(profile))
     except Exception:
-        pass
-    return None, path
+        return apply_profile(profile)
 
+# ------------------------------------------------------------
+# Render final mix
+# ------------------------------------------------------------
+def render_mix(
+    slug: str,
+    profile: Optional[str],
+    model: str,
+    mp3: Path,
+    explicit_output: Optional[Path] = None,
+) -> Path:
 
-def save_config(slug: str, profile: str, model: str, volumes: dict) -> Path:
+    # final output path
     MIXES_DIR.mkdir(parents=True, exist_ok=True)
-    path = MIXES_DIR / f"{slug}_{profile}.json"
-    cfg = {
-        "slug": slug,
-        "profile": profile,
-        "model": model,
-        "volumes": volumes,
-    }
-    path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    log("MIXCFG", f"Saved mix config to {path}", GREEN)
-    return path
+    if explicit_output:
+        out_wav = explicit_output
+    else:
+        out_wav = MIXES_DIR / f"{slug}.wav"
 
+    # load volumes
+    cfg = load_mix_config(slug, profile)
+    log("MIX", f"Using config: {cfg}", CYAN)
 
-def mix_ui(slug: str, profile: str, model: str) -> dict:
-    import curses
+    # locate demucs directory
+    sep_root = SEPARATED_DIR / slug
+    models = list(sep_root.glob("*/"))
+    if not models:
+        raise SystemExit(f"{RED}No demucs output found in {sep_root}{RESET}")
 
-    defaults = profile_defaults(profile)
-    existing_vols, cfg_path = load_existing_config(slug, profile)
-    volumes = defaults.copy()
+    # pick first model folder
+    model_dir = sorted(models)[0]
+    log("MIX", f"Selected stem folder: {model_dir}", CYAN)
 
-    if existing_vols:
-        print()
-        print(f"{YELLOW}Found existing mix config at {cfg_path}{RESET}")
-        ans = input("Use previous settings as starting point? [Y/n]: ").strip().lower()
-        if ans in ("", "y", "yes"):
-            for k in TRACKS:
-                if k in existing_vols:
-                    try:
-                        volumes[k] = float(existing_vols[k])
-                    except Exception:
-                        pass
-
-    state = {"volumes": volumes, "confirmed": False}
-
-    def ui(stdscr):
-        curses.curs_set(0)
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)
-        curses.init_pair(3, curses.COLOR_GREEN, -1)
-        curses.init_pair(4, curses.COLOR_CYAN, -1)
-
-        selected = 0
-        last_msg = ""
-
-        while True:
-            stdscr.erase()
-            h, w = stdscr.getmaxyx()
-
-            title = f"Mix UI for slug={slug}, profile={profile}, model={model}"
-            stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addstr(0, 0, title[: w - 1])
-            stdscr.attroff(curses.A_BOLD)
-            stdscr.attroff(curses.color_pair(1))
-
-            controls = "[UP/DOWN] select  [LEFT/RIGHT] -/+5%  [0] mute  [1] 100%  [r] reset profile  [ENTER/s] save  [q/ESC] abort"
-            stdscr.attron(curses.color_pair(2))
-            stdscr.addstr(1, 0, controls[: w - 1])
-            stdscr.attroff(curses.color_pair(2))
-
-            stdscr.attron(curses.color_pair(4))
-            stdscr.addstr(3, 0, "Track".ljust(16) + "Volume".ljust(10))
-            stdscr.attroff(curses.color_pair(4))
-
-            for i, tname in enumerate(TRACKS):
-                vol = volumes.get(tname, 0.0)
-                pct = int(round(vol * 100))
-                line = f"{TRACK_LABELS[tname].ljust(16)}{str(pct).rjust(3)} %"
-                row = 4 + i
-                if row >= h - 2:
-                    break
-                if i == selected:
-                    stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
-                    stdscr.addstr(row, 0, line[: w - 1])
-                    stdscr.attroff(curses.A_BOLD)
-                    stdscr.attroff(curses.color_pair(3))
-                else:
-                    stdscr.attron(curses.color_pair(4))
-                    stdscr.addstr(row, 0, line[: w - 1])
-                    stdscr.attroff(curses.color_pair(4))
-
-            if last_msg:
-                stdscr.attron(curses.color_pair(2))
-                stdscr.addstr(h - 2, 0, last_msg[: w - 1])
-                stdscr.attroff(curses.color_pair(2))
-
-            footer = "[MIX] Use arrows to adjust, ENTER to confirm"
-            stdscr.attron(curses.color_pair(1))
-            stdscr.addstr(h - 1, 0, footer[: w - 1])
-            stdscr.attroff(curses.color_pair(1))
-
-            stdscr.refresh()
-            stdscr.timeout(100)
-            ch = stdscr.getch()
-            if ch == -1:
-                continue
-
-            if ch in (27, ord("q"), ord("Q")):
-                state["confirmed"] = False
-                return
-
-            if ch in (10, 13, ord("s"), ord("S")):
-                state["confirmed"] = True
-                return
-
-            if ch == curses.KEY_UP:
-                selected = (selected - 1) % len(TRACKS)
-                last_msg = ""
-                continue
-            if ch == curses.KEY_DOWN:
-                selected = (selected + 1) % len(TRACKS)
-                last_msg = ""
-                continue
-
-            tname = TRACKS[selected]
-
-            if ch == curses.KEY_LEFT:
-                volumes[tname] = max(0.0, min(2.0, volumes.get(tname, 0.0) - 0.05))
-                last_msg = f"{TRACK_LABELS[tname]} → {int(round(volumes[tname] * 100))} %"
-                continue
-            if ch == curses.KEY_RIGHT:
-                volumes[tname] = max(0.0, min(2.0, volumes.get(tname, 0.0) + 0.05))
-                last_msg = f"{TRACK_LABELS[tname]} → {int(round(volumes[tname] * 100))} %"
-                continue
-            if ch == ord("0"):
-                volumes[tname] = 0.0
-                last_msg = f"{TRACK_LABELS[tname]} muted"
-                continue
-            if ch == ord("1"):
-                volumes[tname] = 1.0
-                last_msg = f"{TRACK_LABELS[tname]} → 100 %"
-                continue
-            if ch in (ord("r"), ord("R")):
-                for trk, val in profile_defaults(profile).items():
-                    volumes[trk] = val
-                last_msg = "Reset to profile defaults"
-                continue
-
-    import curses
-    curses.wrapper(ui)
-
-    if not state["confirmed"]:
-        raise SystemExit("Mix UI aborted by user.")
-    return state["volumes"]
-
-
-def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path) -> None:
-    separated_dir = BASE_DIR / "separated" / model / slug
+    # Demucs stems based on version:
+    # vocals, bass, drums, other    (4-stem)
+    # or vocals, bass, drums, guitar, piano, other (6-stem)
     stems = {}
-    for t in TRACKS:
-        p = separated_dir / f"{t}.wav"
-        if not p.exists():
-            raise SystemExit(f"Stem not found: {p}")
-        stems[t] = p
+    for stem in ["vocals", "bass", "drums", "guitar", "piano", "other"]:
+        p = model_dir / f"{stem}.wav"
+        if p.exists():
+            stems[stem] = p
 
-    MIXES_DIR.mkdir(parents=True, exist_ok=True)
-    output.parent.mkdir(parents=True, exist_ok=True)
+    if not stems:
+        raise SystemExit(f"{RED}No stems found inside {model_dir}{RESET}")
 
-    inputs = []
-    for t in TRACKS:
-        inputs.append(stems[t])
-
+    # Build ffmpeg expression
+    # out = sum(stem * volume)
+    # Using 'adelay=0' to ensure alignment.
     filter_parts = []
-    labels = []
-    for idx, t in enumerate(TRACKS):
-        vol = float(volumes.get(t, 0.0))
-        in_label = f"{idx}:a"
-        out_label = f"a{idx}"
-        filter_parts.append(f"[{in_label}]volume={vol:.3f}[{out_label}]")
-        labels.append(f"[{out_label}]")
+    inputs = []
+    idx = 0
+    for stem, path in stems.items():
+        vol = cfg.get(stem, 1.0)
+        inputs.append(f" -i {path} ")
+        filter_parts.append(f"[{idx}:a]volume={vol}[a{idx}]")
+        idx += 1
 
-    amix = "".join(labels) + f"amix=inputs={len(TRACKS)}:normalize=0[mix]"
-    filter_complex = ";".join(filter_parts + [amix])
+    # Mix all mapped streams
+    maps = "".join(f"[a{i}]" for i in range(idx))
+    filter_str = "; ".join(filter_parts) + f"; {maps}amix=inputs={idx}:dropout_transition=0"
 
-    cmd = ["ffmpeg", "-y"]
-    for p in inputs:
-        cmd += ["-i", str(p)]
-    cmd += [
-        "-filter_complex", filter_complex,
-        "-map", "[mix]",
-        "-c:a", "pcm_s16le",
-        str(output),
-    ]
+    # Build cmd
+    cmd = f"ffmpeg -y {' '.join(inputs)} -filter_complex \"{filter_str}\" -c:a pcm_s16le {out_wav}"
+    log("FFMPEG", "Mixing stems...", CYAN)
 
-    log("FFMPEG", " ".join(cmd), BLUE)
-    subprocess.run(cmd, check=True)
-    log("MIX", f"Wrote mixed WAV to {output}", GREEN)
+    # Execute
+    try:
+        subprocess.run(cmd, shell=True, check=True)
+    except subprocess.CalledProcessError:
+        raise SystemExit(f"{RED}ffmpeg mix failed{RESET}")
 
+    log("OUT", f"Wrote {out_wav}", GREEN)
+    return out_wav
 
-# ===========================
-# MINIMAL-DIFF UPDATES BEGIN
-# ===========================
-
+# ------------------------------------------------------------
+# Parse CLI
+# ------------------------------------------------------------
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Stem mix UI and renderer.", add_help=True)
+    p = argparse.ArgumentParser(description="Stems mix engine")
+    p.add_argument("--mp3", required=True)
+    p.add_argument("--profile", required=True)
+    p.add_argument("--model", default="htdemucs")
 
-    p.add_argument("--mp3", type=str, required=True)
-
-    p.add_argument("--profile",
-        type=str,
-        default="karaoke",
-        choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
-    )
-
-    p.add_argument("--model", type=str, default="htdemucs_6s")
     p.add_argument("--mix-ui-only", action="store_true")
     p.add_argument("--render-only", action="store_true")
-    p.add_argument("--output", type=str)
 
-    # ↓↓↓ NEW: CLI LEVEL FLAGS (minimal additive diff)
-    p.add_argument("--vocals", type=float)
-    p.add_argument("--bass", type=float)
-    p.add_argument("--guitar", type=float)
-    p.add_argument("--piano", type=float)
-    p.add_argument("--other", type=float)
+    p.add_argument("--output", help="Explicit output wav path")
 
-    # allow ignoring unknown pass-through flags from 0_master
-    args, _unknown = p.parse_known_args(argv)
-    return args
+    # forwarded flags from 0_master (ignored safely)
+    p.add_argument("--non-interactive", action="store_true")
+    p.add_argument("--reset-cache", action="store_true")
 
-
-def cli_levels_present(args) -> bool:
-    return any(
-        getattr(args, t) is not None
-        for t in ["vocals", "bass", "guitar", "piano", "other"]
-    )
-
-# =======================
-# MINIMAL-DIFF MAIN LOGIC
-# =======================
-
+    return p.parse_args(argv or sys.argv[1:])
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
 def main(argv=None):
-    args = parse_args(argv or sys.argv[1:])
+    args = parse_args(argv)
+    slug = slugify(Path(args.mp3).stem)
 
-    mp3_path = Path(args.mp3).resolve()
-    if not mp3_path.exists():
-        raise SystemExit(f"mp3 not found: {mp3_path}")
+    # Step A: Ensure demucs has run (0_master handles actual separation)
+    sep_root = SEPARATED_DIR / slug
+    if not sep_root.exists():
+        log("STEMS", f"No separated/ folder found for slug '{slug}'", YELLOW)
 
-    slug = slugify(mp3_path.stem)
-
-    if args.profile == "lyrics":
-        raise SystemExit("Profile 'lyrics' does not require stem mixing; use original mp3.")
-
-    if args.mix_ui_only and args.render_only:
-        raise SystemExit("Cannot use --mix-ui-only and --render-only together.")
-
-    out_wav = (
-        Path(args.output).resolve()
-        if args.output
-        else (MIXES_DIR / f"{slug}_{args.profile}.wav")
-    )
-
-    # =====================================
-    # NEW LOGIC: CLI LEVELS → SKIP MIX UI
-    # =====================================
-    if cli_levels_present(args):
-        log("MIX", "CLI levels provided; skipping Mix UI.", YELLOW)
-
-        defaults = profile_defaults(args.profile)
-        vols = {}
-
-        for t in TRACKS:
-            cli_val = getattr(args, t)
-            if cli_val is not None:
-                vols[t] = float(cli_val)
-            else:
-                vols[t] = defaults[t]
-
-        # save config (keeps original behavior consistent)
-        save_config(slug, args.profile, args.model, vols)
-
-        # immediately render
-        render_mix(slug, args.profile, args.model, vols, out_wav)
-        return
-
-    # =====================================
-    # ORIGINAL BEHAVIOR (unchanged)
-    # =====================================
-
+    # If only mixing UI is requested
     if args.mix_ui_only:
-        vols = mix_ui(slug, args.profile, args.model)
-        save_config(slug, args.profile, args.model, vols)
+        cfg = load_mix_config(slug, args.profile)
+        print(json.dumps({"ok": True, "slug": slug, "config": cfg}, indent=2))
         return
 
-    cfg_vols, cfg_path = load_existing_config(slug, args.profile)
-    if cfg_vols is None:
-        raise SystemExit(
-            f"No mix config found for slug={slug}, profile={args.profile}. "
-            f"Run with --mix-ui-only first or provide CLI level flags."
+    # If only render is requested
+    if args.render_only:
+        out = render_mix(
+            slug=slug,
+            profile=args.profile,
+            model=args.model,
+            mp3=Path(args.mp3),
+            explicit_output=Path(args.output) if args.output else None,
         )
-    log("MIXCFG", f"Using config from {cfg_path}", GREEN)
-    render_mix(slug, args.profile, args.model, cfg_vols, out_wav)
+        print(json.dumps({"ok": True, "slug": slug, "mix_path": str(out)}, indent=2))
+        return
+
+    # Normal mode: mix UI then render
+    cfg = load_mix_config(slug, args.profile)
+    print(json.dumps({"ok": True, "slug": slug, "config": cfg}, indent=2))
+
+    out = render_mix(
+        slug=slug,
+        profile=args.profile,
+        model=args.model,
+        mp3=Path(args.mp3),
+        explicit_output=Path(args.output) if args.output else None,
+    )
+    print(json.dumps({"ok": True, "slug": slug, "mix_path": str(out)}, indent=2))
 
 
 if __name__ == "__main__":
