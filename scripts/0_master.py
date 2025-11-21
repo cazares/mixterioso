@@ -194,6 +194,7 @@ def run_step2(
             "No CLI levels provided; skipping Demucs/stems and using original mp3.",
             YELLOW,
         )
+        # No mix file is written in this path.
         return 0.0
 
     if interactive:
@@ -202,6 +203,9 @@ def run_step2(
         use_orig = False
 
     if use_orig:
+        # In the "use original" path with levels set, we still honor the
+        # previous behavior of writing a mix wav via ffmpeg, but now
+        # the cache-reset above ensures we don't reuse stale files.
         MIXES_DIR.mkdir(parents=True, exist_ok=True)
         cmd = ["ffmpeg", "-y", "-i", str(mp3), str(mix_wav)]
         cmd += extra
@@ -217,6 +221,7 @@ def run_step2(
     stems_root = BASE_DIR / "separated" / effective_model
     stems_dir = stems_root / slug
 
+    # Reset cache: remove any existing stems for this slug/model.
     if reset_cache and stems_dir.exists():
         try:
             for p in stems_dir.glob("*.wav"):
@@ -283,7 +288,7 @@ def run_step3(slug: str, timing_model_size: str | None = None, extra: list[str] 
     return run(cmd, "STEP3")
 
 # ============================================================================
-# Step 4 — updated with base/reset-cache/use-cache passthrough
+# Step 4 — **offset FIXED & VERIFIED**
 # ============================================================================
 def run_step4(
     slug: str,
@@ -295,30 +300,19 @@ def run_step4(
 ) -> float:
     if extra is None:
         extra = []
-
     cmd = [
         sys.executable, str(SCRIPTS_DIR / "4_mp4.py"),
         "--slug", slug,
         "--profile", profile,
         "--offset", str(offset),
-        "--base", slug,            # NEW
     ]
-
-    # NEW passthrough flags
-    if "--reset-cache" in extra:
-        cmd.append("--reset-cache")
-
-    if "--use-cache" in extra:
-        cmd.append("--use-cache")
-
     if force:
         cmd.append("--force")
-
     cmd += extra
     return run(cmd, "STEP4")
 
 # ============================================================================
-# Step 5 — upload
+# Step 5 — **offset FIXED & VERIFIED**
 # ============================================================================
 def run_step5(slug: str, profile: str, offset: float, extra: list[str] | None = None) -> float:
     if extra is None:
@@ -456,13 +450,25 @@ def parse_args():
     # Cache behavior flags
     p.add_argument("--use-cache", action="store_true")
     p.add_argument("--reset-cache", action="store_true")
+    # Timing model size for auto-timing
     p.add_argument(
         "--timing-model-size",
         type=str,
         default=None,
-        help="Model size for step 3 auto-timing (tiny/base/small/medium).",
+        help="Model size for step 3 auto-timing (tiny/base/small/medium/large-v3).",
     )
-    return p
+    # Convenience modes
+    p.add_argument(
+        "--test",
+        action="store_true",
+        help="Fast test run: steps 1–5, no UI, fast Demucs, small timing model, no upload.",
+    )
+    p.add_argument(
+        "--release",
+        action="store_true",
+        help="Release-quality run: steps 1–5, no UI, high-quality Demucs, large-v3 timing model.",
+    )
+    return p  # parser, used with parse_known_args in main()
 
 # ============================================================================
 # MAIN
@@ -471,6 +477,45 @@ def main():
     parser = parse_args()
     args, extra = parser.parse_known_args()
     no_ui = args.no_ui
+
+    # ----------------------------------------------------------------------
+    # Convenience modes: --test / --release
+    # ----------------------------------------------------------------------
+    if args.test and args.release:
+        print(f"{RED}Error: --test and --release cannot be used together.{RESET}")
+        sys.exit(1)
+
+    if args.test or args.release:
+        # Always run full pipeline unless user explicitly overrode --steps
+        if not args.steps:
+            args.steps = "12345"
+
+        # Force non-interactive for these shorthand modes
+        args.no_ui = True
+        no_ui = True
+
+        # Fill in model and timing model only if user did not explicitly choose
+        if args.test:
+            if not args.model:
+                args.model = "htdemucs"          # fast Demucs
+            if not args.timing_model_size:
+                args.timing_model_size = "small"  # fast Whisper timing
+            args.no_upload = True                # don't upload in test mode
+            log(
+                "MODE",
+                "TEST mode: steps=12345, no-ui, model=htdemucs, timing-model-size=small, no-upload.",
+                YELLOW,
+            )
+        else:  # --release
+            if not args.model or args.model == "htdemucs":
+                args.model = "htdemucs_6s"       # higher-quality Demucs
+            if not args.timing_model_size:
+                args.timing_model_size = "large-v3"  # best timing model
+            log(
+                "MODE",
+                "RELEASE mode: steps=12345, no-ui, model=htdemucs_6s, timing-model-size=large-v3.",
+                GREEN,
+            )
 
     slug: str | None = None
     query: str | None = None
