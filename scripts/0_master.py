@@ -149,10 +149,24 @@ def read_offset(slug: str) -> float:
 def write_offset(slug: str, offset: float) -> None:
     OFFSETS_DIR.mkdir(parents=True, exist_ok=True)
     (OFFSETS_DIR / f"{slug}.txt").write_text(f"{offset:.3f}")
+
 # ============================================================================
 # Step 1
 # ============================================================================
 def run_step1(slug: str, query: str | None, no_ui: bool, extra: list[str]) -> float:
+    """
+    Step 1: txt/mp3/meta fetch.
+    If txt+mp3+meta already exist for this slug, we skip to avoid
+    re-downloading or re-querying APIs unnecessarily.
+    """
+    txt_path  = TXT_DIR  / f"{slug}.txt"
+    mp3_path  = MP3_DIR  / f"{slug}.mp3"
+    meta_path = META_DIR / f"{slug}.json"
+
+    if txt_path.exists() and mp3_path.exists() and meta_path.exists():
+        log("STEP1", "Skipped (txt/mp3/meta already exist)", YELLOW)
+        return 0.0
+
     cmd = [sys.executable, str(SCRIPTS_DIR / "1_txt_mp3.py")]
     cmd += ["--slug", slug]
     if no_ui:
@@ -162,13 +176,6 @@ def run_step1(slug: str, query: str | None, no_ui: bool, extra: list[str]) -> fl
             cmd.append(w)
     cmd += extra
     return run(cmd, "STEP1")
-
-# NEW FUNCTION: checks if Step 1 outputs already exist
-def step1_outputs_exist(slug: str) -> bool:
-    txt_ok  = (TXT_DIR  / f"{slug}.txt").exists()
-    mp3_ok  = (MP3_DIR  / f"{slug}.mp3").exists()
-    meta_ok = (META_DIR / f"{slug}.json").exists()
-    return txt_ok and mp3_ok and meta_ok
 
 # ============================================================================
 # Step 2
@@ -209,21 +216,21 @@ def run_step2(
         use_orig = False
 
     if use_orig:
+        # In the "use original" path with levels set, we still honor the
+        # previous behavior of writing a mix wav via ffmpeg, but now
+        # the cache-reset above ensures we don't reuse stale files.
         MIXES_DIR.mkdir(parents=True, exist_ok=True)
         cmd = ["ffmpeg", "-y", "-i", str(mp3), str(mix_wav)]
         cmd += extra
         return run(cmd, "STEP2-BYPASS")
 
-    if profile == "karaoke":
-        effective_model = "htdemucs_6s"
-        two_stems = False
-    else:
-        effective_model = model
-        two_stems = True
+    # Demucs model selection is now entirely driven by --model.
+    effective_model = model
 
     stems_root = BASE_DIR / "separated" / effective_model
     stems_dir = stems_root / slug
 
+    # Reset cache: remove any existing stems for this slug/model.
     if reset_cache and stems_dir.exists():
         try:
             for p in stems_dir.glob("*.wav"):
@@ -247,9 +254,7 @@ def run_step2(
 
     if not stems_exist:
         cmd = [sys.executable, "-m", "demucs", "-n", effective_model, str(mp3)]
-        if two_stems:
-            cmd.insert(-1, "--two-stems")
-            cmd.insert(-1, "vocals")
+        # (We rely on the model choice alone; no extra --two-stems logic here.)
         cmd += extra
         run(cmd, "STEP2-DEMUX")
 
@@ -276,6 +281,7 @@ def run_step2(
     ]
     cmd += extra
     return run(cmd, "STEP2-RENDER")
+
 # ============================================================================
 # Step 3
 # ============================================================================
@@ -289,7 +295,7 @@ def run_step3(slug: str, timing_model_size: str | None = None, extra: list[str] 
     return run(cmd, "STEP3")
 
 # ============================================================================
-# Step 4 — offset FIXED & VERIFIED
+# Step 4 — **offset FIXED & VERIFIED**
 # ============================================================================
 def run_step4(
     slug: str,
@@ -313,7 +319,7 @@ def run_step4(
     return run(cmd, "STEP4")
 
 # ============================================================================
-# Step 5 — upload
+# Step 5 — **offset FIXED & VERIFIED**
 # ============================================================================
 def run_step5(slug: str, profile: str, offset: float, extra: list[str] | None = None) -> float:
     if extra is None:
@@ -432,38 +438,80 @@ def choose_slug_and_query(no_ui: bool):
 # ARGS
 # ============================================================================
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--slug")
-    p.add_argument("--base")
-    p.add_argument("--query")
-    p.add_argument("--offset", type=float)
-    p.add_argument("--model", default="htdemucs")
-    p.add_argument("--profile", default="karaoke")
-    p.add_argument("--steps")
-    p.add_argument("--no-ui", action="store_true")
-    p.add_argument("--force-mp4", action="store_true")
-    p.add_argument("--no-upload", action="store_true")
+    p = argparse.ArgumentParser(
+        description="Mixterioso full pipeline orchestrator (steps 1–5).",
+    )
+    p.add_argument("--slug", help="Slug to use (overrides query-derived slug).")
+    p.add_argument("--base", help="Human-friendly base name; slugified internally.")
+    p.add_argument("--query", help="Search query for step 1 if slug/base not provided.")
+    p.add_argument("--offset", type=float, help="Override or set the per-slug offset (seconds).")
+    p.add_argument("--model", default="htdemucs", help="Demucs model name to use for stems (default: htdemucs).")
+    p.add_argument("--profile", default="karaoke", help="Audio mix profile name (e.g. karaoke, car-karaoke).")
+    p.add_argument(
+        "--steps",
+        help="Steps to run, e.g. '1234' or '45'. 1=txt/mp3,2=stems,3=timing,4=mp4,5=upload.",
+    )
+    p.add_argument(
+        "--no-ui",
+        action="store_true",
+        help="Disable interactive UI (slug menu, Mix UI, prompts).",
+    )
+    p.add_argument(
+        "--force-mp4",
+        action="store_true",
+        help="Force re-render of MP4 even if an output already exists.",
+    )
+    p.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Skip upload step even if step 5 is selected.",
+    )
+    # Level controls (passed through to 2_stems.py)
+    p.add_argument("--vocals", type=int, help="Override vocals level (0–200, percent-like).")
+    p.add_argument("--bass", type=int,   help="Override bass level (0–200, percent-like).")
+    p.add_argument("--drums", type=int,  help="Override drums level (0–200, percent-like).")
+    p.add_argument("--guitar", type=int, help="Override guitar level (0–200, percent-like).")
 
-    # NEW
-    p.add_argument("--force-step1", action="store_true")
+    # Cache behavior flags
+    p.add_argument(
+        "--use-cache",
+        action="store_true",
+        help="(Reserved) Prefer reusing any existing intermediates when safe.",
+    )
+    p.add_argument(
+        "--reset-cache",
+        action="store_true",
+        help="Delete cached intermediates for this run (stems, mixes, etc.) before processing.",
+    )
 
-    # Level controls
-    p.add_argument("--vocals", type=int)
-    p.add_argument("--bass", type=int)
-    p.add_argument("--drums", type=int)
-    p.add_argument("--guitar", type=int)
-
-    # Cache behavior
-    p.add_argument("--use-cache", action="store_true")
-    p.add_argument("--reset-cache", action="store_true")
-
+    # Whisper/auto-timing model size
     p.add_argument(
         "--timing-model-size",
         type=str,
         default=None,
-        help="Model size for step 3 auto-timing",
+        help="Whisper model size for auto-timing (e.g. tiny/base/small/medium/large-v3).",
     )
-    return p
+
+    # Mode shortcuts
+    p.add_argument(
+        "--test",
+        action="store_true",
+        help=(
+            "Shortcut test run: non-interactive steps=12345, "
+            "Demucs model=htdemucs_tiny, timing-model-size=base, "
+            "and --no-upload."
+        ),
+    )
+    p.add_argument(
+        "--release",
+        action="store_true",
+        help=(
+            "Shortcut release run: non-interactive steps=12345, "
+            "Demucs model=htdemucs, timing-model-size=large-v3."
+        ),
+    )
+
+    return p  # parser, used with parse_known_args in main()
 
 # ============================================================================
 # MAIN
@@ -473,28 +521,65 @@ def main():
     args, extra = parser.parse_known_args()
     no_ui = args.no_ui
 
+    # ---------------------------------------------------------
+    # MODE SHORTCUTS: --test and --release
+    # ---------------------------------------------------------
+    if args.test and args.release:
+        print(f"{RED}Cannot use --test and --release together.{RESET}")
+        sys.exit(1)
+
+    if args.test:
+        log(
+            "MODE",
+            "TEST mode: steps=12345, no-ui, model=htdemucs_tiny, timing-model-size=base, no-upload.",
+            CYAN,
+        )
+        args.no_ui = True
+        no_ui = True
+        args.steps = "12345"
+        args.model = "htdemucs_tiny"
+        if not args.timing_model_size:
+            args.timing_model_size = "base"
+        args.no_upload = True
+
+    if args.release:
+        log(
+            "MODE",
+            "RELEASE mode: steps=12345, no-ui, model=htdemucs, timing-model-size=large-v3.",
+            CYAN,
+        )
+        args.no_ui = True
+        no_ui = True
+        args.steps = "12345"
+        args.model = "htdemucs"
+        if not args.timing_model_size:
+            args.timing_model_size = "large-v3"
+
     slug: str | None = None
     query: str | None = None
 
-    # Base override
+    # NEW: base override (minimal diff)
     if args.base:
         slug = slugify(args.base)
         log("SLUG", f'Using base from CLI: "{slug}"', CYAN)
+
     elif args.slug:
         slug = slugify(args.slug)
         log("SLUG", f'Using slug from CLI: "{slug}"', CYAN)
+
     elif args.query:
         raw_q = args.query.strip()
         slug = slugify(raw_q)
         query = raw_q
         log("SLUG", f'Using slug "{slug}" from CLI query', CYAN)
+
     else:
         slug, query = choose_slug_and_query(no_ui=no_ui)
         if not slug:
             print(f"{RED}No slug provided and no previous slug exists.{RESET}")
             sys.exit(1)
 
-    # Offset load/store
+    # offset load/store
     if args.offset is not None:
         offset = args.offset
         write_offset(slug, offset)
@@ -506,7 +591,7 @@ def main():
     if args.timing_model_size:
         log("TIMING", f"Using timing model size={args.timing_model_size}", CYAN)
 
-    # Determine if CLI levels were provided
+    # Determine if any CLI levels were provided
     has_levels = any(
         v is not None
         for v in (args.vocals, args.bass, args.drums, args.guitar)
@@ -527,11 +612,11 @@ def main():
     else:
         if no_ui:
             if status["1"] == "MISSING":
-                steps = [1,2,3,4]
+                steps = [1, 2, 3, 4]
             elif status["2"] == "MISSING":
-                steps = [2,3,4]
+                steps = [2, 3, 4]
             elif status["3"] == "MISSING":
-                steps = [3,4]
+                steps = [3, 4]
             elif status["4"] == "MISSING":
                 steps = [4]
             else:
@@ -541,17 +626,12 @@ def main():
             steps = choose_steps_interactive(status)
             log("MASTER", f"Running steps: {steps}", CYAN)
 
-    # ============================================================
-    # RUN STEPS with NEW STEP-1 SKIP LOGIC
-    # ============================================================
+    # Run steps
     t1 = t2 = t3 = t4 = t5 = 0.0
 
-    # STEP 1 skip logic
     if 1 in steps:
-        if not args.force_step1 and step1_outputs_exist(slug):
-            log("STEP1", "Skipped (txt/mp3/meta already exist)", YELLOW)
-        else:
-            t1 = run_step1(slug, query, no_ui, extra)
+        t1 = run_step1(slug, query, no_ui, extra)
+
     if 2 in steps:
         t2 = run_step2(
             slug,
@@ -586,16 +666,11 @@ def main():
     if total > 0:
         print()
         print(f"{BOLD}{CYAN}======== PIPELINE SUMMARY ========{RESET}")
-        if t1:
-            print(f"{WHITE}Step1 txt/mp3:{RESET}  {GREEN}{fmt_secs(t1)}{RESET}")
-        if t2:
-            print(f"{WHITE}Step2 stems:{RESET}    {GREEN}{fmt_secs(t2)}{RESET}")
-        if t3:
-            print(f"{WHITE}Step3 timing:{RESET}   {GREEN}{fmt_secs(t3)}{RESET}")
-        if t4:
-            print(f"{WHITE}Step4 mp4:{RESET}      {GREEN}{fmt_secs(t4)}{RESET}")
-        if t5:
-            print(f"{WHITE}Step5 upload:{RESET}   {GREEN}{fmt_secs(t5)}{RESET}")
+        if t1: print(f"{WHITE}Step1 txt/mp3:{RESET}  {GREEN}{fmt_secs(t1)}{RESET}")
+        if t2: print(f"{WHITE}Step2 stems:{RESET}    {GREEN}{fmt_secs(t2)}{RESET}")
+        if t3: print(f"{WHITE}Step3 timing:{RESET}   {GREEN}{fmt_secs(t3)}{RESET}")
+        if t4: print(f"{WHITE}Step4 mp4:{RESET}      {GREEN}{fmt_secs(t4)}{RESET}")
+        if t5: print(f"{WHITE}Step5 upload:{RESET}   {GREEN}{fmt_secs(t5)}{RESET}")
         print(f"{GREEN}Total time:{RESET}       {BOLD}{fmt_secs(total)}{RESET}")
         print(f"{BOLD}{CYAN}=================================={RESET}")
 
