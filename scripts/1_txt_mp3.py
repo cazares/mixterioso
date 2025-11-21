@@ -27,13 +27,13 @@ MAGENTA = "\033[35m"
 WHITE   = "\033[97m"
 
 def log(section: str, msg: str, color: str = CYAN) -> None:
-    ts = time.strftime("%H:%M:%S")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"{color}[{ts}] [{section}]{RESET} {msg}")
 
 # =====================================================================
 # Paths
 # =====================================================================
-BASE_DIR   = Path(__file__).resolve().parent.parent
+BASE_DIR    = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = BASE_DIR / "scripts"
 TXT_DIR     = BASE_DIR / "txts"
 MP3_DIR     = BASE_DIR / "mp3s"
@@ -92,7 +92,7 @@ def load_cache() -> Dict[str, Any]:
     if CACHE_FILE.exists():
         try:
             return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-        except:
+        except Exception:
             return {}
     return {}
 
@@ -165,7 +165,7 @@ def youtube_api_search(query: str, yt_key: str, max_results: int = 12) -> List[D
 
     indexed = {x.get("id"): x for x in stats_data.get("items", [])}
 
-    out = []
+    out: List[Dict[str, Any]] = []
     for it in items:
         vid = it["id"]["videoId"]
         node = indexed.get(vid, {})
@@ -190,14 +190,14 @@ def youtube_fallback_yt_dlp(query: str, limit: int = 12) -> List[Dict[str, Any]]
     try:
         cmd = ["yt-dlp", "-j", f"ytsearch{limit}:{query}"]
         out = subprocess.check_output(cmd, text=True)
-    except:
+    except Exception:
         return []
 
-    out_list = []
+    out_list: List[Dict[str, Any]] = []
     for line in out.splitlines():
         try:
             d = json.loads(line)
-        except:
+        except Exception:
             continue
         if "title" not in d or "webpage_url" not in d:
             continue
@@ -292,6 +292,7 @@ def display_page(results: List[Dict[str, Any]], page: int, per_page: int = 3) ->
     print(" ".join(nav))
 
     print(f"{MAGENTA}Type # to select, arrows to navigate, ENTER to cancel.{RESET}")
+
 def interactive_youtube_pick(results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     Arrow-key + pagination selection (3 items per page).
@@ -341,11 +342,10 @@ def interactive_youtube_pick(results: List[Dict[str, Any]]) -> Optional[Dict[str
                 idx2 = int(buf)
                 if 1 <= idx2 <= total:
                     return results[idx2 - 1]
-            except:
+            except Exception:
                 pass
 
         # Unknown key → ignore and refresh
-
 
 # =====================================================================
 # Genius Search
@@ -379,7 +379,6 @@ def search_genius(query: str, token: str) -> Tuple[Optional[str], Optional[str],
         log("GENIUS", f"Error: {e}", RED)
         return None, None, None
 
-
 # =====================================================================
 # Musixmatch lyrics
 # =====================================================================
@@ -391,7 +390,7 @@ def fetch_lyrics_musixmatch(
     api_key: str,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
 
-    params = {
+    params: Dict[str, Any] = {
         "apikey": api_key,
         "f_has_lyrics": 1,
         "page_size": 1,
@@ -451,7 +450,6 @@ def fetch_lyrics_musixmatch(
     }
     return lyr, meta
 
-
 # =====================================================================
 # Lyrics fallback logic
 # =====================================================================
@@ -504,7 +502,6 @@ def fetch_lyrics_with_fallbacks(
         "youtube_url": yt_url,
     }
 
-
 # =====================================================================
 # Audio download
 # =====================================================================
@@ -532,20 +529,23 @@ def download_audio_from_youtube(video_id: str, slug: str) -> Tuple[Optional[str]
         meta_out = subprocess.check_output(["yt-dlp", "-j", url], text=True)
         data = json.loads([ln for ln in meta_out.splitlines() if ln.strip()][-1])
         return data.get("title"), data.get("uploader")
-    except:
+    except Exception:
         return None, None
-
 
 # =====================================================================
 # ARGS + MAIN
 # =====================================================================
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="txt+mp3 generator with YouTube API + Genius + Musixmatch")
+    p = argparse.ArgumentParser(
+        description="txt+mp3 generator with YouTube API + Genius + Musixmatch"
+    )
+    p.add_argument("--base", type=str, help="Base name to derive slug (preferred).")
     p.add_argument("--slug", type=str, help="Slug override.")
     p.add_argument("--no-ui", action="store_true", help="Disable interactive UI.")
     p.add_argument("query", nargs="*", help="Song search query.")
     return p.parse_args(argv)
+
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
 
@@ -571,15 +571,19 @@ def main(argv=None):
     log("MODE", f'txt+mp3 generation for query "{raw_query}"', CYAN)
 
     # ---------------------------------------------------------------
-    # Slug handling
+    # Slug handling (IDENTICAL precedence: base > slug > query)
     # ---------------------------------------------------------------
-    if args.slug:
+    if args.base:
+        slug = slugify(args.base)
+        log("SLUG", f'Using base from CLI: "{args.base}" -> slug "{slug}"', GREEN)
+    elif args.slug:
         slug = slugify(args.slug)
         log("SLUG", f'Using overridden slug "{slug}"', GREEN)
     else:
         auto_slug = slugify(raw_query)
         if args.no_ui:
             slug = auto_slug
+            log("SLUG", f'Using auto slug "{slug}" (no-ui)', GREEN)
         else:
             print()
             try:
@@ -589,7 +593,6 @@ def main(argv=None):
                 ).strip()
             except EOFError:
                 manual = ""
-
             slug = slugify(manual) if manual else auto_slug
             log("SLUG", f'Using slug "{slug}"', GREEN)
 
