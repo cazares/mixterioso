@@ -156,9 +156,9 @@ def write_offset(slug: str, offset: float) -> None:
     (OFFSETS_DIR / f"{slug}.txt").write_text(f"{offset:.3f}")
 
 # ============================================================================
-# Step 1 — unchanged
+# Step 1
 # ============================================================================
-def run_step1(slug: str, query: str | None, no_ui: bool) -> float:
+def run_step1(slug: str, query: str | None, no_ui: bool, extra: list[str]) -> float:
     cmd = [sys.executable, str(SCRIPTS_DIR / "1_txt_mp3.py")]
     cmd += ["--slug", slug]
     if no_ui:
@@ -166,12 +166,13 @@ def run_step1(slug: str, query: str | None, no_ui: bool) -> float:
     if query:
         for w in query.split():
             cmd.append(w)
+    cmd += extra
     return run(cmd, "STEP1")
 
 # ============================================================================
-# Step 2 — unchanged
+# Step 2
 # ============================================================================
-def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
+def run_step2(slug: str, profile: str, model: str, interactive: bool, extra: list[str]) -> float:
     mp3 = MP3_DIR / f"{slug}.mp3"
     mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
 
@@ -183,6 +184,7 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
     if use_orig:
         MIXES_DIR.mkdir(parents=True, exist_ok=True)
         cmd = ["ffmpeg", "-y", "-i", str(mp3), str(mix_wav)]
+        cmd += extra
         return run(cmd, "STEP2-BYPASS")
 
     if profile == "karaoke":
@@ -209,6 +211,7 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
         if two_stems:
             cmd.insert(-1, "--two-stems")
             cmd.insert(-1, "vocals")
+        cmd += extra
         run(cmd, "STEP2-DEMUX")
 
     cmd = [
@@ -220,6 +223,7 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
     ]
     if not interactive:
         cmd.append("--non-interactive")
+    cmd += extra
     run(cmd, "STEP2-MIXUI")
 
     MIXES_DIR.mkdir(parents=True, exist_ok=True)
@@ -231,21 +235,34 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool) -> float:
         "--render-only",
         "--output", str(mix_wav),
     ]
+    cmd += extra
     return run(cmd, "STEP2-RENDER")
 
 # ============================================================================
-# Step 3 — unchanged
+# Step 3
 # ============================================================================
-def run_step3(slug: str, timing_model_size: str | None = None) -> float:
+def run_step3(slug: str, timing_model_size: str | None = None, extra: list[str] | None = None) -> float:
+    if extra is None:
+        extra = []
     cmd = [sys.executable, str(SCRIPTS_DIR / "3_auto_timing.py"), "--slug", slug]
     if timing_model_size:
         cmd += ["--model-size", timing_model_size]
+    cmd += extra
     return run(cmd, "STEP3")
 
 # ============================================================================
 # Step 4 — **offset FIXED & VERIFIED**
 # ============================================================================
-def run_step4(slug: str, profile: str, offset: float, force: bool = False, called_from_master: bool = True) -> float:
+def run_step4(
+    slug: str,
+    profile: str,
+    offset: float,
+    force: bool = False,
+    called_from_master: bool = True,
+    extra: list[str] | None = None,
+) -> float:
+    if extra is None:
+        extra = []
     cmd = [
         sys.executable, str(SCRIPTS_DIR / "4_mp4.py"),
         "--slug", slug,
@@ -254,18 +271,22 @@ def run_step4(slug: str, profile: str, offset: float, force: bool = False, calle
     ]
     if force:
         cmd.append("--force")
+    cmd += extra
     return run(cmd, "STEP4")
 
 # ============================================================================
 # Step 5 — **offset FIXED & VERIFIED**
 # ============================================================================
-def run_step5(slug: str, profile: str, offset: float) -> float:
+def run_step5(slug: str, profile: str, offset: float, extra: list[str] | None = None) -> float:
+    if extra is None:
+        extra = []
     fname = f"{slug}_{profile}_offset_{format_offset_tag(offset)}.mp4"
     path = OUTPUT_DIR / fname
     cmd = [
         sys.executable, str(SCRIPTS_DIR / "5_upload.py"),
         "--file", str(path),
     ]
+    cmd += extra
     return run(cmd, "STEP5")
 
 # ============================================================================
@@ -370,12 +391,12 @@ def choose_slug_and_query(no_ui: bool):
     return choose_slug_and_query(False)
 
 # ============================================================================
-# ARGS — modified (Iteration 1)
+# ARGS
 # ============================================================================
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--slug")
-    p.add_argument("--base")   # ← ADDED MINIMAL DIFF
+    p.add_argument("--base")
     p.add_argument("--query")
     p.add_argument("--offset", type=float)
     p.add_argument("--model", default="htdemucs")
@@ -390,13 +411,14 @@ def parse_args():
         default=None,
         help="Model size for step 3 auto-timing (tiny/base/small/medium).",
     )
-    return p.parse_args()
+    return p  # changed from p.parse_args() to return the parser
 
 # ============================================================================
-# MAIN — modified (Iteration 1)
+# MAIN
 # ============================================================================
 def main():
-    args = parse_args()
+    parser = parse_args()
+    args, extra = parser.parse_known_args()
     no_ui = args.no_ui
 
     slug: str | None = None
@@ -468,23 +490,24 @@ def main():
     t1 = t2 = t3 = t4 = t5 = 0.0
 
     if 1 in steps:
-        t1 = run_step1(slug, query, no_ui)
+        t1 = run_step1(slug, query, no_ui, extra)
 
     if 2 in steps:
-        t2 = run_step2(slug, args.profile, args.model, interactive=not no_ui)
+        t2 = run_step2(slug, args.profile, args.model, interactive=not no_ui, extra=extra)
 
     if 3 in steps:
-        t3 = run_step3(slug, args.timing_model_size)
+        t3 = run_step3(slug, args.timing_model_size, extra=extra)
 
     if 4 in steps:
         t4 = run_step4(
             slug, args.profile, offset,
             force=args.force_mp4,
-            called_from_master=True
+            called_from_master=True,
+            extra=extra,
         )
 
     if 5 in steps and not args.no_upload:
-        t5 = run_step5(slug, args.profile, offset)
+        t5 = run_step5(slug, args.profile, offset, extra=extra)
     elif 5 in steps and args.no_upload:
         log("STEP5", "Upload requested but --no-upload is set; skipping.", YELLOW)
 
