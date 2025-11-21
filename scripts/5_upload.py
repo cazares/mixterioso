@@ -263,14 +263,12 @@ def get_creds() -> Credentials:
 def build_youtube(creds: Credentials):
     return build("youtube", "v3", credentials=creds)
 
-
 def parse_args():
     # MINIMAL DIFF: use parse_known_args to allow pass-through flags
     p = argparse.ArgumentParser(description="Upload a video to YouTube with OAuth.", add_help=True)
 
     p.add_argument("--file", required=True, help="Path to the MP4 to upload")
     p.add_argument("--title", help="Video title; overrides auto-title")
-    p.add_argument("--description", default="", help="Video description")
     p.add_argument("--tags", default="", help="Comma-separated tags")
 
     p.add_argument("--category-id", default="10", help="YouTube categoryId (default=10 Music)")
@@ -297,13 +295,12 @@ def parse_args():
     p.add_argument("--profile", default=None)
     p.add_argument("--offset", type=float, default=None)
 
-    # Video description on the YouTube video itself (persistent after upload)
+    # Final + only --description
     p.add_argument("--description", default=DEFAULT_DESCRIPTION, help="Video description")
 
     args, unknown = p.parse_known_args()
-    args._unknown = unknown  # store unknown flags minimally
+    args._unknown = unknown
     return args
-
 
 def main():
     args = parse_args()

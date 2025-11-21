@@ -288,10 +288,19 @@ def run_step2(
 def run_step3(slug: str, timing_model_size: str | None = None, extra: list[str] | None = None) -> float:
     if extra is None:
         extra = []
+
+    # Remove flags not supported by 3_auto_timing.py
+    filtered_extra = [
+        x for x in extra
+        if x not in ("--test", "--release")
+    ]
+
     cmd = [sys.executable, str(SCRIPTS_DIR / "3_auto_timing.py"), "--slug", slug]
+
     if timing_model_size:
         cmd += ["--model-size", timing_model_size]
-    cmd += extra
+
+    cmd += filtered_extra
     return run(cmd, "STEP3")
 
 # ============================================================================
@@ -519,6 +528,11 @@ def parse_args():
 def main():
     parser = parse_args()
     args, extra = parser.parse_known_args()
+
+    # Remove master-level flags so they are not forwarded to sub-scripts
+    master_only_flags = {"--test", "--release", "--base"}
+    extra = [x for x in extra if x not in master_only_flags]
+
     no_ui = args.no_ui
 
     # ---------------------------------------------------------
@@ -644,7 +658,10 @@ def main():
         )
 
     if 3 in steps:
-        t3 = run_step3(slug, args.timing_model_size, extra=extra)
+        # REMOVE global flags not meant for 3_auto_timing
+        step3_extra = [x for x in extra if x not in ("--test", "--release")]
+        t3 = run_step3(slug, args.timing_model_size, extra=step3_extra)
+
 
     if 4 in steps:
         t4 = run_step4(

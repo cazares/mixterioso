@@ -54,7 +54,9 @@ import math
 import os
 import re
 import sys
+import re
 import unicodedata
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -79,6 +81,17 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 MAGENTA = "\033[35m"
+
+# --------------------------------------------------------------------------
+# Minimal logger (mirrors 0_master.py style)
+# --------------------------------------------------------------------------
+def log(section: str, msg: str, color: str = CYAN) -> None:
+    print(f"{color}[{section}]{RESET} {msg}")
+
+def slugify(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    return s.strip("_")
 
 
 def _plain_print(tag: str, color: str, msg: str) -> None:
@@ -349,6 +362,12 @@ def run_asr_with_faster_whisper(
             "ASR produced no word-level output. "
             "Track may be purely instrumental or extremely low volume."
         )
+
+    meta_path = TIMINGS_DIR / f"{slug}.timingmeta.json"
+    meta_path.write_text(json.dumps({
+        "model_size": args.model_size,
+        "timestamp": datetime.now().isoformat()
+    }, indent=2))
 
     return words, audio_duration
 
@@ -723,232 +742,235 @@ def write_csv(path: Path, line_timings: List[LineTiming]) -> None:
 
 
 # ----- CLI -----
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def parse_args():
     p = argparse.ArgumentParser(
-        description="Auto-generate line-level lyric timings from audio + lyrics."
+        description="Whisper-based auto-timing engine for karaoke."
     )
-    p.add_argument("--slug", type=str, help="Song slug (txts/<slug>.txt, mp3s/<slug>.mp3)")
-    p.add_argument("--audio", type=str, help="Explicit audio path.")
-    p.add_argument("--lyrics", type=str, help="Explicit lyrics path.")
-    p.add_argument("--out-csv", type=str, help="Output CSV path.")
-    p.add_argument(
-        "--language",
-        type=str,
-        default="en",
-        help="Language code (e.g. 'en', 'es') or 'auto'.",
-    )
-    p.add_argument(
-        "--model-size",
-        type=str,
-        default=DEFAULT_MODEL_SIZE,
-        help=f"Whisper model size (default: {DEFAULT_MODEL_SIZE}).",
-    )
-    p.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="'auto', 'cpu', or 'cuda' (default: auto).",
-    )
-    p.add_argument(
-        "--compute-type",
-        type=str,
-        default=None,
-        help="Whisper compute_type (e.g. 'float16', 'int8').",
-    )
-    p.add_argument(
-        "--beam-size",
-        type=int,
-        default=5,
-        help="Beam size for decoding (default: 5).",
-    )
-    p.add_argument(
-        "--min-line-duration",
-        type=float,
-        default=DEFAULT_MIN_LINE_DURATION,
-        help="Minimum allowed line duration (seconds).",
-    )
-    p.add_argument(
-        "--fallback-line-duration",
-        type=float,
-        default=DEFAULT_FALLBACK_LINE_DURATION,
-        help="Fallback duration for unmatched lines (seconds).",
-    )
-    p.add_argument(
-        "--min-similarity",
-        type=float,
-        default=DEFAULT_MIN_SIMILARITY,
-        help="Min token similarity (0–1) to accept a match.",
-    )
-    p.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable verbose debug logging.",
-    )
-    p.add_argument("--test", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--release", action="store_true", help=argparse.SUPPRESS)
-    return p.parse_args(argv)
 
+    p.add_argument("--slug")
+    p.add_argument("--base", help="Optional base name override")
+    p.add_argument("--audio")
+    p.add_argument("--lyrics")
+    p.add_argument("--out-csv")
+
+    p.add_argument("--language", default="en")
+    p.add_argument("--model-size", default="base")
+
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--compute-type", default="auto")
+    p.add_argument("--beam-size", type=int, default=5)
+
+    p.add_argument("--min-line-duration", type=float, default=0.80)
+    p.add_argument("--fallback-line-duration", type=float, default=2.50)
+    p.add_argument("--min-similarity", type=float, default=0.60)
+
+    p.add_argument("--debug", action="store_true")
+
+    # required for 0_master.py
+    p.add_argument("--no-ui", action="store_true")
+
+    # required because 0_master passes these flags indirectly
+    p.add_argument("--test", action="store_true")
+    p.add_argument("--release", action="store_true")
+    p.add_argument("--force-retime", action="store_true")
+
+    return p
 
 # ----- main -----
-def main(argv: Optional[List[str]] = None) -> None:
-    args = parse_args(argv)
+def main():
+    parser = parse_args()
+    args, extra = parser.parse_known_args()
+    no_ui = args.no_ui
 
-    slug = args.slug
-    audio_path = Path(args.audio) if args.audio else None
-    lyrics_path = Path(args.lyrics) if args.lyrics else None
-
-    if not slug:
-        if audio_path is not None:
-            slug = audio_path.stem
-            log_warn(f"No --slug provided, inferring from audio: '{slug}'")
-        elif lyrics_path is not None:
-            slug = lyrics_path.stem
-            log_warn(f"No --slug provided, inferring from lyrics: '{slug}'")
-        else:
-            die("Provide --slug or at least --audio or --lyrics so I can infer it.")
-
-    assert slug is not None
-    slug = slug.strip()
-    if not slug:
-        die("Resolved slug is empty; provide a valid --slug.")
-
-    if lyrics_path is None:
-        lyrics_path = TXT_DIR / f"{slug}.txt"
-
-    audio_path = pick_audio_for_slug(slug, audio_path)
-
-    if args.out_csv:
-        out_csv = Path(args.out_csv)
-    else:
-        out_csv = TIMINGS_DIR / f"{slug}.csv"
+    # ---------------------------------------------------------
+    # MODE SHORTCUTS: --test and --release
+    # ---------------------------------------------------------
+    if args.test and args.release:
+        print(f"{RED}Cannot use --test and --release together.{RESET}")
+        sys.exit(1)
 
     if args.test:
-        log("MODE", "TEST mode: steps=12345, no-ui, model=htdemucs_tiny, timing-model-size=base, no-upload.", CYAN)
+        log(
+            "MODE",
+            "TEST mode: auto-steps, no-ui, model=htdemucs_tiny, timing-model-size=base, no-upload.",
+            CYAN,
+        )
         args.no_ui = True
-        args.steps = "12345"
+        no_ui = True
+        args.steps = None                      # <<< FIXED
         args.model = "htdemucs_tiny"
-        args.timing_model_size = "base"
-        # args.no_upload = True
+        if not args.timing_model_size:
+            args.timing_model_size = "base"
+        args.no_upload = True
 
     if args.release:
-        log("MODE", "RELEASE mode: steps=12345, no-ui, model=htdemucs, timing-model-size=large-v3.", CYAN)
+        log(
+            "MODE",
+            "RELEASE mode: auto-steps, no-ui, model=htdemucs, timing-model-size=large-v3.",
+            CYAN,
+        )
         args.no_ui = True
-        args.steps = "12345"
+        no_ui = True
+        args.steps = None                      # <<< FIXED
         args.model = "htdemucs"
-        args.timing_model_size = "large-v3"
+        if not args.timing_model_size:
+            args.timing_model_size = "large-v3"
 
-    device = guess_device() if args.device == "auto" else args.device
+    slug: str | None = None
+    query: str | None = None
 
-    if _RICH_AVAILABLE and console is not None:
-        table = Table(title="3_auto_timing configuration")
-        table.add_column("Key", style="bold cyan")
-        table.add_column("Value", style="white")
-        table.add_row("Slug", slug)
-        table.add_row("Audio", str(audio_path))
-        table.add_row("Lyrics", str(lyrics_path))
-        table.add_row("Out CSV", str(out_csv))
-        table.add_row("Language", args.language)
-        table.add_row("Model size", args.model_size)
-        table.add_row("Device", device)
-        table.add_row("Compute type", args.compute_type or "(auto)")
-        table.add_row("Beam size", str(args.beam_size))
-        table.add_row("Min line duration", f"{args.min_line_duration:.2f} s")
-        table.add_row("Fallback line duration", f"{args.fallback_line_duration:.2f} s")
-        table.add_row("Min similarity", f"{args.min_similarity:.2f}")
-        console.print(table)
+    # ----------------------------------------------------------------------
+    # SLUG & QUERY
+    # ----------------------------------------------------------------------
+    slug: str | None = None
+    query: str | None = None
+
+    if args.slug:
+        slug = slugify(args.slug)
+        log("SLUG", f'Using slug from CLI: "{slug}"', CYAN)
+
+    elif args.base:
+        slug = slugify(args.base)
+        log("SLUG", f'Using base from CLI: "{slug}"', CYAN)
+
+    elif args.query:
+        raw_q = args.query.strip()
+        slug = slugify(raw_q)
+        query = raw_q
+        log("SLUG", f'Using slug "{slug}" from CLI query', CYAN)
+
     else:
-        log_info(f"Slug           : {slug}")
-        log_info(f"Audio          : {audio_path}")
-        log_info(f"Lyrics         : {lyrics_path}")
-        log_info(f"Out CSV        : {out_csv}")
-        log_info(f"Language       : {args.language}")
-        log_info(f"Model size     : {args.model_size}")
-        log_info(f"Device         : {device}")
-        log_info(f"Compute type   : {args.compute_type or '(auto)'}")
-        log_info(f"Beam size      : {args.beam_size}")
-        log_info(f"Min line dur   : {args.min_line_duration:.2f}s")
-        log_info(f"Fallback line  : {args.fallback_line_duration:.2f}s")
-        log_info(f"Min similarity : {args.min_similarity:.2f}")
+        slug, query = choose_slug_and_query(no_ui=no_ui)
+        if not slug:
+            print(f"{RED}No slug provided and no previous slug exists.{RESET}")
+            sys.exit(1)
 
-    log_info(f"Loading lyrics from {lyrics_path} ...")
-    lyrics_data = load_lyrics(lyrics_path, debug=args.debug)
+    # ----------------------------------------------------------------------
+    # EARLY EXIT: CSV exists AND model matches → skip transcription
+    # ----------------------------------------------------------------------
+    csv_path = TIMINGS_DIR / f"{slug}.csv"
+    meta_path = TIMINGS_DIR / f"{slug}.timingmeta.json"
+    current_model = args.model_size
 
-    words, audio_duration = run_asr_with_faster_whisper(
-        audio_path=audio_path,
-        model_size=args.model_size,
-        language=args.language,
-        device=device,
-        compute_type=args.compute_type,
-        beam_size=args.beam_size,
-        debug=args.debug,
+    if csv_path.exists() and meta_path.exists():
+        try:
+            import json
+            prev = json.loads(meta_path.read_text())
+
+            prev_model = prev.get("model_size")
+
+            if prev_model == current_model:
+                log("TIMING", f"CSV exists and model matches ({current_model}); skipping transcription.", GREEN)
+                return
+            else:
+                log("TIMING", f"Model changed ({prev_model} → {current_model}); re-transcribing.", YELLOW)
+
+        except Exception:
+            log("TIMING", "Meta read failed; re-transcribing.", RED)
+
+
+    # ----------------------------------------------------------------------
+    # EARLY EXIT: CSV already exists → skip transcription entirely
+    # ----------------------------------------------------------------------
+    csv_path = TIMINGS_DIR / f"{slug}.csv"
+    if csv_path.exists() and not args.force_retime:
+        log("TIMING", f"CSV exists, skipping transcription: {csv_path}", GREEN)
+        return
+
+    if args.timing_model_size:
+        log("TIMING", f"Using timing model size={args.timing_model_size}", CYAN)
+
+    # Determine if any CLI levels were provided
+    has_levels = any(
+        v is not None
+        for v in (args.vocals, args.bass, args.drums, args.guitar)
     )
 
-    # ASR tokens and mapping back to words
-    asr_tokens: List[str] = []
-    asr_token_to_word: List[int] = []
-    for wi, w in enumerate(words):
-        toks = tokenize_line(w.text)
-        if not toks:
-            continue
-        asr_tokens.extend(toks)
-        asr_token_to_word.extend([wi] * len(toks))
+    status = detect_step_status(slug, args.profile)
+    show_pipeline_status(status)
 
-    if len(asr_tokens) != len(asr_token_to_word):
-        die(
-            "Internal error: asr_tokens and asr_token_to_word length mismatch "
-            f"({len(asr_tokens)} vs {len(asr_token_to_word)})."
+    # ---------------------------------------------------------
+    # STEP SELECTION (respect auto-selection)
+    # ---------------------------------------------------------
+    if args.steps:
+        steps: list[int] = []
+        for ch in args.steps:
+            if ch.isdigit():
+                i = int(ch)
+                if 1 <= i <= 5 and i not in steps:
+                    steps.append(i)
+        log("MASTER", f"Running requested steps: {steps}", CYAN)
+    else:
+        if no_ui:
+            if status["1"] == "MISSING":
+                steps = [1, 2, 3, 4]
+            elif status["2"] == "MISSING":
+                steps = [2, 3, 4]
+            elif status["3"] == "MISSING":
+                steps = [3, 4]
+            elif status["4"] == "MISSING":
+                steps = [4]
+            else:
+                steps = []
+
+            # <<< SPECIAL CASE: if CSV exists, DO NOT run step 3
+            if "3" in status and status["3"] == "DONE" and 3 in steps:
+                steps.remove(3)
+
+            log("MASTER", f"--no-ui auto-selected steps: {steps}", CYAN)
+        else:
+            steps = choose_steps_interactive(status)
+            log("MASTER", f"Running steps: {steps}", CYAN)
+
+    # ---------------------------------------------------------
+    # RUN STEPS
+    # ---------------------------------------------------------
+    t1 = t2 = t3 = t4 = t5 = 0.0
+
+    if 1 in steps:
+        t1 = run_step1(slug, query, no_ui, extra)
+
+    if 2 in steps:
+        t2 = run_step2(
+            slug,
+            args.profile,
+            args.model,
+            interactive=not no_ui,
+            extra=extra,
+            has_levels=has_levels,
+            reset_cache=args.reset_cache,
         )
 
-    log_info(
-        f"Prepared {len(lyrics_data.tokens)} lyrics tokens and "
-        f"{len(asr_tokens)} ASR tokens for alignment."
-    )
+    if 3 in steps:
+        t3 = run_step3(slug, args.timing_model_size, extra=extra)
 
-    token_map_tok_to_asr = align_tokens_dp(
-        lyrics_tokens=lyrics_data.tokens,
-        asr_tokens=asr_tokens,
-        min_similarity=args.min_similarity,
-        debug=args.debug,
-    )
+    if 4 in steps:
+        t4 = run_step4(
+            slug,
+            args.profile,
+            offset,
+            force=args.force_mp4,
+            called_from_master=True,
+            extra=extra,
+        )
 
-    # lyric token -> ASR word index
-    token_map_to_word: List[Optional[int]] = []
-    for maybe_tok_idx in token_map_tok_to_asr:
-        if maybe_tok_idx is None:
-            token_map_to_word.append(None)
-        else:
-            if 0 <= maybe_tok_idx < len(asr_token_to_word):
-                token_map_to_word.append(asr_token_to_word[maybe_tok_idx])
-            else:
-                token_map_to_word.append(None)
+    if 5 in steps and not args.no_upload:
+        t5 = run_step5(slug, args.profile, offset, extra=extra)
+    elif 5 in steps and args.no_upload:
+        log("STEP5", "Upload requested but --no-upload is set; skipping.", YELLOW)
 
-    all_word_intervals: List[Tuple[float, float]] = [
-        (w.start, w.end) for w in words
-    ]
+    total = t1 + t2 + t3 + t4 + t5
 
-    line_timings = build_line_timings(
-        lyrics_data=lyrics_data,
-        words=words,
-        token_mapping=token_map_to_word,
-        audio_duration=audio_duration,
-        min_line_duration=args.min_line_duration,
-        fallback_line_duration=args.fallback_line_duration,
-        gap_after_line=DEFAULT_GAP_AFTER_LINE,
-        all_word_intervals=all_word_intervals,
-        debug=args.debug,
-    )
-
-    aligned_count = sum(1 for lt in line_timings if lt.has_alignment)
-    excluded_count = sum(1 for lt in line_timings if lt.excluded)
-    log_ok(
-        f"Line timing complete: {aligned_count}/{len(line_timings)} lines "
-        f"had direct ASR alignment; {excluded_count} lines excluded "
-        f"(instrumental-only gaps + blanks); others were interpolated "
-        f"with pre-chorus tag packing."
-    )
-
-    write_csv(out_csv, line_timings)
-
+    if total > 0:
+        print()
+        print(f"{BOLD}{CYAN}======== PIPELINE SUMMARY ========{RESET}")
+        if t1: print(f"{WHITE}Step1 txt/mp3:{RESET}  {GREEN}{fmt_secs(t1)}{RESET}")
+        if t2: print(f"{WHITE}Step2 stems:{RESET}    {GREEN}{fmt_secs(t2)}{RESET}")
+        if t3: print(f"{WHITE}Step3 timing:{RESET}   {GREEN}{fmt_secs(t3)}{RESET}")
+        if t4: print(f"{WHITE}Step4 mp4:{RESET}      {GREEN}{fmt_secs(t4)}{RESET}")
+        if t5: print(f"{WHITE}Step5 upload:{RESET}   {GREEN}{fmt_secs(t5)}{RESET}")
+        print(f"{GREEN}Total time:{RESET}       {BOLD}{fmt_secs(total)}{RESET}")
+        print(f"{BOLD}{CYAN}=================================={RESET}")
 
 if __name__ == "__main__":
     main()
