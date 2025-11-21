@@ -122,7 +122,7 @@ DEFAULT_UI_FONT_SIZE  = 120
 ASS_FONT_MULTIPLIER   = 1.5
 
 # Global offset
-LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "-0.5") or "-0.5")
+LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "-1.75") or "-1.75")
 
 # =============================================================================
 # MUSIC NOTES

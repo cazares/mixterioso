@@ -734,7 +734,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--language",
         type=str,
-        default="auto",
         help="Language code (e.g. 'en', 'es') or 'auto'.",
     )
     p.add_argument(
