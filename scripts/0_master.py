@@ -194,7 +194,6 @@ def run_step2(
             "No CLI levels provided; skipping Demucs/stems and using original mp3.",
             YELLOW,
         )
-        # No mix file is written in this path.
         return 0.0
 
     if interactive:
@@ -203,9 +202,6 @@ def run_step2(
         use_orig = False
 
     if use_orig:
-        # In the "use original" path with levels set, we still honor the
-        # previous behavior of writing a mix wav via ffmpeg, but now
-        # the cache-reset above ensures we don't reuse stale files.
         MIXES_DIR.mkdir(parents=True, exist_ok=True)
         cmd = ["ffmpeg", "-y", "-i", str(mp3), str(mix_wav)]
         cmd += extra
@@ -221,7 +217,6 @@ def run_step2(
     stems_root = BASE_DIR / "separated" / effective_model
     stems_dir = stems_root / slug
 
-    # Reset cache: remove any existing stems for this slug/model.
     if reset_cache and stems_dir.exists():
         try:
             for p in stems_dir.glob("*.wav"):
@@ -288,7 +283,7 @@ def run_step3(slug: str, timing_model_size: str | None = None, extra: list[str] 
     return run(cmd, "STEP3")
 
 # ============================================================================
-# Step 4 — **offset FIXED & VERIFIED**
+# Step 4 — updated with base/reset-cache/use-cache passthrough
 # ============================================================================
 def run_step4(
     slug: str,
@@ -300,19 +295,30 @@ def run_step4(
 ) -> float:
     if extra is None:
         extra = []
+
     cmd = [
         sys.executable, str(SCRIPTS_DIR / "4_mp4.py"),
         "--slug", slug,
         "--profile", profile,
         "--offset", str(offset),
+        "--base", slug,            # NEW
     ]
+
+    # NEW passthrough flags
+    if "--reset-cache" in extra:
+        cmd.append("--reset-cache")
+
+    if "--use-cache" in extra:
+        cmd.append("--use-cache")
+
     if force:
         cmd.append("--force")
+
     cmd += extra
     return run(cmd, "STEP4")
 
 # ============================================================================
-# Step 5 — **offset FIXED & VERIFIED**
+# Step 5 — upload
 # ============================================================================
 def run_step5(slug: str, profile: str, offset: float, extra: list[str] | None = None) -> float:
     if extra is None:
@@ -456,7 +462,7 @@ def parse_args():
         default=None,
         help="Model size for step 3 auto-timing (tiny/base/small/medium).",
     )
-    return p  # parser, used with parse_known_args in main()
+    return p
 
 # ============================================================================
 # MAIN
