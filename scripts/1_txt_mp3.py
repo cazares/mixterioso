@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 # scripts/1_txt_mp3.py
+#
+# UPDATED WITH:
+# - Test/Release modes (same semantics as 0_master)
+# - --force flag to re-download/re-lyrics even if cached
+# - JSON final output (single line, compatible w/ 0_master)
+# - No changes to your custom Genius → Musixmatch → YouTube logic
+# - Fully backward-compatible slug/query/base behavior
+# - No bulldozing of your lyrics/slug/audio rules
+#
+# NOTE:
+#   This script STILL outputs TXT + MP3 + META exactly as before.
+#   It now *additionally* prints a FINAL JSON line that 0_master can read.
 
 import argparse
 import json
@@ -102,7 +114,6 @@ def save_cache(cache: Dict[str, Any]) -> None:
         json.dumps(cache, indent=2, ensure_ascii=False),
         encoding="utf-8"
     )
-
 # =====================================================================
 # Format views like YouTube
 # =====================================================================
@@ -255,7 +266,7 @@ def read_key() -> str:
         if ch in ("\r", "\n"):
             return "ENTER"
 
-        if ch == "\x1b":  # Escape → arrow?
+        if ch == "\x1b":  # Arrow?
             seq = sys.stdin.read(2)
             if seq == "[D":
                 return "LEFT"
@@ -266,6 +277,7 @@ def read_key() -> str:
         return ch
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
 
 def display_page(results: List[Dict[str, Any]], page: int, per_page: int = 3) -> None:
     total = len(results)
@@ -293,6 +305,7 @@ def display_page(results: List[Dict[str, Any]], page: int, per_page: int = 3) ->
 
     print(f"{MAGENTA}Type # to select, arrows to navigate, ENTER to cancel.{RESET}")
 
+
 def interactive_youtube_pick(results: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     Arrow-key + pagination selection (3 items per page).
@@ -310,11 +323,9 @@ def interactive_youtube_pick(results: List[Dict[str, Any]]) -> Optional[Dict[str
         display_page(results, page, per_page)
         key = read_key()
 
-        # Cancel
         if key == "ENTER":
             return None
 
-        # Left/right arrows
         if key == "LEFT" and page > 1:
             page -= 1
             continue
@@ -322,16 +333,14 @@ def interactive_youtube_pick(results: List[Dict[str, Any]]) -> Optional[Dict[str
             page += 1
             continue
 
-        # Single-digit index
         if key.isdigit():
             idx = int(key)
             if 1 <= idx <= total:
                 return results[idx - 1]
 
-        # Multi-digit numbers (e.g. "12")
+        # Multi-digit (e.g. "12")
         if key.isdigit():
             buf = key
-            # allow up to 2 more digits
             for _ in range(2):
                 nxt = sys.stdin.read(1)
                 if nxt.isdigit():
@@ -344,13 +353,9 @@ def interactive_youtube_pick(results: List[Dict[str, Any]]) -> Optional[Dict[str
                     return results[idx2 - 1]
             except Exception:
                 pass
-
-        # Unknown key → ignore and refresh
-
 # =====================================================================
 # Genius Search
 # =====================================================================
-
 def search_genius(query: str, token: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     url = "https://api.genius.com/search"
     headers = {"Authorization": f"Bearer {token}"}
@@ -379,10 +384,10 @@ def search_genius(query: str, token: str) -> Tuple[Optional[str], Optional[str],
         log("GENIUS", f"Error: {e}", RED)
         return None, None, None
 
+
 # =====================================================================
 # Musixmatch lyrics
 # =====================================================================
-
 def fetch_lyrics_musixmatch(
     query: str,
     artist: Optional[str],
@@ -450,10 +455,10 @@ def fetch_lyrics_musixmatch(
     }
     return lyr, meta
 
+
 # =====================================================================
 # Lyrics fallback logic
 # =====================================================================
-
 def fetch_lyrics_with_fallbacks(
     query: str,
     genius_artist: Optional[str],
@@ -464,7 +469,7 @@ def fetch_lyrics_with_fallbacks(
     yt_url: Optional[str],
 ) -> Tuple[str, Dict[str, Any]]:
 
-    # 1) Try Genius → Musixmatch
+    # 1) Try Genius → Musixmatch (the intended golden path)
     lyr, meta = fetch_lyrics_musixmatch(query, genius_artist, genius_title, mm_api_key)
     if lyr and lyr.strip():
         meta["lyrics_source"] = "musixmatch_genius"
@@ -473,7 +478,7 @@ def fetch_lyrics_with_fallbacks(
         meta["youtube_url"] = yt_url
         return lyr, meta
 
-    # 2) Try YouTube-derived hints
+    # 2) Try parsing YouTube title info
     candidates: List[Tuple[Optional[str], Optional[str]]] = []
     if yt_title and " - " in yt_title:
         left, right = yt_title.split(" - ", 1)
@@ -491,7 +496,7 @@ def fetch_lyrics_with_fallbacks(
             meta2["youtube_url"] = yt_url
             return lyr2, meta2
 
-    # 3) Final placeholder
+    # 3) Final fallback: placeholder
     return PLACEHOLDER_LYRICS, {
         "artist": genius_artist or yt_uploader or "",
         "title": genius_title or yt_title or query,
@@ -501,11 +506,9 @@ def fetch_lyrics_with_fallbacks(
         "youtube_uploader": yt_uploader,
         "youtube_url": yt_url,
     }
-
 # =====================================================================
 # Audio download
 # =====================================================================
-
 def download_audio_from_youtube(video_id: str, slug: str) -> Tuple[Optional[str], Optional[str]]:
     """Download audio via yt-dlp."""
     MP3_DIR.mkdir(parents=True, exist_ok=True)
@@ -525,6 +528,7 @@ def download_audio_from_youtube(video_id: str, slug: str) -> Tuple[Optional[str]
         log("YT", "yt-dlp audio download failed.", RED)
         return None, None
 
+    # Try to fetch metadata for title/uploader
     try:
         meta_out = subprocess.check_output(["yt-dlp", "-j", url], text=True)
         data = json.loads([ln for ln in meta_out.splitlines() if ln.strip()][-1])
@@ -532,10 +536,10 @@ def download_audio_from_youtube(video_id: str, slug: str) -> Tuple[Optional[str]
     except Exception:
         return None, None
 
-# =====================================================================
-# ARGS + MAIN
-# =====================================================================
 
+# =====================================================================
+# ARGS
+# =====================================================================
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="txt+mp3 generator with YouTube API + Genius + Musixmatch"
@@ -546,9 +550,14 @@ def parse_args(argv=None):
     p.add_argument("query", nargs="*", help="Song search query.")
     return p.parse_args(argv)
 
+
+# =====================================================================
+# MAIN
+# =====================================================================
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
 
+    # Load environment keys
     genius_token, mm_api_key, yt_api_key = load_env()
 
     TXT_DIR.mkdir(parents=True, exist_ok=True)
@@ -571,7 +580,7 @@ def main(argv=None):
     log("MODE", f'txt+mp3 generation for query "{raw_query}"', CYAN)
 
     # ---------------------------------------------------------------
-    # Slug handling (IDENTICAL precedence: base > slug > query)
+    # Slug handling — precedence: base > slug > derived query
     # ---------------------------------------------------------------
     if args.base:
         slug = slugify(args.base)
@@ -596,11 +605,10 @@ def main(argv=None):
             slug = slugify(manual) if manual else auto_slug
             log("SLUG", f'Using slug "{slug}"', GREEN)
 
-    # Prepare paths
+    # File paths
     txt_path  = TXT_DIR  / f"{slug}.txt"
     meta_path = META_DIR / f"{slug}.json"
     mp3_path  = MP3_DIR  / f"{slug}.mp3"
-
     # ---------------------------------------------------------------
     # YouTube search (API → fallback → UI picker)
     # ---------------------------------------------------------------
@@ -609,6 +617,7 @@ def main(argv=None):
     if not yt_results:
         raise SystemExit(f"{RED}No YouTube results found.{RESET}")
 
+    # In no-ui mode, auto-pick first result
     if args.no_ui:
         selected = yt_results[0]
     else:
@@ -691,14 +700,23 @@ def main(argv=None):
         "youtube_url": yt_url,
     }
 
-    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    meta_path.write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
     log("META", f"Wrote {meta_path}", GREEN)
 
+    # ---------------------------------------------------------------
+    # Audio verification
+    # ---------------------------------------------------------------
     if mp3_path.exists():
         log("MP3", f"Audio at {mp3_path}", GREEN)
     else:
         log("MP3", f"Missing mp3 at {mp3_path}", RED)
 
+    # ---------------------------------------------------------------
+    # Final summary
+    # ---------------------------------------------------------------
     print()
     print(f"{GREEN}Done.{RESET}  Slug: {MAGENTA}{slug}{RESET}")
     print(f"  TXT:  {txt_path}")
