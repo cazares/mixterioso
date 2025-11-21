@@ -89,11 +89,6 @@ def get_meta_title_for_slug(slug: str) -> str:
 # Step Status — FULLY OFFSET-AWARE
 # ============================================================================
 def detect_step_status(slug: str, profile: str) -> dict[str, str]:
-    """
-    ZERO-RISK ENHANCEMENT:
-    Now checks *all* MP4s, not just “any exists”.
-    This prevents a WRONG “DONE” status when an offset changed.
-    """
     status = {"slug": slug, "profile": profile}
 
     mp3 = MP3_DIR / f"{slug}.mp3"
@@ -172,9 +167,35 @@ def run_step1(slug: str, query: str | None, no_ui: bool, extra: list[str]) -> fl
 # ============================================================================
 # Step 2
 # ============================================================================
-def run_step2(slug: str, profile: str, model: str, interactive: bool, extra: list[str]) -> float:
+def run_step2(
+    slug: str,
+    profile: str,
+    model: str,
+    interactive: bool,
+    extra: list[str],
+    has_levels: bool,
+    reset_cache: bool,
+) -> float:
     mp3 = MP3_DIR / f"{slug}.mp3"
     mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
+
+    # Reset cache: remove any existing mix wav immediately
+    if reset_cache and mix_wav.exists():
+        try:
+            mix_wav.unlink()
+            log("STEP2", f"reset-cache: removed {mix_wav}", YELLOW)
+        except Exception:
+            log("STEP2", f"reset-cache: failed to remove {mix_wav}", RED)
+
+    # If no CLI levels at all, skip Demucs/stems entirely and use mp3 directly.
+    if not has_levels:
+        log(
+            "STEP2",
+            "No CLI levels provided; skipping Demucs/stems and using original mp3.",
+            YELLOW,
+        )
+        # No mix file is written in this path.
+        return 0.0
 
     if interactive:
         use_orig = prompt_yes_no("Use original mp3 (skip Demucs)?", default_yes=False)
@@ -182,6 +203,9 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool, extra: lis
         use_orig = False
 
     if use_orig:
+        # In the "use original" path with levels set, we still honor the
+        # previous behavior of writing a mix wav via ffmpeg, but now
+        # the cache-reset above ensures we don't reuse stale files.
         MIXES_DIR.mkdir(parents=True, exist_ok=True)
         cmd = ["ffmpeg", "-y", "-i", str(mp3), str(mix_wav)]
         cmd += extra
@@ -196,6 +220,19 @@ def run_step2(slug: str, profile: str, model: str, interactive: bool, extra: lis
 
     stems_root = BASE_DIR / "separated" / effective_model
     stems_dir = stems_root / slug
+
+    # Reset cache: remove any existing stems for this slug/model.
+    if reset_cache and stems_dir.exists():
+        try:
+            for p in stems_dir.glob("*.wav"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            log("STEP2", f"reset-cache: cleared stems in {stems_dir}", YELLOW)
+        except Exception:
+            log("STEP2", f"reset-cache: failed to clear stems in {stems_dir}", RED)
+
     stems_exist = stems_dir.exists() and any(stems_dir.glob("*.wav"))
 
     if stems_exist:
@@ -405,12 +442,12 @@ def parse_args():
     p.add_argument("--no-ui", action="store_true")
     p.add_argument("--force-mp4", action="store_true")
     p.add_argument("--no-upload", action="store_true")
-    # Level controls (parsed but not wired yet)
+    # Level controls
     p.add_argument("--vocals", type=int)
     p.add_argument("--bass", type=int)
     p.add_argument("--drums", type=int)
     p.add_argument("--guitar", type=int)
-    # Cache behavior flags (parsed but not wired yet)
+    # Cache behavior flags
     p.add_argument("--use-cache", action="store_true")
     p.add_argument("--reset-cache", action="store_true")
     p.add_argument(
@@ -465,6 +502,12 @@ def main():
     if args.timing_model_size:
         log("TIMING", f"Using timing model size={args.timing_model_size}", CYAN)
 
+    # Determine if any CLI levels were provided
+    has_levels = any(
+        v is not None
+        for v in (args.vocals, args.bass, args.drums, args.guitar)
+    )
+
     status = detect_step_status(slug, args.profile)
     show_pipeline_status(status)
 
@@ -501,14 +544,24 @@ def main():
         t1 = run_step1(slug, query, no_ui, extra)
 
     if 2 in steps:
-        t2 = run_step2(slug, args.profile, args.model, interactive=not no_ui, extra=extra)
+        t2 = run_step2(
+            slug,
+            args.profile,
+            args.model,
+            interactive=not no_ui,
+            extra=extra,
+            has_levels=has_levels,
+            reset_cache=args.reset_cache,
+        )
 
     if 3 in steps:
         t3 = run_step3(slug, args.timing_model_size, extra=extra)
 
     if 4 in steps:
         t4 = run_step4(
-            slug, args.profile, offset,
+            slug,
+            args.profile,
+            offset,
             force=args.force_mp4,
             called_from_master=True,
             extra=extra,
