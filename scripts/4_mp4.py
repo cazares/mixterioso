@@ -635,22 +635,51 @@ def open_path(path: Path)->None:
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser()
-    p.add_argument("--slug", required=True)
-    p.add_argument("--profile", required=True,
-                  choices=["lyrics","karaoke","car-karaoke","no-bass","car-bass-karaoke"])
+    p = argparse.ArgumentParser(add_help=True)
+
+    # New preferred naming flag
+    p.add_argument("--base", type=str, help="Base name for all file lookups/output")
+
+    # Existing slug (now optional + lower precedence)
+    p.add_argument("--slug", type=str)
+
+    p.add_argument(
+        "--profile",
+        required=True,
+        choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
+    )
+
     p.add_argument("--font-size", type=int)
     p.add_argument("--font-name", type=str, default="Helvetica")
+
     p.add_argument("--offset", type=float, default=None)
     p.add_argument("--force", action="store_true")
-    return p.parse_args(argv)
+
+    # NEW caching flags (minimal diff, currently parsed but unused here)
+    p.add_argument("--reset-cache", action="store_true")
+    p.add_argument("--use-cache", action="store_true")
+
+    # Use parse_known_args so 0_master.py can pass through extra flags safely
+    args, _unknown = p.parse_known_args(argv or sys.argv[1:])
+    return args
 
 
 def main(argv=None):
     global LYRICS_OFFSET_SECS
 
-    args = parse_args(argv or sys.argv[1:])
-    slug = slugify(args.slug)
+    args = parse_args(argv)
+
+    # Base-name override with slug fallback
+    if args.base:
+        slug = slugify(args.base)
+        print(f"[SLUG] Using base='{args.base}' -> slug='{slug}'")
+    elif args.slug:
+        slug = slugify(args.slug)
+        print(f"[SLUG] Using slug='{slug}'")
+    else:
+        print("[ERROR] --base or --slug is required")
+        sys.exit(1)
+
     profile = args.profile
 
     if args.offset is not None:
@@ -671,8 +700,10 @@ def main(argv=None):
     timings = read_timings(slug)
 
     ass_path = build_ass(
-        slug, profile,
-        artist, title,
+        slug,
+        profile,
+        artist,
+        title,
         timings,
         audio_duration,
         args.font_name,
