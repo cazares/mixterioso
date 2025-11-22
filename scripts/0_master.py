@@ -7,6 +7,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import List  # ← add this
+
 
 # ============================================================================
 # COLORS
@@ -84,6 +86,65 @@ def get_meta_title_for_slug(slug: str) -> str:
         return title
     except Exception:
         return slug.replace("_", " ")
+
+def detect_steps_to_run(slug: str, profile: str, model_size: str) -> list[int]:
+    """
+    Returns the ordered list of pipeline steps to run, based on what already exists.
+    Steps:
+      1: txt/mp3/meta
+      2: stems/mix
+      3: timings (auto-timing)
+      4: mp4
+      5: upload
+    """
+    steps: list[int] = []
+
+    txt_done   = (TXT_DIR / f"{slug}.txt").exists()
+    mp3_done   = (MP3_DIR / f"{slug}.mp3").exists()
+    meta_done  = (META_DIR / f"{slug}.json").exists()
+
+    # Step 1
+    if not (txt_done and mp3_done and meta_done):
+        steps.append(1)
+
+    # Step 2
+    mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
+    mix_mp3 = MIXES_DIR / f"{slug}_{profile}.mp3"
+    has_mix = mix_wav.exists() or mix_mp3.exists()
+
+    if not has_mix:
+        steps.append(2)
+
+    # Step 3 (timings)
+    csv_path = TIMINGS_DIR / f"{slug}.csv"
+    meta_path = TIMINGS_DIR / f"{slug}.csv.meta.json"
+
+    need_timings = True
+    if csv_path.exists() and meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            if meta.get("model_size") == model_size:
+                need_timings = False
+        except:
+            need_timings = True
+
+    if need_timings:
+        steps.append(3)
+
+    # Step 4 (mp4)
+    out_mp4_prefix = f"{slug}_{profile}"
+    mp4_exists = any(
+        f.name.startswith(out_mp4_prefix) and f.suffix == ".mp4"
+        for f in OUTPUT_DIR.iterdir()
+    )
+
+    if not mp4_exists:
+        steps.append(4)
+
+    # Step 5 (always include unless final skip happens later)
+    steps.append(5)
+
+    return steps
 
 # ============================================================================
 # Step Status — FULLY OFFSET-AWARE
@@ -285,23 +346,44 @@ def run_step2(
 # ============================================================================
 # Step 3
 # ============================================================================
-def run_step3(slug: str, timing_model_size: str | None = None, extra: list[str] | None = None) -> float:
+def run_step3(slug: str, model_size: str, extra: list[str]):
+    # Guarantee extra is a list
     if extra is None:
         extra = []
+    elif not isinstance(extra, list):
+        extra = list(extra)
 
-    # Remove flags not supported by 3_auto_timing.py
-    filtered_extra = [
-        x for x in extra
-        if x not in ("--test", "--release")
-    ]
+    csv_path = TIMINGS_DIR / f"{slug}.csv"
+    meta_path = TIMINGS_DIR / f"{slug}.csv.meta.json"
 
-    cmd = [sys.executable, str(SCRIPTS_DIR / "3_auto_timing.py"), "--slug", slug]
+    # Check cached timing metadata
+    if csv_path.exists() and meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            if meta.get("model_size") == model_size:
+                log("STEP3", "Skipping timings (cached, correct model).", GREEN)
+                return 0.0
+        except:
+            pass
 
-    if timing_model_size:
-        cmd += ["--model-size", timing_model_size]
+    cmd = [
+        sys.executable,
+        str(SCRIPTS_DIR / "3_auto_timing.py"),
+        "--slug", slug,
+        "--model-size", model_size,
+    ] + extra
 
-    cmd += filtered_extra
-    return run(cmd, "STEP3")
+    t0 = time.perf_counter()
+    subprocess.run(cmd, check=True)
+    t1 = time.perf_counter()
+
+    # Write metadata
+    meta_path.write_text(
+        json.dumps({"model_size": model_size}, indent=2),
+        encoding="utf-8",
+    )
+
+    return t1 - t0
 
 # ============================================================================
 # Step 4 — **offset FIXED & VERIFIED**
@@ -495,7 +577,7 @@ def parse_args():
 
     # Whisper/auto-timing model size
     p.add_argument(
-        "--timing-model-size",
+        "--model-size",
         type=str,
         default=None,
         help="Whisper model size for auto-timing (e.g. tiny/base/small/medium/large-v3).",
@@ -529,6 +611,12 @@ def main():
     parser = parse_args()
     args, extra = parser.parse_known_args()
 
+    # Guarantee extra is always a list
+    if extra is None:
+        extra = []
+    elif not isinstance(extra, list):
+        extra = list(extra)
+
     # Remove master-level flags so they are not forwarded to sub-scripts
     master_only_flags = {"--test", "--release", "--base"}
     extra = [x for x in extra if x not in master_only_flags]
@@ -542,19 +630,11 @@ def main():
         print(f"{RED}Cannot use --test and --release together.{RESET}")
         sys.exit(1)
 
+    # compute effective timing model size
     if args.test:
-        log(
-            "MODE",
-            "TEST mode: steps=12345, no-ui, model=htdemucs_tiny, timing-model-size=base, no-upload.",
-            CYAN,
-        )
-        args.no_ui = True
-        no_ui = True
-        args.steps = "12345"
-        args.model = "htdemucs_tiny"
-        if not args.timing_model_size:
-            args.timing_model_size = "base"
-        args.no_upload = True
+        model_size = "base"
+    else:
+        model_size = args.model_size
 
     if args.release:
         log(
@@ -566,8 +646,9 @@ def main():
         no_ui = True
         args.steps = "12345"
         args.model = "htdemucs"
-        if not args.timing_model_size:
-            args.timing_model_size = "large-v3"
+        if not args.model_size:
+            args.model_size = "large-v3"
+        model_size = args.model_size
 
     slug: str | None = None
     query: str | None = None
@@ -575,18 +656,19 @@ def main():
     # NEW: base override (minimal diff)
     if args.base:
         slug = slugify(args.base)
-        log("SLUG", f'Using base from CLI: "{slug}"', CYAN)
-
+        log("SLUG", f"Using base='{args.base}' → slug '{slug}'", GREEN)
     elif args.slug:
         slug = slugify(args.slug)
-        log("SLUG", f'Using slug from CLI: "{slug}"', CYAN)
+        log("SLUG", f"Using slug='{slug}'", GREEN)
+    else:
+        print(f"{RED}Error: --base or --slug required{RESET}")
+        sys.exit(1)
 
-    elif args.query:
+    if args.query:
         raw_q = args.query.strip()
         slug = slugify(raw_q)
         query = raw_q
         log("SLUG", f'Using slug "{slug}" from CLI query', CYAN)
-
     else:
         slug, query = choose_slug_and_query(no_ui=no_ui)
         if not slug:
@@ -602,8 +684,8 @@ def main():
         offset = read_offset(slug)
         log("OFFSET", f"Using stored offset={offset:+.3f}s", CYAN)
 
-    if args.timing_model_size:
-        log("TIMING", f"Using timing model size={args.timing_model_size}", CYAN)
+    if model_size:
+        log("TIMING", f"Using timing model size={model_size}", CYAN)
 
     # Determine if any CLI levels were provided
     has_levels = any(
@@ -613,6 +695,20 @@ def main():
 
     status = detect_step_status(slug, args.profile)
     show_pipeline_status(status)
+
+    step1_extra = []
+    step2_extra = []
+    step3_extra = []
+    step4_extra = []
+
+    if args.reset_cache:
+        step1_extra.append("--reset-cache")
+        step2_extra.append("--reset-cache")
+        step3_extra.append("--reset-cache")
+        step4_extra.append("--reset-cache")
+
+    if args.use_cache:
+        step1_extra.append("--use-cache")
 
     # Determine steps
     if args.steps:
@@ -658,10 +754,10 @@ def main():
         )
 
     if 3 in steps:
-        # REMOVE global flags not meant for 3_auto_timing
+        # remove master-level flags
         step3_extra = [x for x in extra if x not in ("--test", "--release")]
-        t3 = run_step3(slug, args.timing_model_size, extra=step3_extra)
-
+        # *** FIXED: use computed model_size instead of args.model_size ***
+        t3 = run_step3(slug, model_size, extra=step3_extra)
 
     if 4 in steps:
         t4 = run_step4(

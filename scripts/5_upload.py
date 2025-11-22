@@ -302,6 +302,87 @@ def parse_args():
     args._unknown = unknown
     return args
 
+# ============================================================
+# upload_video — REQUIRED BY main()
+# ============================================================
+def upload_video(
+    service,
+    file_path,
+    title,
+    description,
+    tags,
+    category_id,
+    privacy,
+    made_for_kids,
+    thumb_from_sec,
+):
+    """
+    Minimal YouTube upload wrapper expected by main().
+    MUST exist, MUST be above main().
+    """
+
+    from googleapiclient.http import MediaFileUpload
+
+    media = MediaFileUpload(str(file_path), chunksize=-1, resumable=True)
+
+    body = {
+        "snippet": {
+            "title": title,
+            "description": description,
+            "tags": tags,
+            "categoryId": category_id,
+        },
+        "status": {
+            "privacyStatus": privacy,
+            "selfDeclaredMadeForKids": made_for_kids,
+        },
+    }
+
+    request = service.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media,
+    )
+
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            print(f"[UPLOAD] {int(status.progress() * 100)}%...")
+
+    video_id = response.get("id")
+    print(f"[UPLOAD] Upload complete → {video_id}")
+
+    # Thumbnail (optional)
+    if thumb_from_sec is not None:
+        try:
+            import subprocess, tempfile
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            tmp.close()
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(thumb_from_sec),
+                "-i", str(file_path),
+                "-frames:v", "1",
+                tmp.name,
+            ]
+            subprocess.run(cmd, check=True)
+
+            service.thumbnails().set(
+                videoId=video_id,
+                media_body=tmp.name,
+            ).execute()
+            print(f"[UPLOAD] Thumbnail set at {thumb_from_sec}s")
+        except Exception as e:
+            print(f"[UPLOAD] Thumbnail failed: {e}")
+
+    return video_id
+# ============================================================
+# END upload_video
+# ============================================================
+
+
 def main():
     args = parse_args()
 
@@ -335,15 +416,17 @@ def main():
             description=args.description,
             tags=tags,
             category_id=args.category_id,
-            privacy_status=args.privacy,
+            privacy=args.privacy,
             made_for_kids=args.made_for_kids,
+            thumb_from_sec=args.thumb_from_sec,
         )
     except HttpError as e:
         print(json.dumps({"ok": False, "error": "YouTubeUploadError", "message": str(e)}))
         sys.exit(1)
 
-    # Thumbnail
-    if not args.no_thumbnail:
+        # Thumbnail handled inside upload_video()
+        pass
+
         thumb_png = mp4.with_suffix(".mp4.thumb.png")
         try:
             extract_thumbnail_frame(mp4, thumb_png, args.thumb_from_sec)
