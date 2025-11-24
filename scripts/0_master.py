@@ -166,7 +166,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     if model:
         preferred_models.append(model)
     if "htdemucs_6s" not in preferred_models:
-        preferred_models.insert(0, "htdemucs_6s")
+        preferred_models.insert(0, "htdemucs")
     if "htdemucs" not in preferred_models:
         preferred_models.append("htdemucs")  # 4-stem fallback, never 2-stem
 
@@ -312,7 +312,7 @@ def parse_args(argv=None):
         default="karaoke",
         choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
     )
-    p.add_argument("--model", type=str, default="htdemucs_6s", help="Demucs model name")
+    p.add_argument("--model", type=str, default="htdemucs", help="Demucs model name")
     p.add_argument("--steps", type=str, help="Steps to run, e.g. 24 or 1234")
     p.add_argument(
         "--do",

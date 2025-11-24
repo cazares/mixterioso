@@ -69,11 +69,11 @@ TITLE_EXTRA_OFFSET_FRACTION = -0.20
 
 # How big the next-lyric text is relative to the main lyric text.
 #  0.35 = 35% of the main font size.
-NEXT_LINE_FONT_SCALE = 0.35
+NEXT_LINE_FONT_SCALE = 0.475
 
 # How big the "Next:" label text is relative to the main lyric text.
 # By default this is smaller than the actual preview line.
-NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.45
+NEXT_LABEL_FONT_SCALE = NEXT_LINE_FONT_SCALE * 0.55
 
 # Margins for the "Next:" label within the bottom box. The label is
 # placed at the top-left corner of the bottom rectangle with these offsets.
@@ -132,7 +132,7 @@ ASS_FONT_MULTIPLIER = 1.5  # multiple of UI font size to get ASS fontsize
 # Global lyrics timing offset in seconds. Positive = delay, negative = earlier.
 # This is applied uniformly to all lyric timestamps at render time so you can
 # nudge the whole subtitle track without re-running timing.
-LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0") or "0")
+LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "-1.5") or "-1.5")
 # If you prefer hardcoded only, comment the line above and do e.g.:
 # LYRICS_OFFSET_SECS = -0.35  # shift lyrics 350 ms earlier
 
@@ -592,42 +592,50 @@ def build_ass(
 
 
 def choose_audio(slug: str, profile: str) -> Path:
+    """
+    Choose the correct audio for MP4 rendering.
+
+    NEW RULES:
+    - Profile "lyrics" always uses the original mp3.
+    - All other profiles MUST have a mixed WAV present.
+      If the WAV is missing, DO NOT FALL BACK to mp3.
+      Instead, error clearly so you never silently lose your mix.
+    """
     mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
     mix_mp3 = MIXES_DIR / f"{slug}_{profile}.mp3"
     mp3_path = MP3_DIR / f"{slug}.mp3"
 
+    # Lyrics profile = always original mp3.
     if profile == "lyrics":
-        audio_path = mp3_path
-        if not audio_path.exists():
-            print(f"Audio mp3 not found for slug={slug}: {audio_path}")
+        if not mp3_path.exists():
+            print(f"[AUDIO-ERROR] Original mp3 not found for slug={slug}: {mp3_path}")
             sys.exit(1)
-        print(f"[AUDIO] Using original mp3 for profile=lyrics: {audio_path}")
-        return audio_path
+        print(f"[AUDIO] Using original mp3 for profile=lyrics: {mp3_path}")
+        return mp3_path
 
+    # === NEW STRICT BEHAVIOR ===
+    # Mixed WAV required for ALL non-lyrics profiles.
     if mix_wav.exists():
         print(f"[AUDIO] Using mixed WAV for profile={profile}: {mix_wav}")
         return mix_wav
 
+    # If user mixed to MP3 instead of WAV and it's present:
     if mix_mp3.exists():
         print(f"[AUDIO] Using mixed MP3 for profile={profile}: {mix_mp3}")
         return mix_mp3
 
-    if mp3_path.exists():
-        print(
-            f"[AUDIO] Mixed WAV/MP3 for profile={profile} not found.\n"
-            f"        Falling back to original mp3: {mp3_path}"
-        )
-        return mp3_path
-
+    # WAV missing → HARD FAILURE (no more silent fallback)
     print(
-        f"Audio not found for slug={slug}, profile={profile}.\n"
-        f"Tried:\n"
-        f"  mix wav: {mix_wav}\n"
-        f"  mix mp3: {mix_mp3}\n"
-        f"  mp3: {mp3_path}"
+        f"\n[AUDIO-ERROR] No mixed WAV found for slug={slug}, profile={profile}.\n"
+        f"Expected file:\n"
+        f"   {mix_wav}\n\n"
+        f"To fix:\n"
+        f"  • Run 2_stems.py with --mix-ui-only to create the mix config\n"
+        f"  • Then run 2_stems.py normally to generate the mixed WAV\n"
+        f"  • Verify the file exists in: mixes/\n\n"
+        f"Aborting MP4 generation to avoid using incorrect audio.\n"
     )
     sys.exit(1)
-
 
 def open_path(path: Path) -> None:
     try:
