@@ -19,8 +19,10 @@ RED    = "\033[31m"
 BLUE   = "\033[34m"
 MAG    = "\033[35m"
 
+
 def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
+
 
 # ==========================================================
 # PATHS
@@ -33,9 +35,10 @@ MIXES_DIR   = BASE_DIR / "mixes"
 TIMINGS_DIR = BASE_DIR / "timings"
 OUTPUT_DIR  = BASE_DIR / "output"
 META_DIR    = BASE_DIR / "meta"
-UPLOAD_DIR  = BASE_DIR / "uploaded"   # NEW — upload receipts
+UPLOAD_DIR  = BASE_DIR / "uploaded"   # upload receipts
 
 UPLOAD_DIR.mkdir(exist_ok=True)
+
 
 # ==========================================================
 # HELPERS
@@ -47,6 +50,7 @@ def slugify(text: str) -> str:
     base = re.sub(r"[^\w\-]+", "", base)
     return base or "song"
 
+
 def fmt_secs_mmss(sec: float) -> str:
     if sec <= 0:
         return "   0.00 s  (00:00)"
@@ -57,11 +61,13 @@ def fmt_secs_mmss(sec: float) -> str:
         s = 0
     return f"{sec:7.2f} s  ({m:02d}:{s:02d})"
 
+
 def run(cmd: list[str], section: str) -> float:
     log(section, " ".join(cmd), BLUE)
     t0 = time.perf_counter()
     subprocess.run(cmd, check=True)
     return time.perf_counter() - t0
+
 
 # ==========================================================
 # SLUG DETECTION
@@ -80,6 +86,7 @@ def detect_slug_from_latest_mp3() -> str:
     log("MASTER", f"Latest slug from mp3s/: {slug}", CYAN)
     return slug
 
+
 # ==========================================================
 # META LOADING
 # ==========================================================
@@ -88,21 +95,23 @@ def load_meta(slug: str):
     if not meta_path.exists():
         return None, None
     try:
-        m = json.loads(meta_path.read_text())
+        m = json.loads(meta_path.read_text(encoding="utf-8"))
         return m.get("artist"), m.get("title")
     except Exception:
         return None, None
+
+
 # ==========================================================
 # ASSET DETECTION
 # ==========================================================
 def detect_assets(slug: str, profile: str) -> dict:
-    txt = TXT_DIR / f"{slug}.txt"
-    mp3 = MP3_DIR / f"{slug}.mp3"
-    meta = META_DIR / f"{slug}.json"
-    mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
-    timing_csv = TIMINGS_DIR / f"{slug}.csv"
-    mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
-    receipt = UPLOAD_DIR / f"{slug}_{profile}.uploaded"
+    txt         = TXT_DIR / f"{slug}.txt"
+    mp3         = MP3_DIR / f"{slug}.mp3"
+    meta        = META_DIR / f"{slug}.json"
+    mix_wav     = MIXES_DIR / f"{slug}_{profile}.wav"
+    timing_csv  = TIMINGS_DIR / f"{slug}.csv"
+    mp4         = OUTPUT_DIR / f"{slug}_{profile}.mp4"
+    receipt     = UPLOAD_DIR / f"{slug}_{profile}.uploaded"
 
     step1 = txt.exists() and mp3.exists() and meta.exists()
     step2 = True if profile == "lyrics" else mix_wav.exists()
@@ -111,6 +120,7 @@ def detect_assets(slug: str, profile: str) -> dict:
     step5 = receipt.exists()
 
     return {1: step1, 2: step2, 3: step3, 4: step4, 5: step5}
+
 
 # ==========================================================
 # STATUS PRINTING
@@ -126,18 +136,20 @@ def print_asset_status(slug: str, profile: str, status: dict) -> None:
         5: "upload to YouTube (5_upload)",
     }
     for step in range(1, 6):
-        done = status.get(step, False)
+        done  = status.get(step, False)
         color = GREEN if done else YELLOW
-        mark = "DONE" if done else "MISSING"
+        mark  = "DONE" if done else "MISSING"
         print(f"{color}[{step}] {labels[step]}  -> {mark}{RESET}")
     print()
+
 
 def suggest_steps(status: dict) -> str:
     missing = "".join(str(k) for k in range(1, 6) if not status.get(k))
     return missing or "0"
 
+
 def parse_steps_string(s: str) -> list[int]:
-    steps = []
+    steps: list[int] = []
     for ch in s:
         if ch in "012345":
             val = int(ch)
@@ -145,6 +157,7 @@ def parse_steps_string(s: str) -> list[int]:
                 steps.append(val)
     steps.sort()
     return steps
+
 
 # ==========================================================
 # STEP 1
@@ -154,6 +167,7 @@ def run_step1_txt_mp3(query: str) -> tuple[str, float]:
     slug = detect_slug_from_latest_mp3()
     log("STEP1", f"Slug detected: {slug}", GREEN)
     return slug, t
+
 
 # ==========================================================
 # STEP 2
@@ -170,7 +184,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
 
     separated_root = BASE_DIR / "separated"
 
-    preferred = []
+    preferred: list[str] = []
     if model:
         preferred.append(model)
     if "htdemucs_6s" not in preferred:
@@ -186,7 +200,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
             existing_model = m
             break
 
-    reuse = False
+    reuse  = False
     actual = existing_model
 
     if existing_model:
@@ -228,7 +242,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
             "--model", actual,
             "--mix-ui-only",
         ],
-        "STEP2-MIXUI"
+        "STEP2-MIXUI",
     )
 
     out_wav = MIXES_DIR / f"{slug}_{profile}.wav"
@@ -243,19 +257,20 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
             "--render-only",
             "--output", str(out_wav),
         ],
-        "STEP2-RENDER"
+        "STEP2-RENDER",
     )
 
     total = t_demucs + t_ui + t_render
     log("STEP2", f"Completed in {fmt_secs_mmss(total)}", GREEN)
     return total
 
+
 # ==========================================================
 # STEP 3
 # ==========================================================
 def run_step3_timing(slug: str) -> float:
-    mp3_path = MP3_DIR / f"{slug}.mp3"
-    txt_path = TXT_DIR / f"{slug}.txt"
+    mp3_path    = MP3_DIR / f"{slug}.mp3"
+    txt_path    = TXT_DIR / f"{slug}.txt"
     timing_path = TIMINGS_DIR / f"{slug}.csv"
     timing_path.parent.mkdir(exist_ok=True)
 
@@ -266,9 +281,10 @@ def run_step3_timing(slug: str) -> float:
             "--audio", str(mp3_path),
             "--timings", str(timing_path),
         ],
-        "STEP3"
+        "STEP3",
     )
     return t
+
 
 # ==========================================================
 # STEP 4
@@ -281,50 +297,43 @@ def run_step4_mp4(slug: str, profile: str) -> float:
     ]
     try:
         return run(cmd, "STEP4")
-    except subprocess.CalledProcessError as e:
-        log("STEP4", "Step 4 failed. Run step 2 first.", RED)
+    except subprocess.CalledProcessError:
+        log("STEP4", "Step 4 failed. Most likely mixed WAV missing. Run step 2 first.", RED)
         return 0.0
+
+
 # ==========================================================
 # STEP 5 (UPLOAD)
 # ==========================================================
 def run_step5_upload(slug: str, profile: str) -> float:
     """
     Upload to YouTube using 5_upload.py.
+
     Includes:
       - Colorized upload summary
       - Relative paths
       - MM:SS durations
-      - Previous-upload detection
+      - Previous-upload detection with count
       - Yes/no confirmation
       - Pretty descriptor prompt with autosuggestions
     """
-
     # -----------------------------------------
     # Load metadata
     # -----------------------------------------
-    meta_path = META_DIR / f"{slug}.json"
-    artist = title = None
-    if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            artist = meta.get("artist")
-            title = meta.get("title")
-        except Exception:
-            pass
-
+    artist, title = load_meta(slug)
     artist = artist or "Unknown Artist"
-    title = title or slug.replace("_", " ").title()
+    title  = title or slug.replace("_", " ").title()
 
     # -----------------------------------------
     # Load mix config (volumes + model)
     # -----------------------------------------
     cfg_path = MIXES_DIR / f"{slug}_{profile}.json"
-    model = "unknown"
+    model   = "unknown"
     volumes = {}
     if cfg_path.exists():
         try:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            model = cfg.get("model", "unknown")
+            cfg    = json.loads(cfg_path.read_text(encoding="utf-8"))
+            model  = cfg.get("model", "unknown")
             volumes = cfg.get("volumes", {})
         except Exception:
             pass
@@ -354,9 +363,9 @@ def run_step5_upload(slug: str, profile: str) -> float:
                     "ffprobe", "-v", "error",
                     "-show_entries", "format=duration",
                     "-of", "default=noprint_wrappers=1:nokey=1",
-                    str(p)
+                    str(p),
                 ],
-                text=True
+                text=True,
             ).strip()
             return float(out)
         except Exception:
@@ -365,34 +374,113 @@ def run_step5_upload(slug: str, profile: str) -> float:
     mp3_len = compute_len(mp3_path)
     mp4_len = compute_len(mp4_path)
 
-    def mmss(sec: float) -> str:
-        m = int(sec // 60)
-        s = int(round(sec % 60))
-        return f"{m:02d}:{s:02d}"
-
     # -----------------------------------------
     # Previous upload detection
     # -----------------------------------------
-    receipt = UPLOAD_DIR / f"{slug}_{profile}.uploaded"
-    uploaded_before = receipt.exists()
+    receipt_path = UPLOAD_DIR / f"{slug}_{profile}.uploaded"
+    upload_count = 0
+    if receipt_path.exists():
+        try:
+            prev = json.loads(receipt_path.read_text(encoding="utf-8"))
+            upload_count = int(prev.get("count", 1))
+        except Exception:
+            upload_count = 1
+
+    uploaded_before = upload_count > 0 and receipt_path.exists()
 
     if uploaded_before:
-        log("STEP5", f"Previously uploaded: {receipt}", YELLOW)
+        log(
+            "STEP5",
+            f"Previously uploaded {upload_count} time(s); receipt: {receipt_path}",
+            YELLOW,
+        )
         try:
             ans = input("Upload again? [Y/n]: ").strip().lower()
         except EOFError:
             ans = "y"
         if ans not in ("", "y", "yes"):
-            log("STEP5", "Upload cancelled.", YELLOW)
+            log("STEP5", "Upload skipped by user.", YELLOW)
             return 0.0
+
+    # -----------------------------------------
+    # Compute descriptor suggestions
+    # -----------------------------------------
+    def safe_vol(track: str, default: float = 1.0) -> float:
+        try:
+            return float(volumes.get(track, default))
+        except Exception:
+            return default
+
+    v_vocals = safe_vol("vocals", 1.0)
+    v_bass   = safe_vol("bass",   1.0)
+    v_gtr    = safe_vol("guitar", 1.0)
+    v_piano  = safe_vol("piano",  1.0)
+    v_other  = safe_vol("other",  1.0)
+
+    all_instr_100 = (
+        abs(v_bass  - 1.0) < 1e-3 and
+        abs(v_gtr   - 1.0) < 1e-3 and
+        abs(v_piano - 1.0) < 1e-3 and
+        abs(v_other - 1.0) < 1e-3
+    )
+
+    suggestions: list[str] = []
+
+    # 0% vocals: classic Karaoke
+    if abs(v_vocals) < 1e-3:
+        suggestions.append("Karaoke")
+
+    # Instruments 100%, some vocals → Car Karaoke / Karaoke
+    if all_instr_100 and 0.0 < v_vocals < 1.0:
+        if "car" in profile:
+            suggestions.append(f"Car Karaoke, {int(round(v_vocals * 100))}% Vocals")
+        else:
+            suggestions.append(f"Karaoke, {int(round(v_vocals * 100))}% Vocals")
+
+    # Non-100% instrument focus
+    diff_instr = {
+        "bass":   v_bass,
+        "guitar": v_gtr,
+        "piano":  v_piano,
+        "other":  v_other,
+    }
+    varied = [k for k, v in diff_instr.items() if abs(v - 1.0) > 1e-3]
+    if varied:
+        primary = varied[0]
+        label_map = {
+            "bass":   "Bass",
+            "guitar": "Guitar",
+            "piano":  "Piano",
+            "other":  "Band",
+        }
+        base_label = label_map.get(primary, primary.title())
+        suggestions.append(f"{base_label} Karaoke, {int(round(v_vocals * 100))}% Vocals")
+
+    # Lyrics / Letra style when everything is 100%
+    if all_instr_100 and abs(v_vocals - 1.0) < 1e-3:
+        suggestions.append("Lyrics")
+        suggestions.append("Letra")
+
+    # Fallback: profile-based
+    if not suggestions:
+        suggestions.append(profile.replace("-", " ").title())
+
+    # Deduplicate, keep order
+    dedup: list[str] = []
+    for s in suggestions:
+        if s not in dedup:
+            dedup.append(s)
+    suggestions = dedup
+
+    default_desc = suggestions[0] if suggestions else profile.replace("-", " ").title()
 
     # -----------------------------------------
     # Pretty colorized upload summary
     # -----------------------------------------
     print()
-    print(f"{BOLD}{CYAN}{'='*60}{RESET}")
+    print(f"{BOLD}{CYAN}{'=' * 60}{RESET}")
     print(f"{BOLD}{CYAN}UPLOAD SUMMARY for slug='{slug}'  (profile={profile}){RESET}")
-    print(f"{BOLD}{CYAN}{'='*60}{RESET}")
+    print(f"{BOLD}{CYAN}{'=' * 60}{RESET}")
 
     print(f"{CYAN}Artist:{RESET}       {WHITE}{artist}{RESET}")
     print(f"{CYAN}Title:{RESET}        {WHITE}{title}{RESET}")
@@ -403,15 +491,104 @@ def run_step5_upload(slug: str, profile: str) -> float:
 
     print(f"{CYAN}Volumes:{RESET}")
     for stem, vol in volumes.items():
-        pct = int(round(float(vol) * 100))
+        try:
+            pct = int(round(float(vol) * 100))
+        except Exception:
+            pct = 0
         print(f"  {WHITE}{stem:7s}{RESET}: {CYAN}{pct:3d}%{RESET}")
 
     print()
     print(f"{CYAN}MP3:{RESET}          {WHITE}{rel(mp3_path)}{RESET}")
-    print(f"{CYAN}MP4:{RESET}          {WHITE}{rel(mp4_path)}{RESET}")
-    print(f"{CYAN}WAV:{RESET}          {WHITE}{rel(wav_path)}{RESET}")
-    print(f"{CYAN}MP3 length:{RESET}   {WHITE}{mmss(mp3_len)}{RESET}")
-    print(f"{CYAN}MP4 length:{RESET}   {WHITE}{mmss(mp4_len)}{RESET}")
+    print(f"{CYAN}MP3 length:{RESET}   {WHITE}{fmt_secs_mmss(mp3_len)}{RESET}")
+    print(f"{CYAN}WAV mix:{RESET}      {WHITE}{rel(wav_path)}{RESET}")
+    print(f"{CYAN}MP4 output:{RESET}   {WHITE}{rel(mp4_path)}{RESET}")
+    print(f"{CYAN}MP4 length:{RESET}   {WHITE}{fmt_secs_mmss(mp4_len)}{RESET}")
+
+    if uploaded_before:
+        print()
+        print(f"{YELLOW}Previously uploaded {upload_count} time(s).{RESET}")
+
+    print()
+    print(f"{CYAN}Descriptor suggestions:{RESET}")
+    for idx, s in enumerate(suggestions, start=1):
+        print(f"  {WHITE}[{idx}] {s}{RESET}")
+
+    # -----------------------------------------
+    # Ask user for descriptor (with default)
+    # -----------------------------------------
+    print()
+    try:
+        raw = input(
+            f"Enter upload descriptor "
+            f"(or choose 1-{len(suggestions)}) "
+            f"[default={default_desc}]: "
+        ).strip()
+    except EOFError:
+        raw = ""
+
+    desc: str
+    if not raw:
+        desc = default_desc
+    else:
+        # Support picking by number
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(suggestions):
+                desc = suggestions[idx - 1]
+            else:
+                desc = raw
+        else:
+            desc = raw
+
+    upload_title = f"{artist} – {title} ({desc})"
+
+    print()
+    print(f"{CYAN}Final YouTube TITLE will be:{RESET}")
+    print(f"  {WHITE}{upload_title}{RESET}")
+
+    try:
+        ok = input("Continue with upload? [Y/n]: ").strip().lower()
+    except EOFError:
+        ok = "y"
+
+    if ok not in ("", "y", "yes"):
+        log("STEP5", "Upload cancelled by user.", YELLOW)
+        return 0.0
+
+    # -----------------------------------------
+    # Run uploader script
+    # -----------------------------------------
+    cmd = [
+        sys.executable,
+        str(SCRIPTS_DIR / "5_upload.py"),
+        "--file", str(mp4_path),
+        "--title", upload_title,
+        "--description", "",
+        "--privacy", "unlisted",
+        "--thumb-from-sec", "0.5",
+    ]
+
+    t_upload = run(cmd, "STEP5")
+
+    # -----------------------------------------
+    # Write / update receipt
+    # -----------------------------------------
+    new_count = upload_count + 1
+    receipt_data = {
+        "slug": slug,
+        "profile": profile,
+        "count": new_count,
+        "last_title": upload_title,
+        "last_uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        receipt_path.write_text(json.dumps(receipt_data, indent=2), encoding="utf-8")
+        log("STEP5", f"Upload receipt written: {receipt_path} (count={new_count})", GREEN)
+    except Exception as e:
+        log("STEP5", f"Failed to write upload receipt: {e}", YELLOW)
+
+    return t_upload
+
 
 # ==========================================================
 # Argument Parsing
@@ -428,7 +605,7 @@ def parse_args(argv=None):
     src.add_argument(
         "--slug",
         type=str,
-        help="Slug to operate on (e.g. californication)"
+        help="Slug to operate on (e.g. californication)",
     )
 
     p.add_argument(
@@ -440,7 +617,7 @@ def parse_args(argv=None):
             "karaoke",
             "car-karaoke",
             "no-bass",
-            "car-bass-karaoke"
+            "car-bass-karaoke",
         ],
     )
 
@@ -474,7 +651,7 @@ def parse_args(argv=None):
 # ==========================================================
 def interactive_slug_and_steps(args):
     slug = args.slug
-    t1 = 0.0
+    t1   = 0.0
 
     # Step 1 automatically triggered when query provided without slug
     if args.query and not slug:
@@ -518,8 +695,7 @@ def interactive_slug_and_steps(args):
                 if not slug:
                     raise SystemExit("Slug is required when no query is given.")
 
-    slug = slugify(slug)
-
+    slug   = slugify(slug)
     status = detect_assets(slug, args.profile)
     print_asset_status(slug, args.profile, status)
 
@@ -611,7 +787,7 @@ def main(argv=None):
                 raise SystemExit("--do mp4 requires --slug.")
             args.steps = "4"
 
-        args.skip-ui = True  # force noninteractive
+        args.skip_ui = True  # force noninteractive
 
     # Select flow
     if args.skip_ui:
