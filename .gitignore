@@ -37,3 +37,8 @@ lyrics/
 align_env/
 mix_done/
 covers/
+gentle-0.11.0/gentle.egg-info/PKG-INFO
+gentle-full/
+gentle_broken_1/
+mfa_env/pyvenv.cfg
+mfa_env/share/man/man1/ttx.1
