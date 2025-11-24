@@ -18,7 +18,6 @@ This script:
 """
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -42,7 +41,7 @@ YOUTUBE_UPLOAD_SCOPE = ["https://www.googleapis.com/auth/youtube.upload"]
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-def log(section: str, msg: str):
+def log(section: str, msg: str) -> None:
     ts = time.strftime("%H:%M:%S")
     print(f"[{ts}] [{section}] {msg}")
 
@@ -57,7 +56,7 @@ def load_secrets_path() -> Path:
     raw = os.getenv("YOUTUBE_CLIENT_SECRETS_JSON")
 
     if not raw:
-        log("SECRETS", "YOUTUBE_CLIENT_SECRETS_JSON is not set.",)
+        log("SECRETS", "YOUTUBE_CLIENT_SECRETS_JSON is not set.")
         sys.exit(1)
 
     p = Path(raw).expanduser()
@@ -84,7 +83,10 @@ def get_credentials(secrets_path: Path):
     if token_path.exists():
         try:
             from google.oauth2.credentials import Credentials
-            creds = Credentials.from_authorized_user_file(str(token_path), YOUTUBE_UPLOAD_SCOPE)
+
+            creds = Credentials.from_authorized_user_file(
+                str(token_path), YOUTUBE_UPLOAD_SCOPE
+            )
         except Exception:
             creds = None
 
@@ -92,6 +94,7 @@ def get_credentials(secrets_path: Path):
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             from google.auth.transport.requests import Request
+
             try:
                 creds.refresh(Request())
             except Exception:
@@ -110,16 +113,21 @@ def get_credentials(secrets_path: Path):
     return creds
 
 
-def extract_thumbnail(video_path: Path, out_path: Path, time_sec: float):
+def extract_thumbnail(video_path: Path, out_path: Path, time_sec: float) -> None:
     """
     Extract a JPEG thumbnail from given time position.
     """
     cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(time_sec),
-        "-i", str(video_path),
-        "-frames:v", "1",
-        "-q:v", "2",
+        "ffmpeg",
+        "-y",
+        "-ss",
+        str(time_sec),
+        "-i",
+        str(video_path),
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
         str(out_path),
     ]
     log("THUMB", " ".join(cmd))
@@ -137,7 +145,7 @@ def upload_video(
     tags: list[str],
     category_id: str,
     privacy: str,
-):
+) -> str:
     """
     Performs actual YouTube upload.
     Returns the newly created video ID.
@@ -155,18 +163,14 @@ def upload_video(
         },
     }
 
-    media = MediaFileUpload(
-        str(video_path),
-        mimetype="video/mp4",
-        resumable=True
-    )
+    media = MediaFileUpload(str(video_path), mimetype="video/mp4", resumable=True)
 
     log("UPLOAD", f"Uploading: {video_path}")
 
     request = youtube.videos().insert(
         part="snippet,status",
         body=body,
-        media_body=media
+        media_body=media,
     )
 
     response = None
@@ -185,17 +189,14 @@ def upload_video(
     return video_id
 
 
-def set_thumbnail(youtube, video_id: str, thumb_path: Path):
+def set_thumbnail(youtube, video_id: str, thumb_path: Path) -> None:
     """
     Upload thumbnail for a video.
     """
     log("THUMB", f"Uploading thumbnail for {video_id}: {thumb_path}")
     media = MediaFileUpload(str(thumb_path), mimetype="image/jpeg")
-    request = youtube.thumbnails().set(
-        videoId=video_id,
-        media_body=media
-    )
-    response = request.execute()
+    request = youtube.thumbnails().set(videoId=video_id, media_body=media)
+    _ = request.execute()
     log("THUMB", "Thumbnail set.")
 
 
@@ -208,9 +209,23 @@ def parse_args(argv=None):
     p.add_argument("--title", default=None)
     p.add_argument("--description", default="")
     p.add_argument("--tags", type=str, default="", help="Comma-separated tags.")
-    p.add_argument("--category-id", type=str, default="10", help="YouTube category (default 10=Music).")
-    p.add_argument("--privacy", choices=["public", "unlisted", "private"], default="unlisted")
-    p.add_argument("--thumb-from-sec", type=float, default=None, help="Extract thumbnail at this second.")
+    p.add_argument(
+        "--category-id",
+        type=str,
+        default="10",
+        help="YouTube category (default 10=Music).",
+    )
+    p.add_argument(
+        "--privacy",
+        choices=["public", "unlisted", "private"],
+        default="unlisted",
+    )
+    p.add_argument(
+        "--thumb-from-sec",
+        type=float,
+        default=None,
+        help="Extract thumbnail at this second.",
+    )
     return p.parse_args(argv)
 
 
