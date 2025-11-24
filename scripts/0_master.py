@@ -306,47 +306,130 @@ def run_step4_mp4(slug: str, profile: str) -> float:
 
 def run_step5_upload(slug: str, profile: str) -> float:
     """
-    Upload the MP4 for slug/profile using 5_upload.py.
-    Uses default privacy=unlisted, auto title, empty description.
+    Step 5: Upload to YouTube using 5_upload.py.
+    Asks the user for the upload descriptor and shows a summary of all metadata.
     """
-    mp4_path = OUTPUT_DIR / f"{slug}_{profile}.mp4"
-    if not mp4_path.exists():
-        log("STEP5", f"MP4 not found: {mp4_path} (run step 4 first)", RED)
-        return 0.0
-
-    # Title & description from meta
+    # ---------------------------------------------------------
+    # Load metadata (artist/title)
+    # ---------------------------------------------------------
     meta_path = META_DIR / f"{slug}.json"
-    title = mp4_path.stem
-    description = ""
+    artist = title = None
     if meta_path.exists():
         try:
-            data = json.loads(meta_path.read_text(encoding="utf-8"))
-            artist = data.get("artist") or ""
-            song = data.get("title") or ""
-            if artist and song:
-                title = f"{artist} – {song} (Karaoke)"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            artist = meta.get("artist")
+            title = meta.get("title")
         except Exception:
             pass
 
+    artist = artist or "Unknown Artist"
+    title = title or slug.replace("_", " ").title()
+
+    # ---------------------------------------------------------
+    # Load mix config (stem volumes + model)
+    # ---------------------------------------------------------
+    mix_cfg_path_json = MIXES_DIR / f"{slug}_{profile}.json"
+    model = "unknown"
+    volumes = {}
+    if mix_cfg_path_json.exists():
+        try:
+            cfg = json.loads(mix_cfg_path_json.read_text(encoding="utf-8"))
+            model = cfg.get("model", "unknown")
+            volumes = cfg.get("volumes", {})
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------
+    # Gather file paths
+    # ---------------------------------------------------------
+    mp4_path = OUTPUT_DIR / f"{slug}_{profile}.mp4"
+    mix_wav_path = MIXES_DIR / f"{slug}_{profile}.wav"
+    txt_path = TXT_DIR / f"{slug}.txt"
+    mp3_path = MP3_DIR / f"{slug}.mp3"
+
+    # ---------------------------------------------------------
+    # Compute audio duration
+    # ---------------------------------------------------------
+    def compute_len(p: Path) -> float:
+        if not p.exists():
+            return 0.0
+        try:
+            out = subprocess.check_output(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(p)],
+                text=True
+            ).strip()
+            return float(out)
+        except Exception:
+            return 0.0
+
+    mp3_dur = compute_len(mp3_path)
+    mp4_dur = compute_len(mp4_path)
+
+    # ---------------------------------------------------------
+    # Display summary for user confirmation
+    # ---------------------------------------------------------
+    print("\n" + "=" * 60)
+    print(f"UPLOAD SUMMARY for slug='{slug}'  (profile={profile})")
+    print("=" * 60)
+    print(f"Artist:       {artist}")
+    print(f"Title:        {title}")
+    print(f"Slug:         {slug}")
+    print(f"Profile:      {profile}")
+    print(f"Model:        {model}")
+    print(f"Stems:        vocals, bass, guitar, piano, other")
+    print("Volumes:")
+    for k, v in volumes.items():
+        pct = int(round(float(v) * 100))
+        print(f"  - {k:7s}: {pct:3d}%")
+
+    print(f"\nMP3:          {mp3_path}")
+    print(f"MP3 length:   {mp3_dur:.1f} sec")
+    print(f"WAV mix:      {mix_wav_path}")
+    print(f"MP4 output:   {mp4_path}")
+    print(f"MP4 length:   {mp4_dur:.1f} sec")
+    print("=" * 60)
+
+    # ---------------------------------------------------------
+    # Ask user for descriptor
+    # ---------------------------------------------------------
+    try:
+        desc = input(
+            f"Enter upload descriptor (e.g. Karaoke, Car Karaoke) "
+            f"[default={profile}]: "
+        ).strip()
+    except EOFError:
+        desc = ""
+
+    if not desc:
+        desc = profile.replace("-", " ").title()
+
+    upload_title = f"{artist} – {title} ({desc})"
+
+    print(f"\nFinal YouTube TITLE will be:\n  {upload_title}")
+    try:
+        ok = input("Continue? [Y/n]: ").strip().lower()
+    except EOFError:
+        ok = "y"
+
+    if ok not in ("", "y", "yes"):
+        log("STEP5", "Upload cancelled.", YELLOW)
+        return 0.0
+
+    # ---------------------------------------------------------
+    # Run uploader script
+    # ---------------------------------------------------------
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "5_upload.py"),
-        "--file",
-        str(mp4_path),
-        "--title",
-        title,
-        "--description",
-        description,
-        "--privacy",
-        "unlisted",
-        "--thumb-from-sec",
-        "0.5",
+        "--file", str(mp4_path),
+        "--title", upload_title,
+        "--description", "",
+        "--privacy", "unlisted",
+        "--thumb-from-sec", "0.5",
     ]
 
-    t = run(cmd, "STEP5")
-    log("STEP5", "Upload completed.", GREEN)
-    return t
-
+    return run(cmd, "STEP5")
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
