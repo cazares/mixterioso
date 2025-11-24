@@ -255,32 +255,82 @@ def mix_ui(slug: str, profile: str, model: str) -> dict:
 
 
 def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path) -> None:
-    # Expect stems at separated/<model>/<stemname>.wav relative to BASE_DIR
+    """
+    Default to 4-stem models (vocals, bass, drums, other) but gracefully
+    fall back for older 5-stem configs by allowing guitar->other.
+    """
+
     separated_dir = BASE_DIR / "separated" / model / slug
+
+    # NEW: dynamic stem resolution
+    def resolve_stem(track: str) -> Path:
+        """
+        Rules:
+        - For 'guitar': prefer guitar.wav, fallback to other.wav
+        - For 'piano': fallback to other.wav (optional)
+        - For 'drums': support drums.wav under 4-stem models
+        - Everything else: direct match
+        """
+        direct = separated_dir / f"{track}.wav"
+
+        # If direct exists, use it
+        if direct.exists():
+            return direct
+
+        # guitar fallback → other.wav
+        if track == "guitar":
+            fallback = separated_dir / "other.wav"
+            if fallback.exists():
+                return fallback
+
+        # piano fallback → other.wav (safe)
+        if track == "piano":
+            fallback = separated_dir / "other.wav"
+            if fallback.exists():
+                return fallback
+
+        raise SystemExit(f"Stem not found: expected '{track}.wav' or fallback, in {separated_dir}")
+
+    # NEW DEFAULT TRACK ORDER (4-stem model)
+    # Keep backwards compatibility: if user has volumes for guitar/piano, they still get mapped.
+    ordered_tracks = []
+
+    # Always include these
+    for base in ["vocals", "bass", "drums", "other"]:
+        if base in volumes:
+            ordered_tracks.append(base)
+
+    # If user specified guitar volume in config, include it too (fallback to other.wav)
+    if "guitar" in volumes and "guitar" not in ordered_tracks:
+        ordered_tracks.append("guitar")
+
+    # Optional: preserve existing piano as well
+    if "piano" in volumes and "piano" not in ordered_tracks:
+        ordered_tracks.append("piano")
+
+    # Resolve paths with fallback
     stems = {}
-    for t in TRACKS:
-        p = separated_dir / f"{t}.wav"
-        if not p.exists():
-            raise SystemExit(f"Stem not found: {p}")
-        stems[t] = p
+    for t in ordered_tracks:
+        stems[t] = resolve_stem(t)
 
     MIXES_DIR.mkdir(parents=True, exist_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    inputs = []
-    for t in TRACKS:
-        inputs.append(stems[t])
-
+    # Build ffmpeg filtergraph
     filter_parts = []
     labels = []
-    for idx, t in enumerate(TRACKS):
+    inputs = []
+
+    for idx, t in enumerate(ordered_tracks):
+        p = stems[t]
+        inputs.append(p)
         vol = float(volumes.get(t, 0.0))
         in_label = f"{idx}:a"
         out_label = f"a{idx}"
         filter_parts.append(f"[{in_label}]volume={vol:.3f}[{out_label}]")
         labels.append(f"[{out_label}]")
 
-    amix = "".join(labels) + f"amix=inputs={len(TRACKS)}:normalize=0[mix]"
+    amix = "".join(labels) + f"amix=inputs={len(ordered_tracks)}:normalize=0[mix]"
     filter_complex = ";".join(filter_parts + [amix])
 
     cmd = ["ffmpeg", "-y"]
@@ -296,8 +346,6 @@ def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path)
     log("FFMPEG", " ".join(cmd), BLUE)
     subprocess.run(cmd, check=True)
     log("MIX", f"Wrote mixed WAV to {output}", GREEN)
-
-
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Stem mix UI and renderer.")

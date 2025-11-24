@@ -1,155 +1,152 @@
 #!/usr/bin/env python3
-# scripts/5_upload.py
-#
-# Upload a video to YouTube via the official YouTube Data API.
-#
-# Requirements:
-#   - OAuth client secrets JSON:
-#          $YOUTUBE_CLIENT_SECRETS_JSON   (file OR directory)
-#          ./client_secret.json           (fallback)
-#   - Stores OAuth tokens next to client_secret.json as youtube_token.json
-#
-#   This script is intentionally simple: 0_master.py builds the final
-#   title/description and calls this with --file/--title/etc.
-#
-# CLI:
-#   --file            MP4 path (required)
-#   --title           Title (required)
-#   --description     Description text
-#   --tags            Comma-separated list of tags
-#   --category-id     YouTube category (default "10")
-#   --privacy         public|unlisted|private
-#   --made-for-kids   Mark as “made for kids”
-#   --thumb-from-sec  Generate and upload thumbnail from timestamp (sec)
-#
-# Returns:
-#   Prints the video ID JSON object on final line.
+"""
+Clean, modern YouTube uploader for Mixterioso.
+
+- Uses google-auth / google-auth-oauthlib / google-api-python-client
+- No oauth2client / run_flow / Storage
+- Stores OAuth token as youtube_token.json next to client_secret.json
+
+Environment:
+    YOUTUBE_CLIENT_SECRETS_JSON -> path to client_secret.json
+                                  OR a directory containing client_secret.json
+
+Example:
+    export YOUTUBE_CLIENT_SECRETS_JSON="/Users/you/karaoke/client_secret.json"
+    python3 scripts/5_upload.py --file output/foo_bar.mp4 --title "Foo – Bar (Karaoke)"
+"""
 
 import argparse
-import http.client
-import httplib2
-import json
 import os
-import sys
 import subprocess
+import sys
+import time
 from pathlib import Path
-from typing import Optional
 
+from dotenv import load_dotenv
+
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
-from oauth2client.client import flow_from_clientsecrets
-from oauth2client.file import Storage
-from oauth2client.tools import run_flow
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 
-# ==========================================================
-# COLORS (match 0_master.py)
-# ==========================================================
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-CYAN   = "\033[36m"
-WHITE  = "\033[97m"
-GREEN  = "\033[32m"
-YELLOW = "\033[33m"
-RED    = "\033[31m"
-BLUE   = "\033[34m"
-MAG    = "\033[35m"
+# Load .env (for YOUTUBE_CLIENT_SECRETS_JSON, etc.)
+load_dotenv()
+
+# -----------------------------------------------------------------------------
+# Constants / paths
+# -----------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Scope required for uploading videos
+YOUTUBE_UPLOAD_SCOPE = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
-def log(section: str, msg: str, color: str = CYAN):
-    print(f"{color}[{section}]{RESET} {msg}")
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def log(section: str, msg: str) -> None:
+    """Simple timestamped logger."""
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] [{section}] {msg}")
 
 
-# ==========================================================
-# LOCATE CLIENT SECRETS
-# ==========================================================
-def find_client_secret_json() -> Path:
+def load_secrets_path() -> Path:
     """
-    Locate OAuth client secrets either from env:
-        $YOUTUBE_CLIENT_SECRETS_JSON
-    or fallback to ./client_secret.json
+    Resolve the location of client_secret.json based on YOUTUBE_CLIENT_SECRETS_JSON.
+
+    Accepts:
+      - exact file path to client_secret.json
+      - directory containing client_secret.json
     """
-    env = os.environ.get("YOUTUBE_CLIENT_SECRETS_JSON")
-    if env:
-        p = Path(env)
-        if p.is_dir():
-            p = p / "client_secret.json"
-        if not p.exists():
-            raise SystemExit(
-                f"$YOUTUBE_CLIENT_SECRETS_JSON points to '{env}' "
-                f"but no client_secret.json found inside it."
-            )
+    raw = os.getenv("YOUTUBE_CLIENT_SECRETS_JSON")
+
+    if not raw:
+        log("SECRETS", "YOUTUBE_CLIENT_SECRETS_JSON is not set.")
+        sys.exit(1)
+
+    p = Path(raw).expanduser()
+
+    if p.is_file():
         return p
 
-    # Fallback: local directory
-    p = Path("client_secret.json")
-    if not p.exists():
-        raise SystemExit(
-            "client_secret.json not found.\n"
-            "Place it in the project root OR set $YOUTUBE_CLIENT_SECRETS_JSON."
-        )
-    return p
+    if p.is_dir():
+        guess = p / "client_secret.json"
+        if guess.exists():
+            return guess
+
+    log("SECRETS", f"Invalid secrets path: {p}")
+    sys.exit(1)
 
 
-# ==========================================================
-# THUMBNAIL GENERATION
-# ==========================================================
-def generate_thumbnail(video_path: Path, sec: float) -> Optional[Path]:
+def get_credentials(secrets_path: Path):
     """
-    Extract a thumbnail via ffmpeg at timestamp "sec".
-    Returns:
-        Path to thumbnail JPG or None on failure.
+    Get or create OAuth credentials for the YouTube upload scope.
+
+    Token is stored as youtube_token.json next to client_secret.json (Option A).
     """
-    thumb = video_path.with_suffix(".jpg")
+    token_path = secrets_path.parent / "youtube_token.json"
+    creds = None
+
+    # Try to load existing token
+    if token_path.exists():
+        try:
+            creds = Credentials.from_authorized_user_file(
+                str(token_path),
+                YOUTUBE_UPLOAD_SCOPE,
+            )
+        except Exception:
+            creds = None
+
+    # Refresh or run new OAuth flow if needed
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                log("OAUTH", "Refreshing existing OAuth token...")
+                creds.refresh(Request())
+            except Exception:
+                creds = None
+
+        if not creds or not creds.valid:
+            log("OAUTH", "Running OAuth login flow...")
+            flow = InstalledAppFlow.from_client_secrets_file(
+                str(secrets_path),
+                scopes=YOUTUBE_UPLOAD_SCOPE,
+            )
+            # This opens a browser and listens on localhost
+            creds = flow.run_local_server(port=0)
+            token_path.write_text(creds.to_json(), encoding="utf-8")
+            log("OAUTH", f"Saved OAuth token to {token_path}")
+
+    return creds
+
+
+def extract_thumbnail(video_path: Path, out_path: Path, time_sec: float) -> None:
+    """
+    Extract a JPEG thumbnail from the given time position using ffmpeg.
+    """
     cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(sec),
-        "-i", str(video_path),
-        "-frames:v", "1",
-        "-q:v", "2",
-        str(thumb)
+        "ffmpeg",
+        "-y",
+        "-ss",
+        str(time_sec),
+        "-i",
+        str(video_path),
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        str(out_path),
     ]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True)
-        return thumb
-    except Exception as e:
-        log("UPLOAD", f"Thumbnail generation failed: {e}", YELLOW)
-        return None
+    log("THUMB", " ".join(cmd))
+    subprocess.run(cmd, check=True)
 
 
-# ==========================================================
-# YOUTUBE CLIENT AUTH
-# ==========================================================
-def get_authenticated_service() -> "Resource":
-    """
-    Perform OAuth2 from client_secret.json and return YouTube Data API client.
-    Token is stored in same directory as youtube_token.json.
-    """
-    client_secret_path = find_client_secret_json()
-    secrets_dir = client_secret_path.parent
-    token_path = secrets_dir / "youtube_token.json"
-
-    flow = flow_from_clientsecrets(
-        str(client_secret_path),
-        scope=["https://www.googleapis.com/auth/youtube.upload"],
-        message="Unable to find client secrets.",
-    )
-
-    storage = Storage(str(token_path))
-    credentials = storage.get()
-
-    if credentials is None or credentials.invalid:
-        log("UPLOAD", "Launching OAuth flow in browser...", CYAN)
-        credentials = run_flow(flow, storage)
-
-    # Create API client
-    return build("youtube", "v3", http=credentials.authorize(httplib2.Http()))
-
-
-# ==========================================================
-# PERFORM UPLOAD
-# ==========================================================
-def perform_upload(
+# -----------------------------------------------------------------------------
+# Upload logic
+# -----------------------------------------------------------------------------
+def upload_video(
     youtube,
     video_path: Path,
     title: str,
@@ -157,12 +154,9 @@ def perform_upload(
     tags: list[str],
     category_id: str,
     privacy: str,
-    made_for_kids: bool,
 ) -> str:
     """
-    Upload the video file to YouTube.
-    Returns:
-        The video ID string.
+    Perform the actual YouTube upload and return the new video ID.
     """
     body = {
         "snippet": {
@@ -173,129 +167,120 @@ def perform_upload(
         },
         "status": {
             "privacyStatus": privacy,
-            "selfDeclaredMadeForKids": made_for_kids,
+            "selfDeclaredMadeForKids": False,
         },
     }
 
-    media = MediaFileUpload(str(video_path), chunksize=-1, resumable=True)
+    media = MediaFileUpload(str(video_path), mimetype="video/mp4", resumable=True)
 
+    log("UPLOAD", f"Starting upload: {video_path}")
     request = youtube.videos().insert(
         part="snippet,status",
         body=body,
         media_body=media,
     )
 
-    log("UPLOAD", "Starting resumable upload...", CYAN)
-
     response = None
-    error = None
-    retry = 0
-    max_retries = 10
-
     while response is None:
         try:
             status, response = request.next_chunk()
-            if response and "id" in response:
-                vid = response["id"]
-                log("UPLOAD", f"Upload complete. Video ID: {vid}", GREEN)
-                return vid
+            if status:
+                pct = int(status.progress() * 100)
+                log("UPLOAD", f"Progress: {pct}%")
         except HttpError as e:
-            error = f"HTTP error: {e.resp.status}"
-        except (httplib2.HttpLib2Error, IOError, http.client.NotConnected):
-            error = "Network error"
+            log("ERROR", f"Upload failed: {e}")
+            raise
 
-        if error:
-            retry += 1
-            if retry > max_retries:
-                raise SystemExit(f"Upload failed: {error}")
-
-            log("UPLOAD", f"{error}; retry {retry}/{max_retries}", YELLOW)
-            error = None
-
-    raise SystemExit("Upload failed with unknown error.")
+    video_id = response.get("id")
+    log("UPLOAD", f"Upload complete. video_id={video_id}")
+    return video_id
 
 
-# ==========================================================
-# THUMBNAIL UPLOAD
-# ==========================================================
-def upload_thumbnail(youtube, video_id: str, thumb_path: Path):
+def set_thumbnail(youtube, video_id: str, thumb_path: Path) -> None:
     """
-    Upload a generated thumbnail to YouTube.
+    Upload a thumbnail for a video.
     """
-    log("UPLOAD", f"Uploading thumbnail: {thumb_path}", CYAN)
-
+    log("THUMB", f"Uploading thumbnail for {video_id}: {thumb_path}")
     media = MediaFileUpload(str(thumb_path), mimetype="image/jpeg")
-    try:
-        youtube.thumbnails().set(
-            videoId=video_id,
-            media_body=media
-        ).execute()
-        log("UPLOAD", "Thumbnail uploaded.", GREEN)
-    except Exception as e:
-        log("UPLOAD", f"Thumbnail upload failed: {e}", YELLOW)
+    request = youtube.thumbnails().set(videoId=video_id, media_body=media)
+    _ = request.execute()
+    log("THUMB", "Thumbnail set.")
 
 
-# ==========================================================
-# MAIN
-# ==========================================================
-def parse_args():
-    p = argparse.ArgumentParser(description="Upload MP4 to YouTube")
-    p.add_argument("--file", required=True, help="MP4 to upload")
-    p.add_argument("--title", required=True, help="YouTube title")
-    p.add_argument("--description", default="", help="YouTube description")
-    p.add_argument("--tags", default="", help="Comma-separated tags")
-    p.add_argument("--category-id", default="10", help="YouTube categoryId")
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Upload an MP4 file to YouTube.")
+
+    p.add_argument("--file", required=True, help="Path to MP4 file.")
+    p.add_argument("--title", default=None, help="YouTube video title.")
     p.add_argument(
-        "--privacy",
-        default="unlisted",
-        choices=["public", "unlisted", "private"],
-        help="Video privacy status",
+        "--description",
+        default="",
+        help="YouTube video description.",
     )
     p.add_argument(
-        "--made-for-kids",
-        action="store_true",
-        help="Mark video as made for kids",
+        "--tags",
+        type=str,
+        default="",
+        help="Comma-separated tags, e.g. 'karaoke,red hot chili peppers'.",
+    )
+    p.add_argument(
+        "--category-id",
+        type=str,
+        default="10",
+        help="YouTube category (default '10' = Music).",
+    )
+    p.add_argument(
+        "--privacy",
+        choices=["public", "unlisted", "private"],
+        default="unlisted",
+        help="Privacy status for the video.",
     )
     p.add_argument(
         "--thumb-from-sec",
         type=float,
-        help="Generate and upload a thumbnail from timestamp (sec)",
+        default=None,
+        help="If set, extract and upload a thumbnail at this second.",
     )
-    return p.parse_args()
+
+    return p.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv or sys.argv[1:])
 
-    video_path = Path(args.file)
+    video_path = Path(args.file).resolve()
     if not video_path.exists():
-        raise SystemExit(f"Video file not found: {video_path}")
+        log("ERROR", f"Video file not found: {video_path}")
+        sys.exit(1)
 
-    # Parse tags
-    tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
+    title = args.title or video_path.stem
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()]
 
-    youtube = get_authenticated_service()
+    secrets_path = load_secrets_path()
+    creds = get_credentials(secrets_path)
+    youtube = build("youtube", "v3", credentials=creds)
 
     # Upload video
-    video_id = perform_upload(
-        youtube=youtube,
-        video_path=video_path,
-        title=args.title,
-        description=args.description,
-        tags=tags,
-        category_id=args.category_id,
-        privacy=args.privacy,
-        made_for_kids=args.made_for_kids,
+    video_id = upload_video(
+        youtube,
+        video_path,
+        title,
+        args.description,
+        tags,
+        args.category_id,
+        args.privacy,
     )
 
-    # Thumbnail selection
+    # Thumbnail (optional)
     if args.thumb_from_sec is not None:
-        thumb = generate_thumbnail(video_path, args.thumb_from_sec)
-        if thumb:
-            upload_thumbnail(youtube, video_id, thumb)
+        thumb_path = video_path.with_suffix(".jpg")
+        extract_thumbnail(video_path, thumb_path, args.thumb_from_sec)
+        set_thumbnail(youtube, video_id, thumb_path)
 
-    # Final success JSON
-    print(json.dumps({"ok": True, "video_id": video_id}))
+    log("DONE", f"Video available at: https://youtube.com/watch?v={video_id}")
 
 
 if __name__ == "__main__":
