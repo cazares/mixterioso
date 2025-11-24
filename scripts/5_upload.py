@@ -17,17 +17,25 @@ This script:
   - Sets thumbnail at --thumb-from-sec (optional)
 """
 
+#!/usr/bin/env python3
 import argparse
+import json
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
+
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 
 # -----------------------------------------------------------------------------
 # Paths

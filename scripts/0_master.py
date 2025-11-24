@@ -54,6 +54,7 @@ def run(cmd: list[str], section: str) -> float:
     t1 = time.perf_counter()
     return t1 - t0
 
+
 def detect_slug_from_latest_mp3() -> str:
     """
     Infer the most recent slug produced by step 1.
@@ -101,12 +102,15 @@ def detect_assets(slug: str, profile: str) -> dict:
         step2_done = mix_wav.exists()
     step3_done = timing_csv.exists()
     step4_done = mp4.exists()
+    # For now, we don't track upload receipts; treat step 5 as "not done" by default.
+    step5_done = False
 
     return {
         1: step1_done,
         2: step2_done,
         3: step3_done,
         4: step4_done,
+        5: step5_done,
     }
 
 
@@ -118,8 +122,9 @@ def print_asset_status(slug: str, profile: str, status: dict) -> None:
         2: "stems/mix (Demucs + mix UI)",
         3: "timings CSV (3_timing)",
         4: "mp4 generation (4_mp4)",
+        5: "upload to YouTube (5_upload)",
     }
-    for step in range(1, 5):
+    for step in range(1, 6):
         s = "DONE" if status.get(step) else "MISSING"
         color = GREEN if status.get(step) else YELLOW
         print(f"{color}[{step}] {labels[step]}  -> {s}{RESET}")
@@ -127,14 +132,14 @@ def print_asset_status(slug: str, profile: str, status: dict) -> None:
 
 
 def suggest_steps(status: dict) -> str:
-    missing = "".join(str(k) for k in range(1, 5) if not status.get(k))
+    missing = "".join(str(k) for k in range(1, 6) if not status.get(k))
     return missing or "0"
 
 
 def parse_steps_string(s: str) -> list[int]:
     steps: list[int] = []
     for ch in s:
-        if ch in "01234":
+        if ch in "012345":
             v = int(ch)
             if v not in steps:
                 steps.append(v)
@@ -299,9 +304,56 @@ def run_step4_mp4(slug: str, profile: str) -> float:
         return 0.0
 
 
+def run_step5_upload(slug: str, profile: str) -> float:
+    """
+    Upload the MP4 for slug/profile using 5_upload.py.
+    Uses default privacy=unlisted, auto title, empty description.
+    """
+    mp4_path = OUTPUT_DIR / f"{slug}_{profile}.mp4"
+    if not mp4_path.exists():
+        log("STEP5", f"MP4 not found: {mp4_path} (run step 4 first)", RED)
+        return 0.0
+
+    # Title & description from meta
+    meta_path = META_DIR / f"{slug}.json"
+    title = mp4_path.stem
+    description = ""
+    if meta_path.exists():
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            artist = data.get("artist") or ""
+            song = data.get("title") or ""
+            if artist and song:
+                title = f"{artist} – {song} (Karaoke)"
+        except Exception:
+            pass
+
+    cmd = [
+        sys.executable,
+        str(SCRIPTS_DIR / "5_upload.py"),
+        "--file",
+        str(mp4_path),
+        "--title",
+        title,
+        "--description",
+        description,
+        "--privacy",
+        "unlisted",
+        "--thumb-from-sec",
+        "0.5",
+    ]
+
+    t = run(cmd, "STEP5")
+    log("STEP5", "Upload completed.", GREEN)
+    return t
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Karaoke pipeline master (1=txt/mp3, 2=stems, 3=timing, 4=mp4)."
+        description=(
+            "Karaoke pipeline master "
+            "(1=txt/mp3, 2=stems, 3=timing, 4=mp4, 5=upload)."
+        )
     )
     src = p.add_mutually_exclusive_group()
     src.add_argument("--query", type=str, help="Search query for step 1 (1_txt_mp3)")
@@ -313,7 +365,7 @@ def parse_args(argv=None):
         choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
     )
     p.add_argument("--model", type=str, default="htdemucs", help="Demucs model name")
-    p.add_argument("--steps", type=str, help="Steps to run, e.g. 24 or 1234")
+    p.add_argument("--steps", type=str, help="Steps to run, e.g. 24 or 12345")
     p.add_argument(
         "--do",
         type=str,
@@ -382,7 +434,9 @@ def interactive_slug_and_steps(args):
     suggested = suggest_steps(status)
     try:
         s = input(
-            f"Steps to run (1=txt/mp3,2=stems,3=timing,4=mp4, 0=none, ENTER for suggested={suggested}): "
+            "Steps to run "
+            "(1=txt/mp3,2=stems,3=timing,4=mp4,5=upload, "
+            f"0=none, ENTER for suggested={suggested}): "
         ).strip()
     except EOFError:
         s = ""
@@ -409,7 +463,7 @@ def interactive_slug_and_steps(args):
 
 def noninteractive_slug_and_steps(args):
     if not args.steps:
-        raise SystemExit("--skip-ui requires --steps like 24 or 1234.")
+        raise SystemExit("--skip-ui requires --steps like 24 or 12345.")
     steps = parse_steps_string(args.steps)
     if not steps:
         return "", []
@@ -421,7 +475,7 @@ def noninteractive_slug_and_steps(args):
         slug, _ = run_step1_txt_mp3(args.query)
 
     if not slug:
-        raise SystemExit("Slug is required for steps 2–4 (use --slug or include step 1 with --query).")
+        raise SystemExit("Slug is required for steps 2–5 (use --slug or include step 1 with --query).")
 
     slug = slugify(slug)
     return slug, steps
@@ -464,7 +518,7 @@ def main(argv=None):
 
     log("MASTER", f"Running steps {steps} for slug={slug}, profile={args.profile}", CYAN)
 
-    t2 = t3 = t4 = 0.0
+    t2 = t3 = t4 = t5 = 0.0
 
     if 1 in steps and not args.skip_ui and t1 == 0.0:
         if not args.query:
@@ -480,6 +534,9 @@ def main(argv=None):
     if 4 in steps:
         t4 = run_step4_mp4(slug, args.profile)
 
+    if 5 in steps:
+        t5 = run_step5_upload(slug, args.profile)
+
     total_end = time.perf_counter()
     total = total_end - total_start
 
@@ -489,6 +546,7 @@ def main(argv=None):
     print(f"{CYAN}Step 2 stems:    {fmt_secs_mmss(t2)}{RESET}")
     print(f"{CYAN}Step 3 timing:   {fmt_secs_mmss(t3)}{RESET}")
     print(f"{CYAN}Step 4 mp4:      {fmt_secs_mmss(t4)}{RESET}")
+    print(f"{CYAN}Step 5 upload:   {fmt_secs_mmss(t5)}{RESET}")
     print(f"{BOLD}{GREEN}Total pipeline: {fmt_secs_mmss(total)}{RESET}")
     print(f"{BOLD}{BLUE}====================================================={RESET}")
 
