@@ -6,6 +6,8 @@ import sys
 import time
 from pathlib import Path
 
+from scripts.mix_utils import load_existing_config
+
 # ==========================================================
 # COLORS
 # ==========================================================
@@ -173,6 +175,14 @@ def run_step1_txt_mp3(query: str) -> tuple[str, float]:
 # STEP 2
 # ==========================================================
 def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> float:
+    """
+    NEW ORDER:
+      1. Run mix UI FIRST (always before stem separation)
+      2. Save/confirm volumes
+      3. Then run Demucs (reuse or regenerate)
+      4. Finally render mix WAV
+    """
+
     if profile == "lyrics":
         log("STEP2", "Profile 'lyrics' skips stems/mix.", YELLOW)
         return 0.0
@@ -182,6 +192,30 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     if not mp3_path.exists() or not txt_path.exists():
         raise SystemExit(f"Missing assets for step 2: {mp3_path}, {txt_path}")
 
+    # -------------------------------------------------------
+    # 1. UI FIRST (always)
+    # -------------------------------------------------------
+    t_ui = run(
+        [
+            sys.executable, str(SCRIPTS_DIR / "2_stems.py"),
+            "--mp3", str(mp3_path),
+            "--profile", profile,
+            "--model", model,
+            "--mix-ui-only",
+        ],
+        "STEP2-MIXUI",
+    )
+
+    # Load the config that UI just saved
+    cfg_vols, cfg_path = load_existing_config(slug, profile)
+    if cfg_vols is None:
+        raise SystemExit("Mix UI did not save a valid config.")
+
+    log("STEP2", f"Using volumes from {cfg_path}", GREEN)
+
+    # -------------------------------------------------------
+    # 2. Decide whether stems exist + reuse prompt
+    # -------------------------------------------------------
     separated_root = BASE_DIR / "separated"
 
     preferred: list[str] = []
@@ -192,7 +226,6 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     if "htdemucs" not in preferred:
         preferred.append("htdemucs")
 
-    # Reuse existing stems?
     existing_model = None
     for m in preferred:
         d = separated_root / m / slug
@@ -200,7 +233,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
             existing_model = m
             break
 
-    reuse  = False
+    reuse = False
     actual = existing_model
 
     if existing_model:
@@ -212,9 +245,11 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
         else:
             reuse = True
 
+    # -------------------------------------------------------
+    # 3. Run Demucs ONLY AFTER UI
+    # -------------------------------------------------------
     t_demucs = 0.0
 
-    # Run Demucs if needed
     if not reuse:
         import subprocess as sp
         log("STEP2", f"Trying models: {preferred}", CYAN)
@@ -231,23 +266,12 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     elif actual is None:
         raise SystemExit("Reuse requested but no stems exist.")
 
-    log("STEP2", f"Using model '{actual}'", GREEN)
+    log("STEP2", f"Using stem model '{actual}'", GREEN)
 
-    # Open UI
-    t_ui = run(
-        [
-            sys.executable, str(SCRIPTS_DIR / "2_stems.py"),
-            "--mp3", str(mp3_path),
-            "--profile", profile,
-            "--model", actual,
-            "--mix-ui-only",
-        ],
-        "STEP2-MIXUI",
-    )
-
+    # -------------------------------------------------------
+    # 4. Render FINAL WAV
+    # -------------------------------------------------------
     out_wav = MIXES_DIR / f"{slug}_{profile}.wav"
-
-    # Render
     t_render = run(
         [
             sys.executable, str(SCRIPTS_DIR / "2_stems.py"),
@@ -260,10 +284,9 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
         "STEP2-RENDER",
     )
 
-    total = t_demucs + t_ui + t_render
+    total = t_ui + t_demucs + t_render
     log("STEP2", f"Completed in {fmt_secs_mmss(total)}", GREEN)
     return total
-
 
 # ==========================================================
 # STEP 3

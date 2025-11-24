@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from scripts.mix_utils import load_existing_config, save_config
+
 RESET = "\033[0m"
 BOLD = "\033[1m"
 CYAN = "\033[36m"
@@ -83,42 +85,6 @@ def profile_defaults(profile: str) -> dict:
         "piano": 1.0,
         "other": 1.0,
     }
-
-
-def load_existing_config(slug: str, profile: str) -> tuple[dict | None, Path | None]:
-    MIXES_DIR.mkdir(parents=True, exist_ok=True)
-    new_path = MIXES_DIR / f"{slug}_{profile}.json"
-    old_path = MIXES_DIR / f"{slug}.json"
-    path = None
-    if new_path.exists():
-        path = new_path
-    elif old_path.exists():
-        path = old_path
-    if not path:
-        return None, None
-    try:
-        cfg = json.loads(path.read_text(encoding="utf-8"))
-        vols = cfg.get("volumes", {})
-        if isinstance(vols, dict):
-            return vols, path
-    except Exception:
-        pass
-    return None, path
-
-
-def save_config(slug: str, profile: str, model: str, volumes: dict) -> Path:
-    MIXES_DIR.mkdir(parents=True, exist_ok=True)
-    path = MIXES_DIR / f"{slug}_{profile}.json"
-    cfg = {
-        "slug": slug,
-        "profile": profile,
-        "model": model,
-        "volumes": volumes,
-    }
-    path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    log("MIXCFG", f"Saved mix config to {path}", GREEN)
-    return path
-
 
 def mix_ui(slug: str, profile: str, model: str) -> dict:
     import curses
