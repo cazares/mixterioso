@@ -5,6 +5,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import sys, os
+PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PARENT)
+
 from scripts.mix_utils import load_existing_config, save_config
 
 RESET = "\033[0m"
@@ -222,67 +226,70 @@ def mix_ui(slug: str, profile: str, model: str) -> dict:
 
 def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path) -> None:
     """
-    Default to 4-stem models (vocals, bass, drums, other) but gracefully
-    fall back for older 5-stem configs by allowing guitar->other.
+    4-stem aware mixer with fallback mappings:
+      - drums.wav is supported
+      - guitar → other.wav fallback
+      - piano → other.wav fallback
+    This guarantees correct volume application for modern Demucs output.
     """
-
     separated_dir = BASE_DIR / "separated" / model / slug
 
-    # NEW: dynamic stem resolution
+    # Helper: resolve one stem with fallback
     def resolve_stem(track: str) -> Path:
-        """
-        Rules:
-        - For 'guitar': prefer guitar.wav, fallback to other.wav
-        - For 'piano': fallback to other.wav (optional)
-        - For 'drums': support drums.wav under 4-stem models
-        - Everything else: direct match
-        """
         direct = separated_dir / f"{track}.wav"
 
-        # If direct exists, use it
+        # If exact file exists, use it
         if direct.exists():
             return direct
 
-        # guitar fallback → other.wav
+        # guitar → other fallback
         if track == "guitar":
-            fallback = separated_dir / "other.wav"
-            if fallback.exists():
-                return fallback
+            fb = separated_dir / "other.wav"
+            if fb.exists():
+                return fb
 
-        # piano fallback → other.wav (safe)
+        # piano → other fallback
         if track == "piano":
-            fallback = separated_dir / "other.wav"
-            if fallback.exists():
-                return fallback
+            fb = separated_dir / "other.wav"
+            if fb.exists():
+                return fb
 
-        raise SystemExit(f"Stem not found: expected '{track}.wav' or fallback, in {separated_dir}")
+        raise SystemExit(
+            f"Stem not found: expected {track}.wav or fallback in {separated_dir}"
+        )
 
-    # NEW DEFAULT TRACK ORDER (4-stem model)
-    # Keep backwards compatibility: if user has volumes for guitar/piano, they still get mapped.
+    # ---------------------------------------------
+    # Determine final ordered track list dynamically
+    # ---------------------------------------------
+
+    # The four real Demucs stems (preferred)
+    base_tracks = ["vocals", "bass", "drums", "other"]
+
     ordered_tracks = []
 
-    # Always include these
-    for base in ["vocals", "bass", "drums", "other"]:
-        if base in volumes:
-            ordered_tracks.append(base)
+    # Always include real stems *if* the config contains them
+    for t in base_tracks:
+        if t in volumes:
+            ordered_tracks.append(t)
 
-    # If user specified guitar volume in config, include it too (fallback to other.wav)
-    if "guitar" in volumes and "guitar" not in ordered_tracks:
-        ordered_tracks.append("guitar")
+    # Also include guitar/piano if user has them in config
+    # They will correctly resolve to other.wav
+    for opt in ("guitar", "piano"):
+        if opt in volumes and opt not in ordered_tracks:
+            ordered_tracks.append(opt)
 
-    # Optional: preserve existing piano as well
-    if "piano" in volumes and "piano" not in ordered_tracks:
-        ordered_tracks.append("piano")
-
-    # Resolve paths with fallback
+    # Resolve paths now
     stems = {}
     for t in ordered_tracks:
         stems[t] = resolve_stem(t)
 
+    # Prepare directories
     MIXES_DIR.mkdir(parents=True, exist_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    # ---------------------------------------------
     # Build ffmpeg filtergraph
+    # ---------------------------------------------
     filter_parts = []
     labels = []
     inputs = []
@@ -290,18 +297,26 @@ def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path)
     for idx, t in enumerate(ordered_tracks):
         p = stems[t]
         inputs.append(p)
+
         vol = float(volumes.get(t, 0.0))
         in_label = f"{idx}:a"
         out_label = f"a{idx}"
+
+        # Volume filter
         filter_parts.append(f"[{in_label}]volume={vol:.3f}[{out_label}]")
         labels.append(f"[{out_label}]")
 
+    # Build amix
     amix = "".join(labels) + f"amix=inputs={len(ordered_tracks)}:normalize=0[mix]"
     filter_complex = ";".join(filter_parts + [amix])
 
+    # ---------------------------------------------
+    # Execute ffmpeg
+    # ---------------------------------------------
     cmd = ["ffmpeg", "-y"]
     for p in inputs:
         cmd += ["-i", str(p)]
+
     cmd += [
         "-filter_complex", filter_complex,
         "-map", "[mix]",
@@ -315,6 +330,7 @@ def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path)
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Stem mix UI and renderer.")
+
     p.add_argument("--mp3", type=str, required=True, help="Original mp3 path (to derive slug).")
     p.add_argument(
         "--profile",
@@ -322,10 +338,19 @@ def parse_args(argv=None):
         default="karaoke",
         choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
     )
-    p.add_argument("--model", type=str, default="htdemucs_6s", help="Demucs model name.")
+
+    # Strict 4-stem model default
+    p.add_argument(
+        "--model",
+        type=str,
+        default="htdemucs",
+        help="Demucs model name (4-stem only).",
+    )
+
     p.add_argument("--mix-ui-only", action="store_true", help="Only run mix UI and save config.")
     p.add_argument("--render-only", action="store_true", help="Only render mix WAV from config.")
     p.add_argument("--output", type=str, help="Output WAV path (optional).")
+
     return p.parse_args(argv)
 
 

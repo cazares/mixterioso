@@ -6,6 +6,10 @@ import sys
 import time
 from pathlib import Path
 
+import sys, os
+PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PARENT)
+
 from scripts.mix_utils import load_existing_config
 
 # ==========================================================
@@ -176,11 +180,12 @@ def run_step1_txt_mp3(query: str) -> tuple[str, float]:
 # ==========================================================
 def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> float:
     """
-    NEW ORDER:
-      1. Run mix UI FIRST (always before stem separation)
-      2. Save/confirm volumes
-      3. Then run Demucs (reuse or regenerate)
-      4. Finally render mix WAV
+    Step 2 now behaves in the correct order:
+      1. Detect existing stems
+      2. Ask user whether to reuse them BEFORE UI
+      3. Run mix UI
+      4. Render mix
+      5. Only re-run Demucs if user declines reuse
     """
 
     if profile == "lyrics":
@@ -192,40 +197,16 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     if not mp3_path.exists() or not txt_path.exists():
         raise SystemExit(f"Missing assets for step 2: {mp3_path}, {txt_path}")
 
-    # -------------------------------------------------------
-    # 1. UI FIRST (always)
-    # -------------------------------------------------------
-    t_ui = run(
-        [
-            sys.executable, str(SCRIPTS_DIR / "2_stems.py"),
-            "--mp3", str(mp3_path),
-            "--profile", profile,
-            "--model", model,
-            "--mix-ui-only",
-        ],
-        "STEP2-MIXUI",
-    )
-
-    # Load the config that UI just saved
-    cfg_vols, cfg_path = load_existing_config(slug, profile)
-    if cfg_vols is None:
-        raise SystemExit("Mix UI did not save a valid config.")
-
-    log("STEP2", f"Using volumes from {cfg_path}", GREEN)
-
-    # -------------------------------------------------------
-    # 2. Decide whether stems exist + reuse prompt
-    # -------------------------------------------------------
     separated_root = BASE_DIR / "separated"
 
+    # Allowed models (strict 4-stem)
     preferred: list[str] = []
     if model:
         preferred.append(model)
-    if "htdemucs_6s" not in preferred:
-        preferred.insert(0, "htdemucs")
     if "htdemucs" not in preferred:
-        preferred.append("htdemucs")
+        preferred.insert(0, "htdemucs")
 
+    # Check for existing stems
     existing_model = None
     for m in preferred:
         d = separated_root / m / slug
@@ -236,23 +217,21 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     reuse = False
     actual = existing_model
 
-    if existing_model:
-        if interactive:
-            ans = input(
-                f"Stems exist for model '{existing_model}'. Reuse? [Y/n]: "
-            ).strip().lower()
-            reuse = ans in ("", "y", "yes")
-        else:
-            reuse = True
+    # Ask BEFORE mix UI
+    if existing_model and interactive:
+        ans = input(
+            f"Stems found for model '{existing_model}'. Reuse existing stems? [Y/n]: "
+        ).strip().lower()
+        reuse = ans in ("", "y", "yes")
+    elif existing_model:
+        reuse = True
 
-    # -------------------------------------------------------
-    # 3. Run Demucs ONLY AFTER UI
-    # -------------------------------------------------------
     t_demucs = 0.0
 
+    # Run Demucs only if needed
     if not reuse:
         import subprocess as sp
-        log("STEP2", f"Trying models: {preferred}", CYAN)
+        log("STEP2", f"Running Demucs (4-stem) with models: {preferred}", CYAN)
         actual = None
         for m in preferred:
             try:
@@ -264,14 +243,25 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
         if actual is None:
             raise SystemExit("Demucs failed for all allowed models.")
     elif actual is None:
-        raise SystemExit("Reuse requested but no stems exist.")
+        raise SystemExit("Reuse requested but no stems actually exist.")
 
-    log("STEP2", f"Using stem model '{actual}'", GREEN)
+    log("STEP2", f"Using stems from model '{actual}'", GREEN)
 
-    # -------------------------------------------------------
-    # 4. Render FINAL WAV
-    # -------------------------------------------------------
+    # --- RUN MIX UI (now after stems decision) ---
+    t_ui = run(
+        [
+            sys.executable, str(SCRIPTS_DIR / "2_stems.py"),
+            "--mp3", str(mp3_path),
+            "--profile", profile,
+            "--model", actual,
+            "--mix-ui-only",
+        ],
+        "STEP2-MIXUI",
+    )
+
     out_wav = MIXES_DIR / f"{slug}_{profile}.wav"
+
+    # --- RENDER MIX ---
     t_render = run(
         [
             sys.executable, str(SCRIPTS_DIR / "2_stems.py"),
@@ -284,7 +274,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
         "STEP2-RENDER",
     )
 
-    total = t_ui + t_demucs + t_render
+    total = t_demucs + t_ui + t_render
     log("STEP2", f"Completed in {fmt_secs_mmss(total)}", GREEN)
     return total
 
@@ -625,11 +615,7 @@ def parse_args(argv=None):
     )
     src = p.add_mutually_exclusive_group()
     src.add_argument("--query", type=str, help="Search query for step 1 (1_txt_mp3)")
-    src.add_argument(
-        "--slug",
-        type=str,
-        help="Slug to operate on (e.g. californication)",
-    )
+    src.add_argument("--slug", type=str, help="Slug to operate on")
 
     p.add_argument(
         "--profile",
@@ -652,10 +638,10 @@ def parse_args(argv=None):
         type=str,
         choices=["new", "remix", "retime", "mp4"],
         help=(
-            "High-level shortcut: "
-            "new=1+2+3+4 from query, "
-            "remix=2+4 from existing slug, "
-            "retime=3+4 from existing slug, "
+            "Shortcuts: "
+            "new=1+2+3+4, "
+            "remix=2+4 (reuse stems), "
+            "retime=3+4, "
             "mp4=4 only."
         ),
     )
@@ -663,11 +649,10 @@ def parse_args(argv=None):
     p.add_argument(
         "--skip-ui",
         action="store_true",
-        help="Non-interactive; use --steps or --do exactly as given",
+        help="Non-interactive mode; use config defaults without the Mix UI",
     )
 
     return p.parse_args(argv)
-
 
 # ==========================================================
 # INTERACTIVE FLOW
@@ -788,48 +773,61 @@ def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
     total_start = time.perf_counter()
 
-    # --do shortcuts
+    # =============================================================
+    # DO-SHORTCUT HANDLING (Skip interactive menu entirely)
+    # =============================================================
     if args.do:
+        # Validate required input
         if args.do == "new":
             if not args.query:
                 raise SystemExit("--do new requires --query.")
             args.steps = "1234"
+            args.skip_ui = True
 
         elif args.do == "remix":
             if not args.slug:
                 raise SystemExit("--do remix requires --slug.")
             args.steps = "24"
+            # User chooses UI or not via --skip-ui
 
         elif args.do == "retime":
             if not args.slug:
                 raise SystemExit("--do retime requires --slug.")
             args.steps = "34"
+            args.skip_ui = True
 
         elif args.do == "mp4":
             if not args.slug:
                 raise SystemExit("--do mp4 requires --slug.")
             args.steps = "4"
+            args.skip_ui = True
 
-        args.skip_ui = True  # force noninteractive
-
-    # Select flow
-    if args.skip_ui:
-        slug, steps = noninteractive_slug_and_steps(args)
+        # For any --do value, completely skip interactive menu
+        slug = args.slug or slugify(args.query)
+        steps = {int(c) for c in str(args.steps)}
         t1 = 0.0
+        log("MASTER", f"Running steps {steps} for slug={slug} (do={args.do})", CYAN)
     else:
-        slug, steps, t1 = interactive_slug_and_steps(args)
+        # =============================================================
+        # NORMAL INTERACTIVE FLOW
+        # =============================================================
+        if args.skip_ui:
+            slug, steps = noninteractive_slug_and_steps(args)
+            t1 = 0.0
+        else:
+            slug, steps, t1 = interactive_slug_and_steps(args)
 
-    if not steps:
-        return
-
-    log("MASTER", f"Running steps {steps} for slug={slug}, profile={args.profile}", CYAN)
-
+        if not steps:
+            return
+        # =============================================================
+    # RUN SELECTED STEPS (standard pipeline execution)
+    # =============================================================
     t2 = t3 = t4 = t5 = 0.0
 
     # Step 1
     if 1 in steps and not args.skip_ui and t1 == 0.0:
         if not args.query:
-            raise SystemExit("Interactive step 1 requires a query.")
+            raise SystemExit("Step 1 requires a query.")
         slug, t1 = run_step1_txt_mp3(args.query)
 
     # Step 2
@@ -848,10 +846,12 @@ def main(argv=None):
     if 5 in steps:
         t5 = run_step5_upload(slug, args.profile)
 
+    # =============================================================
+    # SUMMARY
+    # =============================================================
     total_end = time.perf_counter()
     total = total_end - total_start
 
-    # Final pipeline summary
     print()
     print(f"{BOLD}{BLUE}========= PIPELINE SUMMARY ({slug}, profile={args.profile}) ========={RESET}")
     print(f"{CYAN}Step 1 txt/mp3:  {fmt_secs_mmss(t1)}{RESET}")
@@ -861,7 +861,6 @@ def main(argv=None):
     print(f"{CYAN}Step 5 upload:   {fmt_secs_mmss(t5)}{RESET}")
     print(f"{BOLD}{GREEN}Total pipeline: {fmt_secs_mmss(total)}{RESET}")
     print(f"{BOLD}{BLUE}====================================================={RESET}")
-
 
 if __name__ == "__main__":
     main()
