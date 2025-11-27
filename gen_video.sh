@@ -134,17 +134,17 @@ find_existing_stems_dir() {
   local stems_export_dir="$1"
   local audio_base="$2"
 
-  if [ -d "$stems_export_dir/htdemucs_6s/$audio_base" ]; then
-    printf '%s\n' "$stems_export_dir/htdemucs_6s/$audio_base"
+  if [ -d "$stems_export_dir/htdemucs/$audio_base" ]; then
+    printf '%s\n' "$stems_export_dir/htdemucs/$audio_base"
     return 0
   fi
   if [ -d "$stems_export_dir/htdemucs/$audio_base" ]; then
     printf '%s\n' "$stems_export_dir/htdemucs/$audio_base"
     return 0
   fi
-  if [ -d "$stems_export_dir/htdemucs_6s" ]; then
+  if [ -d "$stems_export_dir/htdemucs" ]; then
     local d
-    d="$(find "$stems_export_dir/htdemucs_6s" -maxdepth 2 -type d -name "$audio_base" 2>/dev/null | head -n1 || true)"
+    d="$(find "$stems_export_dir/htdemucs" -maxdepth 2 -type d -name "$audio_base" 2>/dev/null | head -n1 || true)"
     if [ -n "$d" ]; then
       printf '%s\n' "$d"
       return 0
@@ -412,12 +412,12 @@ else
   DEMUCS_BASE_OUT="$STEMS_EXPORT_DIR"
 
   set +e
-  run_demucs_cmd "6-stem attempt" -n htdemucs_6s -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH"
+  run_demucs_cmd "6-stem attempt" -n htdemucs -o "$DEMUCS_BASE_OUT" "$AUDIO_MONO_PATH"
   DM_RC=$?
   set -e
 
   if [ $DM_RC -eq 0 ]; then
-    BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs_6s/$AUDIO_BASE_NOEXT"
+    BEST_STEMS_DIR="$DEMUCS_BASE_OUT/htdemucs/$AUDIO_BASE_NOEXT"
     ok "[OK] Demucs 6-stem succeeded → $BEST_STEMS_DIR"
   else
     warn "[WARN] 6-stem failed (rc=$DM_RC), trying 4-stem (htdemucs)…"

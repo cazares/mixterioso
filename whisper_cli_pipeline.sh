@@ -60,8 +60,8 @@ jq -r '.segments[]?.words[]? | "\(.word)\t\(.start)\t\(.end)"' "whisper_out/${BA
 
 # --- 4) Optional: separate vocals and transcribe vocals only ---
 if [[ "$ENABLE_DEMUCS" == "1" ]]; then
-  demucs -n htdemucs_6s "$MP3"
-  whisper "separated/htdemucs_6s/${BASE}/vocals.wav" \
+  demucs -n htdemucs "$MP3"
+  whisper "separated/htdemucs/${BASE}/vocals.wav" \
     --model large-v3 \
     --language es \
     --task transcribe \
