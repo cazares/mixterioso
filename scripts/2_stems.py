@@ -37,66 +37,78 @@ def slugify(text: str) -> str:
     return base or "song"
 
 
-TRACKS = ["vocals", "bass", "guitar", "piano", "other"]
+# Strict 4-stem world: only real Demucs stems
+TRACKS = ["vocals", "bass", "drums", "other"]
 TRACK_LABELS = {
     "vocals": "Vocals",
     "bass": "Bass",
-    "guitar": "Guitar",
-    "piano": "Piano/Keys",
+    "drums": "Drums",
     "other": "Other",
 }
 
 
 def profile_defaults(profile: str) -> dict:
-    # volumes are linear multipliers (0.0–2.0)
+    """
+    Profile → linear volume multipliers for the 4 real stems.
+    All values are in [0.0, 2.0].
+    """
     if profile == "karaoke":
+        # Pure karaoke: kill vocals, keep band flat
         return {
             "vocals": 0.0,
             "bass": 1.0,
-            "guitar": 1.0,
-            "piano": 1.0,
+            "drums": 1.0,
             "other": 1.0,
         }
+
     if profile == "car-karaoke":
+        # Car karaoke: low-but-audible vocals over full band
         return {
             "vocals": 0.35,
             "bass": 1.0,
-            "guitar": 1.0,
-            "piano": 1.0,
+            "drums": 1.0,
             "other": 1.0,
         }
+
     if profile == "no-bass":
+        # No bass: everything except the bass stem
         return {
             "vocals": 1.0,
             "bass": 0.0,
-            "guitar": 1.0,
-            "piano": 1.0,
+            "drums": 1.0,
             "other": 1.0,
         }
+
     if profile == "car-bass-karaoke":
+        # Car bass karaoke: low vocals, no bass stem (sub-friendly mix)
         return {
             "vocals": 0.35,
             "bass": 0.0,
-            "guitar": 1.0,
-            "piano": 1.0,
+            "drums": 1.0,
             "other": 1.0,
         }
-    # lyrics or unknown: flat
+
+    # lyrics or unknown → flat 4-stem mix
     return {
         "vocals": 1.0,
         "bass": 1.0,
-        "guitar": 1.0,
-        "piano": 1.0,
+        "drums": 1.0,
         "other": 1.0,
     }
 
+
 def mix_ui(slug: str, profile: str, model: str) -> dict:
+    """
+    curses-based UI for adjusting the 4 real Demucs stems.
+    Returns a dict: { "vocals": float, "bass": float, "drums": float, "other": float }
+    """
     import curses
 
     defaults = profile_defaults(profile)
     existing_vols, cfg_path = load_existing_config(slug, profile)
     volumes = defaults.copy()
 
+    # Seed from existing config if user wants to reuse it
     if existing_vols:
         print()
         print(f"{YELLOW}Found existing mix config at {cfg_path}{RESET}")
@@ -133,7 +145,10 @@ def mix_ui(slug: str, profile: str, model: str) -> dict:
             stdscr.attroff(curses.A_BOLD)
             stdscr.attroff(curses.color_pair(1))
 
-            controls = "[UP/DOWN] select  [LEFT/RIGHT] -/+5%  [0] mute  [1] 100%  [r] reset profile  [ENTER/s] save  [q/ESC] abort"
+            controls = (
+                "[UP/DOWN] select  [LEFT/RIGHT] -/+5%  [0] mute  [1] 100%  "
+                "[r] reset profile  [ENTER/s] save  [q/ESC] abort"
+            )
             stdscr.attron(curses.color_pair(2))
             stdscr.addstr(1, 0, controls[: w - 1])
             stdscr.attroff(curses.color_pair(2))
@@ -175,14 +190,17 @@ def mix_ui(slug: str, profile: str, model: str) -> dict:
             if ch == -1:
                 continue
 
+            # Abort
             if ch in (27, ord("q"), ord("Q")):
                 state["confirmed"] = False
                 return
 
+            # Save / confirm
             if ch in (10, 13, ord("s"), ord("S")):
                 state["confirmed"] = True
                 return
 
+            # Navigation
             if ch == curses.KEY_UP:
                 selected = (selected - 1) % len(TRACKS)
                 last_msg = ""
@@ -194,6 +212,7 @@ def mix_ui(slug: str, profile: str, model: str) -> dict:
 
             tname = TRACKS[selected]
 
+            # Adjustments
             if ch == curses.KEY_LEFT:
                 volumes[tname] = max(0.0, min(2.0, volumes.get(tname, 0.0) - 0.05))
                 last_msg = f"{TRACK_LABELS[tname]} → {int(round(volumes[tname] * 100))} %"
@@ -211,12 +230,14 @@ def mix_ui(slug: str, profile: str, model: str) -> dict:
                 last_msg = f"{TRACK_LABELS[tname]} → 100 %"
                 continue
             if ch in (ord("r"), ord("R")):
+                # Reset to profile defaults (strict 4-stem)
                 for trk, val in profile_defaults(profile).items():
                     volumes[trk] = val
                 last_msg = "Reset to profile defaults"
                 continue
 
     import curses
+
     curses.wrapper(ui)
 
     if not state["confirmed"]:
@@ -226,57 +247,38 @@ def mix_ui(slug: str, profile: str, model: str) -> dict:
 
 def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path) -> None:
     """
-    4-stem aware mixer with fallback mappings:
-      - drums.wav is supported
-      - guitar → other.wav fallback
-      - piano → other.wav fallback
-    This guarantees correct volume application for modern Demucs output.
+    Strict 4-stem mixer for Demucs-style output:
+
+        separated/{model}/{slug}/vocals.wav
+        separated/{model}/{slug}/bass.wav
+        separated/{model}/{slug}/drums.wav
+        separated/{model}/{slug}/other.wav
+
+    No virtual guitar/piano stems, no duplication of other.wav.
     """
     separated_dir = BASE_DIR / "separated" / model / slug
 
-    # Helper: resolve one stem with fallback
     def resolve_stem(track: str) -> Path:
-        direct = separated_dir / f"{track}.wav"
-
-        # If exact file exists, use it
-        if direct.exists():
-            return direct
-
-        # guitar → other fallback
-        if track == "guitar":
-            fb = separated_dir / "other.wav"
-            if fb.exists():
-                return fb
-
-        # piano → other fallback
-        if track == "piano":
-            fb = separated_dir / "other.wav"
-            if fb.exists():
-                return fb
-
-        raise SystemExit(
-            f"Stem not found: expected {track}.wav or fallback in {separated_dir}"
-        )
+        """
+        Resolve one of the 4 canonical stems, or fail loudly if missing.
+        """
+        p = separated_dir / f"{track}.wav"
+        if not p.exists():
+            raise SystemExit(f"Stem not found: expected {p}")
+        return p
 
     # ---------------------------------------------
-    # Determine final ordered track list dynamically
+    # Determine ordered track list for this mix
     # ---------------------------------------------
-
-    # The four real Demucs stems (preferred)
-    base_tracks = ["vocals", "bass", "drums", "other"]
-
+    # Only stems that appear in the volumes dict are used,
+    # but we never exceed the canonical 4-stem set.
     ordered_tracks = []
-
-    # Always include real stems *if* the config contains them
-    for t in base_tracks:
+    for t in TRACKS:
         if t in volumes:
             ordered_tracks.append(t)
 
-    # Also include guitar/piano if user has them in config
-    # They will correctly resolve to other.wav
-    for opt in ("guitar", "piano"):
-        if opt in volumes and opt not in ordered_tracks:
-            ordered_tracks.append(opt)
+    if not ordered_tracks:
+        raise SystemExit("No valid stems found in volumes config; nothing to mix.")
 
     # Resolve paths now
     stems = {}
@@ -302,11 +304,11 @@ def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path)
         in_label = f"{idx}:a"
         out_label = f"a{idx}"
 
-        # Volume filter
+        # Volume filter per stem
         filter_parts.append(f"[{in_label}]volume={vol:.3f}[{out_label}]")
         labels.append(f"[{out_label}]")
 
-    # Build amix
+    # amix all active stems
     amix = "".join(labels) + f"amix=inputs={len(ordered_tracks)}:normalize=0[mix]"
     filter_complex = ";".join(filter_parts + [amix])
 
@@ -318,9 +320,12 @@ def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path)
         cmd += ["-i", str(p)]
 
     cmd += [
-        "-filter_complex", filter_complex,
-        "-map", "[mix]",
-        "-c:a", "pcm_s16le",
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[mix]",
+        "-c:a",
+        "pcm_s16le",
         str(output),
     ]
 
@@ -328,28 +333,43 @@ def render_mix(slug: str, profile: str, model: str, volumes: dict, output: Path)
     subprocess.run(cmd, check=True)
     log("MIX", f"Wrote mixed WAV to {output}", GREEN)
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Stem mix UI and renderer.")
 
-    p.add_argument("--mp3", type=str, required=True, help="Original mp3 path (to derive slug).")
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Stem mix UI and renderer (strict 4-stem).")
+
+    p.add_argument(
+        "--mp3",
+        type=str,
+        required=True,
+        help="Original mp3 path (to derive slug).",
+    )
     p.add_argument(
         "--profile",
         type=str,
         default="karaoke",
         choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
     )
-
-    # Strict 4-stem model default
     p.add_argument(
         "--model",
         type=str,
         default="htdemucs",
-        help="Demucs model name (4-stem only).",
+        help="Demucs model name (4-stem).",
     )
-
-    p.add_argument("--mix-ui-only", action="store_true", help="Only run mix UI and save config.")
-    p.add_argument("--render-only", action="store_true", help="Only render mix WAV from config.")
-    p.add_argument("--output", type=str, help="Output WAV path (optional).")
+    p.add_argument(
+        "--mix-ui-only",
+        action="store_true",
+        help="Only run mix UI and save config.",
+    )
+    p.add_argument(
+        "--render-only",
+        action="store_true",
+        help="Only render mix WAV from existing config.",
+    )
+    p.add_argument(
+        "--output",
+        type=str,
+        help="Output WAV path (optional). Defaults to mixes/<slug>_<profile>.wav",
+    )
 
     return p.parse_args(argv)
 
@@ -368,10 +388,16 @@ def main(argv=None):
     if args.mix_ui_only and args.render_only:
         raise SystemExit("Cannot use --mix-ui-only and --render-only together.")
 
-    out_wav = Path(args.output).resolve() if args.output else (MIXES_DIR / f"{slug}_{args.profile}.wav")
+    out_wav = (
+        Path(args.output).resolve()
+        if args.output
+        else (MIXES_DIR / f"{slug}_{args.profile}.wav")
+    )
 
+    # UI-only mode: just capture and save volumes
     if args.mix_ui_only:
         vols = mix_ui(slug, args.profile, args.model)
+        log("MIXCFG", f"Saving mix config for slug={slug}, profile={args.profile}", GREEN)
         save_config(slug, args.profile, args.model, vols)
         return
 
@@ -382,8 +408,26 @@ def main(argv=None):
             f"No mix config found for slug={slug}, profile={args.profile}. "
             f"Run with --mix-ui-only first."
         )
+
+    # Restrict to strict 4-stem keys; ignore any legacy keys
+    volumes = {}
+    for k in TRACKS:
+        if k in cfg_vols:
+            try:
+                volumes[k] = float(cfg_vols[k])
+            except Exception:
+                pass
+
+    if not volumes:
+        raise SystemExit(
+            f"Existing config at {cfg_path} has no usable 4-stem keys; "
+            f"delete it or re-run with --mix-ui-only."
+        )
+
     log("MIXCFG", f"Using config from {cfg_path}", GREEN)
-    render_mix(slug, args.profile, args.model, cfg_vols, out_wav)
+    log("MIXCFG", f"Volumes: " + ", ".join(f"{k}={volumes[k]:.2f}" for k in TRACKS), CYAN)
+
+    render_mix(slug, args.profile, args.model, volumes, out_wav)
 
 
 if __name__ == "__main__":
