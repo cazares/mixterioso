@@ -1,32 +1,21 @@
 #!/usr/bin/env python3
 """
-Minimal shared helpers for the Mixterioso pipeline.
+Shared lightweight helpers for Mixterioso.
 
-This module centralizes ONLY lightweight, duplicated utilities:
-- ANSI colors
-- logging
-- fatal + overwrite confirmations
-- slugify
-- directory paths
-- mp3 discovery + chooser
-- demucs helpers
-- stem inspection
-- JSON helpers
-- timers
-- empty-dir cleanup
-
-NO heavy logic, NO curses UI, NO ffmpeg composition.
+Rules:
+- ONLY tiny reusable helpers
+- NO heavy logic (no UI, no demucs logic, no ffmpeg logic)
+- MUST be safe to import from ALL pipeline scripts
+- MUST simplify scripts, never complicate them
 """
 
-import os
 import json
 import subprocess
 import time
 from pathlib import Path
 
-
 # ─────────────────────────────────────────────
-# ANSI COLORS
+# COLORS
 # ─────────────────────────────────────────────
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
@@ -36,18 +25,18 @@ YELLOW = "\033[33m"
 RED    = "\033[31m"
 BLUE   = "\033[34m"
 
-
 # ─────────────────────────────────────────────
-# LOGGING + FATAL
+# LOGGING
 # ─────────────────────────────────────────────
 def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
 
-
-def fatal(msg: str, section: str = "ERROR") -> None:
+# ─────────────────────────────────────────────
+# FATAL
+# ─────────────────────────────────────────────
+def fatal(msg: str, section="ERROR"):
     log(section, msg, RED)
     raise SystemExit(msg)
-
 
 # ─────────────────────────────────────────────
 # SLUGIFY
@@ -59,7 +48,6 @@ def slugify(text: str) -> str:
     base = re.sub(r"[^\w\-]+", "", base)
     return base or "song"
 
-
 # ─────────────────────────────────────────────
 # ASK YES/NO
 # ─────────────────────────────────────────────
@@ -69,32 +57,16 @@ def ask_yes_no(prompt: str, default_yes: bool = True) -> bool:
         ans = input(f"{prompt} {suffix}: ").strip().lower()
     except EOFError:
         ans = ""
-
     if ans == "" and default_yes:
         return True
     if ans == "" and not default_yes:
         return False
     return ans in ("y", "yes")
 
-
 # ─────────────────────────────────────────────
-# CONFIRM OVERWRITE
+# PATHS (authoritative)
 # ─────────────────────────────────────────────
-def confirm_overwrite(path: Path, label="file"):
-    if not path.exists():
-        return
-    print()
-    print(f"{YELLOW}WARNING: About to overwrite {label}:{RESET}")
-    print(f"   • {path}")
-    print()
-    if not ask_yes_no("Overwrite?", default_yes=False):
-        fatal("Cancelled to avoid overwriting.", section="ABORT")
-
-
-# ─────────────────────────────────────────────
-# BASE PATHS
-# ─────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent
 
 PATHS = {
     "base":      BASE_DIR,
@@ -108,25 +80,47 @@ PATHS = {
     "meta":      BASE_DIR / "meta",
 }
 
+# ─────────────────────────────────────────────
+# AUTO-CREATE PIPELINE DIRS
+# ─────────────────────────────────────────────
+def ensure_pipeline_dirs() -> None:
+    for key, path in PATHS.items():
+        if key in ("scripts", "base"):
+            continue
+        path.mkdir(parents=True, exist_ok=True)
 
 # ─────────────────────────────────────────────
-# DEMUCS MODEL CONSTANT
+# FILE OVERWRITE CONFIRMATION
 # ─────────────────────────────────────────────
-DEFAULT_DEMUCS_MODEL = "htdemucs"
-
+def confirm_overwrite(path: Path, label="file") -> None:
+    if not path.exists():
+        return
+    print(f"{YELLOW}WARNING: Overwriting existing {label}:{RESET}")
+    print(f"   • {path}")
+    if not ask_yes_no("Proceed?", default_yes=False):
+        fatal("Cancelled to avoid overwriting.")
 
 # ─────────────────────────────────────────────
-# MP3 DISCOVERY / CHOOSER
+# FIND MP3 CANDIDATES
 # ─────────────────────────────────────────────
 def find_mp3_candidates() -> list[Path]:
     mp3_dir = PATHS["mp3"]
-    mp3_dir.mkdir(exist_ok=True)
-    return sorted(p for p in mp3_dir.glob("*.mp3") if p.is_file())
+    return sorted(mp3_dir.glob("*.mp3"))
 
+# ─────────────────────────────────────────────
+# CHOOSE MP3 (for stems)
+# ─────────────────────────────────────────────
+def choose_mp3() -> Path:
+    mp3s = find_mp3_candidates()
+    if not mp3s:
+        fatal("No mp3 files found in mp3s/. Run Step 1 first.", "MP3")
 
-def choose_mp3_interactive(candidates: list[Path]) -> Path:
+    if len(mp3s) == 1:
+        log("MP3", f"Using {mp3s[0].name}", GREEN)
+        return mp3s[0]
+
     print(f"{CYAN}Multiple mp3s found:{RESET}")
-    for i, p in enumerate(candidates, start=1):
+    for i, p in enumerate(mp3s, start=1):
         print(f"  {i}) {p.name}")
     print()
 
@@ -134,70 +128,48 @@ def choose_mp3_interactive(candidates: list[Path]) -> Path:
         try:
             raw = input("Choose mp3 number: ").strip()
         except EOFError:
-            fatal("No choice made (EOF).", "MP3")
+            fatal("EOF received, no selection.")
 
-        if not raw.isdigit():
-            print("Enter a number.")
-            continue
-
-        idx = int(raw)
-        if 1 <= idx <= len(candidates):
-            mp3 = candidates[idx - 1]
-            log("MP3", f"Selected {mp3.name}", GREEN)
-            return mp3
-
+        if raw.isdigit():
+            i = int(raw)
+            if 1 <= i <= len(mp3s):
+                log("MP3", f"Selected {mp3s[i-1].name}", GREEN)
+                return mp3s[i - 1]
         print("Invalid number.")
 
-
-def choose_mp3() -> Path:
-    candidates = find_mp3_candidates()
-    if not candidates:
-        fatal("No mp3s found. Run step 1 first.", "MP3")
-    if len(candidates) == 1:
-        mp3 = candidates[0]
-        log("MP3", f"Using {mp3.name}", GREEN)
-        return mp3
-    return choose_mp3_interactive(candidates)
-
-
 # ─────────────────────────────────────────────
-# STEMS DIR + INSPECTION
+# STEMS DIR UTIL
 # ─────────────────────────────────────────────
-def stems_dir(slug: str, model: str = DEFAULT_DEMUCS_MODEL) -> Path:
+def stems_dir(slug: str, model: str) -> Path:
     return PATHS["separated"] / model / slug
 
+# ─────────────────────────────────────────────
+# INSPECT EXISTING STEMS
+# ─────────────────────────────────────────────
+def inspect_stems(stem_path: Path, tracks=("vocals","bass","drums","other")):
+    if not stem_path.exists():
+        return "none", {}
 
-def inspect_stems(stems_dir: Path, tracks: list[str]) -> tuple[str, dict[str, Path]]:
-    mapping = {t: stems_dir / f"{t}.wav" for t in tracks}
-    existing_count = sum(1 for p in mapping.values() if p.exists())
+    found = {}
+    for t in tracks:
+        p = stem_path / f"{t}.wav"
+        if p.exists():
+            found[t] = p
 
-    if existing_count == 0:
-        return "none", mapping
-    if existing_count == len(tracks):
-        return "all", mapping
-    return "partial", mapping
-
+    if not found:
+        return "none", {}
+    if len(found) < len(tracks):
+        return "partial", found
+    return "all", found
 
 # ─────────────────────────────────────────────
 # RUN DEMUCS
 # ─────────────────────────────────────────────
-def run_with_timer(cmd: list[str], label: str, *, color=BLUE) -> float:
-    log(label, " ".join(cmd), color)
-    t0 = time.perf_counter()
-    subprocess.run(cmd, check=True)
-    return time.perf_counter() - t0
+DEFAULT_DEMUCS_MODEL = "htdemucs"
 
-
-def run_demucs(mp3_path: Path, model: str = DEFAULT_DEMUCS_MODEL) -> float:
-    if not mp3_path.exists():
-        fatal(f"MP3 not found: {mp3_path}", "DEMUX")
-
-    log("DEMUX", f"Extracting stems with model={model}", BLUE)
+def run_demucs(mp3_path: Path, model: str = DEFAULT_DEMUCS_MODEL):
     cmd = ["demucs", "-n", model, str(mp3_path)]
-    elapsed = run_with_timer(cmd, "DEMUX", color=BLUE)
-    log("DEMUX", f"Finished extracting stems in {elapsed:.1f}s.", GREEN)
-    return elapsed
-
+    run_with_timer(cmd, "DEMUX", BLUE)
 
 # ─────────────────────────────────────────────
 # CLEAN EMPTY DIRS
@@ -205,16 +177,41 @@ def run_demucs(mp3_path: Path, model: str = DEFAULT_DEMUCS_MODEL) -> float:
 def clean_empty_dirs(root: Path):
     if not root.exists():
         return
-    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
-        p = Path(dirpath)
-        if p == root:
-            continue
-        try:
-            if not any(p.iterdir()):
+    for p in sorted(root.rglob("*"), reverse=True):
+        if p.is_dir() and not any(p.iterdir()):
+            try:
                 p.rmdir()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
+# ─────────────────────────────────────────────
+# FFPROBE DURATION
+# ─────────────────────────────────────────────
+def ffprobe_duration(path: Path) -> float:
+    if not path.exists():
+        return 0.0
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            text=True,
+        ).strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+# ─────────────────────────────────────────────
+# TIMER
+# ─────────────────────────────────────────────
+def run_with_timer(cmd: list[str], label: str, *, color=BLUE) -> float:
+    log(label, " ".join(cmd), color)
+    t0 = time.perf_counter()
+    subprocess.run(cmd, check=True)
+    return time.perf_counter() - t0
 
 # ─────────────────────────────────────────────
 # JSON HELPERS
@@ -225,13 +222,11 @@ def read_json(path: Path) -> dict | None:
     except Exception:
         return None
 
-
 def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-
 # ─────────────────────────────────────────────
-# PIPELINE STATUS (unchanged)
+# PIPELINE STATUS PRINTER
 # ─────────────────────────────────────────────
 def print_pipeline_status(slug: str, s1: bool, s2: bool, s3: bool, s4: bool) -> None:
     print()
@@ -241,3 +236,4 @@ def print_pipeline_status(slug: str, s1: bool, s2: bool, s3: bool, s4: bool) -> 
     print(f"  Step3 timing  : {'OK' if s3 else 'MISSING'}")
     print(f"  Step4 mp4     : {'OK' if s4 else 'MISSING'}")
     print()
+# end of mix_utils.py
