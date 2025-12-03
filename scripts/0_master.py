@@ -809,7 +809,7 @@ def main(argv=None):
         log("MASTER", f"Running steps {steps} for slug={slug} (do={args.do})", CYAN)
     else:
         # =============================================================
-        # NORMAL INTERACTIVE FLOW
+        # NORMAL INTERACTIVE / NON-INTERACTIVE FLOW
         # =============================================================
         if args.skip_ui:
             slug, steps = noninteractive_slug_and_steps(args)
@@ -819,32 +819,116 @@ def main(argv=None):
 
         if not steps:
             return
-        # =============================================================
-    # RUN SELECTED STEPS (standard pipeline execution)
+
+    # Normalize steps into a sorted list
+    steps = sorted(list(steps))
+
+    # =============================================================
+    # RUN SELECTED STEPS WITH AUTO-ADVANCE LOGIC
     # =============================================================
     t2 = t3 = t4 = t5 = 0.0
+    executed: set[int] = set()
 
-    # Step 1
-    if 1 in steps and not args.skip_ui and t1 == 0.0:
-        if not args.query:
-            raise SystemExit("Step 1 requires a query.")
-        slug, t1 = run_step1_txt_mp3(args.query)
+    def execute_step(step: int) -> None:
+        nonlocal t1, t2, t3, t4, t5, slug
 
-    # Step 2
-    if 2 in steps:
-        t2 = run_step2_stems(slug, args.profile, args.model, interactive=not args.skip_ui)
+        if step == 1:
+            # Step 1: txt/mp3 generation
+            # Run only if we haven't already run it in this master invocation.
+            if t1 == 0.0:
+                if not args.query:
+                    raise SystemExit("Step 1 requires a query.")
+                slug, t1 = run_step1_txt_mp3(args.query)
+            else:
+                log("STEP1", "Skipping Step 1 (already run).", YELLOW)
 
-    # Step 3
-    if 3 in steps:
-        t3 = run_step3_timing(slug)
+        elif step == 2:
+            # Step 2: stems + mix
+            t2 = run_step2_stems(slug, args.profile, args.model, interactive=not args.skip_ui)
 
-    # Step 4
-    if 4 in steps:
-        t4 = run_step4_mp4(slug, args.profile)
+        elif step == 3:
+            # Step 3: timing
+            t3 = run_step3_timing(slug)
 
-    # Step 5
-    if 5 in steps:
-        t5 = run_step5_upload(slug, args.profile)
+        elif step == 4:
+            # Step 4: mp4 generation
+            t4 = run_step4_mp4(slug, args.profile)
+
+        elif step == 5:
+            # Step 5: upload
+            t5 = run_step5_upload(slug, args.profile)
+
+    # No steps selected somehow (should already be handled above)
+    if not steps:
+        return
+
+    # Start from the lowest requested step
+    current = min(steps)
+
+    # Auto-advance for steps 1–4 only; step 5 is handled separately.
+    while True:
+        # Run this step if not already executed
+        if current not in executed:
+            execute_step(current)
+            executed.add(current)
+
+        # Auto-advance logic only applies for steps 1–3.
+        # Step 4 (and 5) never trigger N+1 evaluation.
+        if current >= 4:
+            break
+
+        # Refresh asset status so we can see what's "DONE"
+        status = detect_assets(slug, args.profile)
+
+        # Candidate for N+1
+        next_candidate = current + 1
+
+        # Determine if we can auto-advance to next_candidate (only if <= 4)
+        can_auto = False
+        if next_candidate <= 4:
+            # All steps >= next_candidate up to 4 must NOT be done.
+            # Step 5 is explicitly ignored in this check.
+            future_keys = [k for k in range(next_candidate, 5) if k <= 4]
+            if all(not status.get(k, False) for k in future_keys):
+                can_auto = True
+
+        if can_auto:
+            # Auto-advance to next consecutive step
+            current = next_candidate
+            continue
+
+        # Otherwise, find the next explicit step > current (1–4) that hasn't run yet
+        remaining_explicit = [s for s in steps if s > current and s <= 4 and s not in executed]
+        if remaining_explicit:
+            current = remaining_explicit[0]
+            continue
+
+        # No more steps 1–4 to run
+        break
+
+    # After auto-advance loop:
+    # 1) Run explicit step 5 if the user requested it and it hasn't run yet
+    if 5 in steps and 5 not in executed:
+        execute_step(5)
+
+    # 2) Offer step 5 as an additional option at the end of step 4,
+    #    as long as:
+    #       - mp4 exists (step 4 done)
+    #       - upload receipt does not exist (step 5 not done)
+    #       - we are in interactive mode (skip-ui is False)
+    status_after = detect_assets(slug, args.profile)
+    if (
+        status_after.get(4, False)      # mp4 present
+        and not status_after.get(5, False)  # no upload receipt
+        and not args.skip_ui            # interactive mode
+        and 5 not in executed           # haven't already uploaded
+    ):
+        try:
+            ans = input("Step 4 completed. Run upload (step 5) now? [y/N]: ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans in ("y", "yes"):
+            execute_step(5)
 
     # =============================================================
     # SUMMARY
