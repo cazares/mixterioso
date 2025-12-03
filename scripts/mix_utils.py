@@ -1,196 +1,134 @@
 #!/usr/bin/env python3
 """
-Shared mix helpers for 2_stems.py and 0_master.py.
-Ensures consistent loading/saving of mix configs and
-provides a canonical way to detect stems, load defaults,
-and guarantee compatibility with 4-stem Demucs models.
+Minimal shared helpers for the Mixterioso pipeline.
 
-This module intentionally contains *no* ffmpeg logic.
+Goal:
+Centralize lightweight, duplicated utilities:
+- ANSI colors
+- logging helper
+- slugify
+- directory helpers
+- ffprobe duration
+- pretty relative paths
+- run_with_timer wrapper
+- small JSON read/write helpers
+
+NO ffmpeg logic, NO mix logic, NO stem logic here
+(other modules handle the heavy stuff).
 """
 
 import json
+import subprocess
+import time
 from pathlib import Path
 
-RESET = "\033[0m"
-BOLD = "\033[1m"
-CYAN = "\033[36m"
-GREEN = "\033[32m"
+# ─────────────────────────────────────────────
+# ANSI COLORS
+# ─────────────────────────────────────────────
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+CYAN   = "\033[36m"
+GREEN  = "\033[32m"
 YELLOW = "\033[33m"
-RED = "\033[31m"
-BLUE = "\033[34m"
+RED    = "\033[31m"
+BLUE   = "\033[34m"
 
 
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
 def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
 
 
-# ----------------------------------------------------------
-# CONFIG LOADING / SAVING
-# ----------------------------------------------------------
+# ─────────────────────────────────────────────
+# SLUGIFY
+# ─────────────────────────────────────────────
+def slugify(text: str) -> str:
+    import re
+    base = text.strip().lower()
+    base = re.sub(r"\s+", "_", base)
+    base = re.sub(r"[^\w\-]+", "", base)
+    return base or "song"
 
-def load_existing_config(slug: str, profile: str):
+
+# ─────────────────────────────────────────────
+# DIRECTORY HELPERS
+# ─────────────────────────────────────────────
+def ensure_dir(path: Path) -> Path:
     """
-    Returns (volumes_dict, config_path or None)
-
-    Accepts both:
-        mixes/slug_profile.json   ← modern path
-        mixes/slug.json           ← legacy compatibility
-
-    Returns (None, path) if file exists but cannot be parsed.
+    Ensures a directory exists and returns the Path.
     """
-    base = Path(__file__).resolve().parent.parent
-    mixes_dir = base / "mixes"
-    mixes_dir.mkdir(exist_ok=True)
-
-    new_path = mixes_dir / f"{slug}_{profile}.json"
-    old_path = mixes_dir / f"{slug}.json"
-
-    path = None
-    if new_path.exists():
-        path = new_path
-    elif old_path.exists():
-        path = old_path
-
-    if not path:
-        return None, None
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        vols = data.get("volumes", {})
-        if isinstance(vols, dict):
-            return vols, path
-        return None, path
-    except Exception:
-        return None, path
-
-
-def save_config(slug: str, profile: str, model: str, volumes: dict) -> Path:
-    """
-    Writes the canonical config file:
-
-        mixes/slug_profile.json
-
-    Always JSON, always includes slug/profile/model/volumes.
-    """
-    base = Path(__file__).resolve().parent.parent
-    mixes_dir = base / "mixes"
-    mixes_dir.mkdir(exist_ok=True)
-
-    path = mixes_dir / f"{slug}_{profile}.json"
-    payload = {
-        "slug": slug,
-        "profile": profile,
-        "model": model,
-        "volumes": volumes,
-    }
-
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    log("MIXCFG", f"Saved mix config to {path}", GREEN)
+    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-# ----------------------------------------------------------
-# STEM RESOLUTION HELPERS (4-stem only)
-# ----------------------------------------------------------
-
-def stem_path_for(track: str, separated_dir: Path) -> Path | None:
+# ─────────────────────────────────────────────
+# PATH PRETTY PRINT
+# ─────────────────────────────────────────────
+def pretty_relpath(p: Path, base: Path) -> str:
     """
-    Resolves a mixed track name into a concrete WAV path:
-
-      Preferred 4-stem Demucs files:
-          vocals.wav
-          bass.wav
-          drums.wav
-          other.wav
-
-      Fallback behavior:
-          guitar → other.wav
-          piano  → other.wav
-
-    Returns the Path if found, or None if not found.
+    Return a path relative to base/, prefixed with "./" if possible.
+    Used for cleaner logs and meta printing.
     """
-    direct = separated_dir / f"{track}.wav"
-    if direct.exists():
-        return direct
-
-    # fallback rules
-    if track in ("guitar", "piano"):
-        fb = separated_dir / "other.wav"
-        if fb.exists():
-            return fb
-
-    # no match
-    return None
+    try:
+        return f"./{p.relative_to(base)}"
+    except Exception:
+        return str(p)
 
 
-def validate_stems_for_mix(volumes: dict, separated_dir: Path):
+# ─────────────────────────────────────────────
+# FFPROBE DURATION
+# ─────────────────────────────────────────────
+def ffprobe_duration(path: Path) -> float:
     """
-    Ensures that at least ONE valid stem exists for the
-    requested volumes dict. This prevents confusing errors
-    from downstream render code.
-
-    Raises SystemExit if a requested track cannot be resolved.
+    Returns duration in seconds using ffprobe.
+    Returns 0.0 on error.
     """
-    for t in volumes.keys():
-        p = stem_path_for(t, separated_dir)
-        if p is None:
-            raise SystemExit(
-                f"Stem not found for track '{t}'. "
-                f"Expected {t}.wav or fallback in: {separated_dir}"
-            )
+    if not path.exists():
+        return 0.0
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path)
+            ],
+            text=True
+        ).strip()
+        return float(out)
+    except Exception:
+        return 0.0
 
 
-# ----------------------------------------------------------
-# PROFILE DEFAULTS (shared)
-# ----------------------------------------------------------
-
-def profile_defaults(profile: str) -> dict:
+# ─────────────────────────────────────────────
+# RUN WITH TIMER
+# ─────────────────────────────────────────────
+def run_with_timer(cmd: list[str], label: str, *, color=BLUE) -> float:
     """
-    Centralized place to define default linear volumes
-    for every supported profile. This keeps 2_stems.py
-    and any future code consistent.
+    Runs a subprocess, logs it, and returns elapsed seconds.
     """
-    if profile == "karaoke":
-        return {
-            "vocals": 0.0,
-            "bass": 1.0,
-            "guitar": 1.0,
-            "piano": 1.0,
-            "other": 1.0,
-        }
+    log(label, " ".join(cmd), color)
+    t0 = time.perf_counter()
+    subprocess.run(cmd, check=True)
+    return time.perf_counter() - t0
 
-    if profile == "car-karaoke":
-        return {
-            "vocals": 0.35,
-            "bass": 1.0,
-            "guitar": 1.0,
-            "piano": 1.0,
-            "other": 1.0,
-        }
 
-    if profile == "no-bass":
-        return {
-            "vocals": 1.0,
-            "bass": 0.0,
-            "guitar": 1.0,
-            "piano": 1.0,
-            "other": 1.0,
-        }
+# ─────────────────────────────────────────────
+# JSON HELPERS
+# ─────────────────────────────────────────────
+def read_json(path: Path) -> dict | None:
+    """
+    Safe JSON load: returns dict or None.
+    """
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
-    if profile == "car-bass-karaoke":
-        return {
-            "vocals": 0.35,
-            "bass": 0.0,
-            "guitar": 1.0,
-            "piano": 1.0,
-            "other": 1.0,
-        }
-
-    # Lyrics mode: keep everything 1.0
-    return {
-        "vocals": 1.0,
-        "bass": 1.0,
-        "guitar": 1.0,
-        "piano": 1.0,
-        "other": 1.0,
-    }
+def write_json(path: Path, data: dict) -> None:
+    """
+    Safe JSON write with indentation.
+    """
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
