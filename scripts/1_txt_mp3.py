@@ -9,50 +9,20 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-# ─────────────────────────────────────────────
-# COLORS + LOGGING
-# ─────────────────────────────────────────────
-RESET  = "\033[0m"
-CYAN   = "\033[36m"
-GREEN  = "\033[32m"
-YELLOW = "\033[33m"
-RED    = "\033[31m"
-BLUE   = "\033[34m"
+from scripts.mix_utils import (
+    log, fatal, slugify, PATHS, ask_yes_no,
+    CYAN, GREEN, YELLOW, RED
+)
+
+# Paths
+BASE_DIR = PATHS["base"]
+TXT_DIR  = PATHS["txt"]
+MP3_DIR  = PATHS["mp3"]
+META_DIR = PATHS["meta"]
 
 
-def log(section: str, msg: str, color: str = CYAN) -> None:
-    print(f"{color}[{section}]{RESET} {msg}")
-
-
-# ─────────────────────────────────────────────
-# PATHS
-# ─────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent.parent
-TXT_DIR  = BASE_DIR / "txts"
-MP3_DIR  = BASE_DIR / "mp3s"
-META_DIR = BASE_DIR / "meta"
-
-
-# ─────────────────────────────────────────────
-# SLUGIFY
-# ─────────────────────────────────────────────
-def slugify(text: str) -> str:
-    import re
-
-    base = text.strip().lower()
-    base = re.sub(r"\s+", "_", base)
-    base = re.sub(r"[^\w\-]+", "", base)
-    return base or "song"
-
-
-# ─────────────────────────────────────────────
-# ENV (MUSIXMATCH ONLY)
-# ─────────────────────────────────────────────
+# ENV
 def load_mm_env() -> str:
-    """
-    Load Musixmatch API key from .env or environment.
-    Required: MUSIXMATCH_API_KEY or MM_API.
-    """
     env_path = BASE_DIR / ".env"
     if env_path.exists():
         log("ENV", f"Loading .env from {env_path}", CYAN)
@@ -60,21 +30,14 @@ def load_mm_env() -> str:
     else:
         log("ENV", ".env not found, relying on process environment", YELLOW)
 
-    mm_api_key = os.getenv("MUSIXMATCH_API_KEY") or os.getenv("MM_API")
-    if not mm_api_key:
-        log("ENV", "MUSIXMATCH_API_KEY (or MM_API) is not set.", RED)
-        raise SystemExit("Missing Musixmatch API key in environment.")
-    return mm_api_key
+    key = os.getenv("MUSIXMATCH_API_KEY") or os.getenv("MM_API")
+    if not key:
+        fatal("Missing Musixmatch API key (MUSIXMATCH_API_KEY or MM_API).", "ENV")
+    return key
 
 
-# ─────────────────────────────────────────────
-# MUSIXMATCH (METADATA + LYRICS)
-# ─────────────────────────────────────────────
+# MUSIXMATCH
 def musixmatch_search_track(artist: str, title: str, api_key: str) -> dict:
-    """
-    Find a single best track for (artist, title) using Musixmatch.
-    Fails with SystemExit if nothing reasonable is found.
-    """
     params = {
         "apikey": api_key,
         "f_has_lyrics": 1,
@@ -92,37 +55,26 @@ def musixmatch_search_track(artist: str, title: str, api_key: str) -> dict:
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        log("MM", f"track.search failed: {e}", RED)
-        raise SystemExit("Musixmatch track.search failed.")
+        fatal(f"Musixmatch track.search failed: {e}", "MM")
 
     body = data.get("message", {}).get("body", {})
-    track_list = body.get("track_list", [])
-    if not track_list:
-        log("MM", "No tracks found for given artist/title.", YELLOW)
-        raise SystemExit("No matching track found on Musixmatch.")
+    tracks = body.get("track_list", [])
+    if not tracks:
+        fatal("No tracks found.", "MM")
 
-    track = track_list[0].get("track", {})
-    if not track.get("track_id"):
-        log("MM", "First result has no track_id.", YELLOW)
-        raise SystemExit("Musixmatch result missing track_id.")
+    track = tracks[0].get("track", {})
+    tid = track.get("track_id")
+    if not tid:
+        fatal("First result missing track_id.", "MM")
 
     mm_artist = track.get("artist_name") or artist
     mm_title  = track.get("track_name") or title
-    tid       = track.get("track_id")
 
     log("MM", f'Chosen track: "{mm_artist} - {mm_title}" (track_id={tid})', GREEN)
-    return {
-        "track_id": tid,
-        "artist": mm_artist,
-        "title": mm_title,
-    }
+    return {"track_id": tid, "artist": mm_artist, "title": mm_title}
 
 
 def musixmatch_fetch_lyrics(track_id: int, api_key: str) -> str:
-    """
-    Given a Musixmatch track_id, fetch the lyrics.
-    Fails with SystemExit if lyrics are missing.
-    """
     url = "https://api.musixmatch.com/ws/1.1/track.lyrics.get"
     params = {"track_id": track_id, "apikey": api_key}
 
@@ -133,170 +85,123 @@ def musixmatch_fetch_lyrics(track_id: int, api_key: str) -> str:
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        log("MM", f"track.lyrics.get failed: {e}", RED)
-        raise SystemExit("Musixmatch track.lyrics.get failed.")
+        fatal(f"Musixmatch lyrics fetch failed: {e}", "MM")
 
     body = data.get("message", {}).get("body", {})
     lyrics_obj = body.get("lyrics", {})
-    lyrics_text = lyrics_obj.get("lyrics_body")
+    text = lyrics_obj.get("lyrics_body")
 
-    if not lyrics_text or not lyrics_text.strip():
-        log("MM", "Lyrics body missing or empty.", YELLOW)
-        raise SystemExit("Lyrics not found for this track on Musixmatch.")
+    if not text or not text.strip():
+        fatal("Lyrics missing for this track.", "MM")
 
     footer = "******* This Lyrics is NOT for Commercial use *******"
-    if footer in lyrics_text:
-        lyrics_text = lyrics_text.split(footer, 1)[0].strip()
+    if footer in text:
+        text = text.split(footer, 1)[0].strip()
 
-    log("MM", "Lyrics fetched from Musixmatch.", GREEN)
-    return lyrics_text
+    log("MM", "Lyrics fetched.", GREEN)
+    return text
 
 
-# ─────────────────────────────────────────────
-# YT-DLP AUDIO DOWNLOAD
-# ─────────────────────────────────────────────
-def youtube_download_mp3(search_str: str, slug: str) -> None:
-    """
-    Download first YouTube audio match for search_str into mp3s/<slug>.mp3.
-    No metadata tricks, just fetch the audio.
-    """
+# YT-DLP
+def youtube_download_mp3(search_str: str, slug: str):
     MP3_DIR.mkdir(parents=True, exist_ok=True)
-    out_template = str(MP3_DIR / f"{slug}.%(ext)s")
+    out = str(MP3_DIR / f"{slug}.%(ext)s")
 
-    log("YT", f'Downloading audio for "{search_str}" as slug "{slug}"', CYAN)
+    log("YT", f'Downloading audio: "{search_str}"', CYAN)
     cmd = [
-        "yt-dlp",
-        "-x",
-        "--audio-format",
-        "mp3",
-        "-o",
-        out_template,
+        "yt-dlp", "-x", "--audio-format", "mp3",
+        "-o", out,
         f"ytsearch1:{search_str}",
     ]
+
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
-        log("YT", f"yt-dlp failed (exit {e.returncode}).", RED)
-        raise SystemExit("yt-dlp audio download failed.")
+        fatal(f"yt-dlp failed (exit {e.returncode}).", "YT")
 
 
-# ─────────────────────────────────────────────
-# INTERACTIVE ARTIST/TITLE PROMPTS
-# ─────────────────────────────────────────────
+# INTERACTIVE ARTIST/TITLE
 def prompt_artist_title(query: str) -> tuple[str, str]:
-    """
-    Ask user explicitly for artist and title.
-
-    Small convenience:
-    - If user leaves both blank and query looks like 'Artist - Title',
-      we split on ' - ' once.
-
-    Otherwise we require non-empty answers.
-    """
     print()
-    print("We need artist and title for Musixmatch.")
-    print(f'Base query: "{query}"')
-    print("If you just press ENTER for both, and the query looks like 'Artist - Title',")
-    print("we'll try to split on the first ' - '.")
-    print()
+    print("We need artist and title. Query:", query)
+    print("If both empty and query looks like 'Artist - Title', will split.")
 
     try:
-        artist_in = input("Artist (ENTER to maybe infer from query): ").strip()
+        a = input("Artist: ").strip()
     except EOFError:
-        artist_in = ""
+        a = ""
 
     try:
-        title_in = input("Title  (ENTER to maybe infer from query): ").strip()
+        t = input("Title : ").strip()
     except EOFError:
-        title_in = ""
+        t = ""
 
-    if not artist_in and not title_in and " - " in query:
+    if not a and not t and " - " in query:
         left, right = query.split(" - ", 1)
-        artist_in = left.strip()
-        title_in  = right.strip()
+        a = left.strip()
+        t = right.strip()
 
-    if not artist_in or not title_in:
-        raise SystemExit("Artist and title are required and could not be inferred from query.")
+    if not a or not t:
+        fatal("Artist and title required.", "INPUT")
 
-    return artist_in, title_in
+    return a, t
 
 
-# ─────────────────────────────────────────────
-# ARG PARSING
-# ─────────────────────────────────────────────
+# ARGS
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        description="Generate txt+mp3 using Musixmatch (lyrics) + yt-dlp (audio)."
-    )
-    p.add_argument(
-        "query",
-        nargs="+",
-        help="Search query (used for logging / optional inference), e.g. 'Artist - Title'",
-    )
+    p = argparse.ArgumentParser(description="Generate txt+mp3 via Musixmatch + yt-dlp.")
+    p.add_argument("query", nargs="+", help="Search query")
     return p.parse_args(argv)
 
 
-# ─────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
     query = " ".join(args.query).strip()
 
     log("MODE", f'txt+mp3 generation for "{query}"', CYAN)
 
-    mm_api_key = load_mm_env()
-
     TXT_DIR.mkdir(parents=True, exist_ok=True)
     MP3_DIR.mkdir(parents=True, exist_ok=True)
     META_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Prompt user for artist/title (with tiny inference)
+    api_key = load_mm_env()
+
     artist, title = prompt_artist_title(query)
+    track = musixmatch_search_track(artist, title, api_key)
 
-    # 1) Musixmatch: track metadata (artist/title/track_id)
-    track_info = musixmatch_search_track(artist, title, mm_api_key)
-    mm_artist = track_info["artist"]
-    mm_title  = track_info["title"]
-    track_id  = track_info["track_id"]
+    lyrics = musixmatch_fetch_lyrics(track["track_id"], api_key)
 
-    # 2) Musixmatch: lyrics
-    lyrics_text = musixmatch_fetch_lyrics(track_id, mm_api_key)
+    slug = slugify(track["title"])
+    log("SLUG", f'Slug: "{slug}"', GREEN)
 
-    # 3) Slug from Musixmatch's title
-    slug = slugify(mm_title)
-    log("SLUG", f'Title slug: "{slug}"', GREEN)
-
-    txt_path  = TXT_DIR / f"{slug}.txt"
+    txt_path  = TXT_DIR  / f"{slug}.txt"
     meta_path = META_DIR / f"{slug}.json"
-    mp3_path  = MP3_DIR / f"{slug}.mp3"
+    mp3_path  = MP3_DIR  / f"{slug}.mp3"
 
-    # 4) Download audio via YouTube using simple "artist title" search
-    search_str = f"{mm_artist} {mm_title}".strip()
+    search_str = f"{track['artist']} {track['title']}".strip()
     youtube_download_mp3(search_str, slug)
 
-    # 5) Write lyrics txt (always)
-    txt_path.write_text(lyrics_text, encoding="utf-8")
-    log("TXT", f"Wrote lyrics txt to {txt_path}", GREEN)
+    txt_path.write_text(lyrics, encoding="utf-8")
+    log("TXT", f"Wrote {txt_path}", GREEN)
 
-    # 6) Write meta
     meta = {
         "slug": slug,
         "query": query,
-        "artist": mm_artist,
-        "title": mm_title,
-        "musixmatch_track_id": track_id,
+        "artist": track["artist"],
+        "title": track["title"],
+        "track_id": track["track_id"],
         "lyrics_source": "musixmatch",
         "audio_source": "yt-dlp",
         "youtube_search_query": search_str,
     }
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    log("META", f"Wrote meta JSON to {meta_path}", GREEN)
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    log("META", f"Wrote {meta_path}", GREEN)
 
     if mp3_path.exists():
-        log("MP3", f"Audio mp3 is at {mp3_path}", GREEN)
+        log("MP3", f"Audio at {mp3_path}", GREEN)
     else:
-        log("MP3", f"Expected mp3 at {mp3_path} but file not found.", YELLOW)
+        log("MP3", f"Expected mp3 at {mp3_path} but not found.", RED)
 
 
 if __name__ == "__main__":

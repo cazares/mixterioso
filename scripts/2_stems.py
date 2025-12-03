@@ -1,41 +1,24 @@
 #!/usr/bin/env python3
 import sys
-import os
-import json
-import subprocess
 from pathlib import Path
 
-# Colors
-RESET  = "\033[0m"
-CYAN   = "\033[36m"
-GREEN  = "\033[32m"
-YELLOW = "\033[33m"
-RED    = "\033[31m"
-BLUE   = "\033[34m"
+from scripts.mix_utils import (
+    log, fatal, ask_yes_no,
+    slugify, confirm_overwrite,
+    PATHS, DEFAULT_DEMUCS_MODEL,
+    choose_mp3, stems_dir, inspect_stems,
+    run_demucs, clean_empty_dirs,
+    CYAN, GREEN, YELLOW, BLUE
+)
 
-def log(sec, msg, color=CYAN):
-    print(f"{color}[{sec}]{RESET} {msg}")
-
-BASE_DIR   = Path(__file__).resolve().parent.parent
-MP3_DIR    = BASE_DIR / "mp3s"
-SEPARATED  = BASE_DIR / "separated"
-MIXES_DIR  = BASE_DIR / "mixes"
-MIXES_DIR.mkdir(exist_ok=True)
-
+# CONSTANTS
 TRACKS = ["vocals", "bass", "drums", "other"]
+MODEL = DEFAULT_DEMUCS_MODEL
 
 
-def slugify(text: str) -> str:
-    import re
-    base = text.strip().lower()
-    base = re.sub(r"\s+", "_", base)
-    base = re.sub(r"[^\w\-]+", "", base)
-    return base or "song"
-
-
-# ============================================
-# Mix UI
-# ============================================
+# ─────────────────────────────────────────────
+# Mix UI (unchanged)
+# ─────────────────────────────────────────────
 def mix_ui(slug: str, model: str) -> dict:
     import curses
 
@@ -46,6 +29,7 @@ def mix_ui(slug: str, model: str) -> dict:
         curses.curs_set(0)
         curses.start_color()
         curses.use_default_colors()
+
         curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
         curses.init_pair(2, curses.COLOR_YELLOW, -1)
         curses.init_pair(3, curses.COLOR_GREEN, -1)
@@ -117,152 +101,61 @@ def mix_ui(slug: str, model: str) -> dict:
                 last_msg = ""
                 continue
 
-            tname = TRACKS[selected]
+            name = TRACKS[selected]
 
             if ch == curses.KEY_LEFT:
-                volumes[tname] = max(0.0, min(2.0, volumes[tname] - 0.05))
-                last_msg = f"{tname} → {int(round(volumes[tname]*100))}%"
+                volumes[name] = max(0.0, min(2.0, volumes[name] - 0.05))
+                last_msg = f"{name} → {int(round(volumes[name] * 100))}%"
                 continue
             if ch == curses.KEY_RIGHT:
-                volumes[tname] = max(0.0, min(2.0, volumes[tname] + 0.05))
-                last_msg = f"{tname} → {int(round(volumes[tname]*100))}%"
+                volumes[name] = max(0.0, min(2.0, volumes[name] + 0.05))
+                last_msg = f"{name} → {int(round(volumes[name] * 100))}%"
                 continue
             if ch == ord("0"):
-                volumes[tname] = 0.0
-                last_msg = f"{tname} muted"
+                volumes[name] = 0.0
+                last_msg = f"{name} muted"
                 continue
             if ch == ord("1"):
-                volumes[tname] = 1.0
-                last_msg = f"{tname} → 100%"
+                volumes[name] = 1.0
+               	last_msg = f"{name} → 100%"
                 continue
 
     import curses
     curses.wrapper(ui)
 
     if not state["confirmed"]:
-        raise SystemExit("Mix UI aborted.")
+        fatal("Mix UI aborted.", "MIX_UI")
 
     return state["volumes"]
 
 
-# ============================================
-# Demucs logic
-# ============================================
-def run_demucs(slug: str, model: str):
-    mp3 = MP3_DIR / f"{slug}.mp3"
-    if not mp3.exists():
-        raise SystemExit(f"MP3 not found: {mp3}")
-
-    log("DEMUX", f"Running Demucs model={model}", BLUE)
-    cmd = ["demucs", "-n", model, str(mp3)]
-    subprocess.run(cmd, check=True)
-    log("DEMUX", "Finished extracting stems.", GREEN)
-
-
-def warn_overwrite_stems(slug: str, model: str):
-    d = SEPARATED / model / slug
-    if not d.exists():
-        return
-    wavs = list(d.glob("*.wav"))
-    if not wavs:
-        return
-
-    print()
-    print(f"{YELLOW}WARNING: Re-running Demucs will overwrite:{RESET}")
-    for w in wavs:
-        print(f"   • {w}")
-    print()
-
-    try:
-        ok = input("Proceed? [y/N]: ").strip().lower()
-    except EOFError:
-        ok = ""
-
-    if ok not in ("y", "yes"):
-        raise SystemExit("Cancelled to avoid overwriting stems.")
-
-
-def choose_stems(slug: str, model: str) -> str:
-    d = SEPARATED / model / slug
-    if not d.exists():
-        log("STEMS", "No stems found → running Demucs.", YELLOW)
-        run_demucs(slug, model)
-        return model
-
-    print()
-    print(f"{CYAN}Stems already exist for slug '{slug}' (model '{model}').{RESET}")
-    print()
-    print("Reuse stems when:")
-    print("  • You only want to change mix/volumes")
-    print("  • You've already extracted stems earlier")
-    print("  • You want to avoid re-running Demucs (slow)")
-    print()
-    print("Do NOT reuse stems when:")
-    print("  • You replaced the mp3 with a new version")
-    print("  • The previous extraction had issues")
-    print("  • You want a clean fresh separation")
-    print()
-
-    try:
-        ans = input("Reuse existing stems? [Y/n]: ").strip().lower()
-    except EOFError:
-        ans = "y"
-
-    if ans in ("", "y", "yes"):
-        log("STEMS", "Reusing existing stems", GREEN)
-        return model
-
-    warn_overwrite_stems(slug, model)
-    run_demucs(slug, model)
-    return model
-
-
-# ============================================
-# Load stems
-# ============================================
-def load_stems(slug: str, model: str) -> dict:
-    d = SEPARATED / model / slug
-    stems = {}
-    for t in TRACKS:
-        p = d / f"{t}.wav"
+# ─────────────────────────────────────────────
+# LOAD STEMS
+# ─────────────────────────────────────────────
+def load_stems(mapping: dict[str, Path]) -> dict[str, Path]:
+    for t, p in mapping.items():
         if not p.exists():
-            raise SystemExit(f"Missing stem: {p}")
-        stems[t] = p
-    return stems
+            fatal(f"Missing stem: {p}", "STEMS")
+    return mapping
 
 
-# ============================================
-# Warn before overwriting final WAV
-# ============================================
-def warn_overwrite_wav(path: Path):
-    if not path.exists():
-        return
-    print()
-    print(f"{YELLOW}WARNING: Overwriting mix file:{RESET}")
-    print(f"   • {path}")
-    print()
-    try:
-        ok = input("Overwrite? [y/N]: ").strip().lower()
-    except EOFError:
-        ok = ""
-    if ok not in ("y", "yes"):
-        raise SystemExit("Cancelled to avoid overwriting output WAV.")
-
-
-# ============================================
-# Render final mix
-# ============================================
+# ─────────────────────────────────────────────
+# MIX (ffmpeg)
+# ─────────────────────────────────────────────
 def render_mix(stems: dict, volumes: dict, out_wav: Path):
-    warn_overwrite_wav(out_wav)
+    from subprocess import run
+
+    confirm_overwrite(out_wav, label="mix WAV")
 
     filter_parts = []
-    labels = []
     inputs = []
+    labels = []
 
     for idx, t in enumerate(TRACKS):
         p = stems[t]
         v = float(volumes.get(t, 1.0))
-        in_label  = f"{idx}:a"
+
+        in_label = f"{idx}:a"
         out_label = f"a{idx}"
 
         inputs.append(p)
@@ -270,54 +163,71 @@ def render_mix(stems: dict, volumes: dict, out_wav: Path):
         labels.append(f"[{out_label}]")
 
     amix = "".join(labels) + f"amix=inputs={len(TRACKS)}:normalize=0[mix]"
-    filter_complex = ";".join(filter_parts + [amix])
+    filter_comp = ";".join(filter_parts + [amix])
 
     cmd = ["ffmpeg", "-y"]
     for p in inputs:
         cmd += ["-i", str(p)]
     cmd += [
-        "-filter_complex", filter_complex,
+        "-filter_complex", filter_comp,
         "-map", "[mix]",
         "-c:a", "pcm_s16le",
         str(out_wav)
     ]
 
-    log("FFMPEG", " ".join(cmd), BLUE)
-    subprocess.run(cmd, check=True)
+    log("FFMPEG", "Rendering final mix...", BLUE)
+    run(cmd, check=True)
     log("MIX", f"Wrote {out_wav}", GREEN)
 
 
-# ============================================
-# MAIN
-# ============================================
-def main(argv=None):
-    import argparse
-    p = argparse.ArgumentParser(description="Super simple Demucs 4-stem mixer")
-    p.add_argument("--mp3", required=True, help="Original mp3 file")
-    p.add_argument("--model", default="htdemucs")
-    args = p.parse_args(argv or sys.argv[1:])
+# ─────────────────────────────────────────────
+# MAIN PIPELINE
+# ─────────────────────────────────────────────
+def main():
+    if len(sys.argv) > 1:
+        fatal("2_stems.py takes no arguments.", "ARGS")
 
-    mp3_path = Path(args.mp3).resolve()
-    if not mp3_path.exists():
-        raise SystemExit(f"MP3 not found: {mp3_path}")
+    mp3 = choose_mp3()
+    slug = slugify(mp3.stem)
 
-    slug = slugify(mp3_path.stem)
+    sdir = stems_dir(slug, MODEL)
+    status, mapping = inspect_stems(sdir, TRACKS)
 
-    # 1) UI FIRST
-    volumes = mix_ui(slug, args.model)
+    if status == "none":
+        log("STEMS", f"No stems for '{slug}', running Demucs.", YELLOW)
+        run_demucs(mp3, MODEL)
+        status, mapping = inspect_stems(sdir, TRACKS)
 
-    # 2) Decide stem source
-    model_used = choose_stems(slug, args.model)
+    elif status == "partial":
+        log("STEMS", f"Partial stems for '{slug}', re-running Demucs.", YELLOW)
+        run_demucs(mp3, MODEL)
+        status, mapping = inspect_stems(sdir, TRACKS)
 
-    # 3) Load stems
-    stems = load_stems(slug, model_used)
+    elif status == "all":
+        print()
+        print(f"{CYAN}Stems already exist for '{slug}'.{RESET}")
+        print("Reuse them to tweak mix volumes.")
+        print()
+        if not ask_yes_no("Reuse existing stems?", default_yes=True):
+            log("STEMS", "Re-running Demucs (existing will be replaced).", YELLOW)
+            run_demucs(mp3, MODEL)
+            status, mapping = inspect_stems(sdir, TRACKS)
 
-    # 4) Mix
-    out_wav = MIXES_DIR / f"{slug}.wav"
+    if status != "all":
+        fatal("Demucs did not produce all 4 stems.", "STEMS")
+
+    stems = load_stems(mapping)
+
+    out_wav = PATHS["mixes"] / f"{slug}.wav"
+
+    volumes = mix_ui(slug, MODEL)
     render_mix(stems, volumes, out_wav)
 
+    clean_empty_dirs(PATHS["separated"])
+
     print()
-    print(f"{GREEN}Done!{RESET} Mixed file written to: {out_wav}")
+    log("DONE", f"Mixed file written to: {out_wav}", GREEN)
+    print()
 
 
 if __name__ == "__main__":
