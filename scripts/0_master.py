@@ -127,6 +127,44 @@ def detect_assets(slug: str, profile: str) -> dict:
 
     return {1: step1, 2: step2, 3: step3, 4: step4, 5: step5}
 
+# ==========================================================
+# AUTO-ADVANCE LOGIC (Option 2)
+# ==========================================================
+def can_auto_advance(current_step: int, status: dict) -> bool:
+    """
+    Auto-advance rules:
+
+    - Applies only to steps 1 → 2, 2 → 3, 3 → 4
+    - Step 5 is ignored in the logic (optional)
+    - Auto-advance to next step N+1 ONLY IF ALL steps > N+1 up to step 4 are MISSING.
+
+    Example:
+        After finishing step 1:
+            can auto-advance if steps 2,3,4 are missing.
+        After finishing step 2:
+            can auto-advance if steps 3,4 are missing.
+        After finishing step 3:
+            can auto-advance if step 4 is missing.
+        After finishing step 4:
+            never auto-advance (step 5 is optional)
+    """
+
+    # Never auto-advance from step 4 → step 5
+    if current_step >= 4:
+        return False
+
+    next_step = current_step + 1
+
+    # If the next step is already done, do NOT auto-advance
+    if status.get(next_step, False):
+        return False
+
+    # All future steps up to step 4 must be missing
+    for future in range(next_step + 1, 5):  # only check steps 3 and 4 max
+        if status.get(future, False):
+            return False
+
+    return True
 
 # ==========================================================
 # STATUS PRINTING
@@ -695,6 +733,7 @@ def interactive_slug_and_steps(args):
         else:
             if last_slug:
                 slug = last_slug
+                args.query = slug
             else:
                 try:
                     slug = input("Enter existing slug: ").strip()
@@ -727,15 +766,17 @@ def interactive_slug_and_steps(args):
 
     # If user picked step 1 but did not specify a query yet → prompt here
     if 1 in steps and not args.query:
-        try:
-            q = input("Step 1 selected. Enter search query: ").strip()
-        except EOFError:
-            q = ""
-        if not q:
-            log("MASTER", "Query missing; dropping step 1.", YELLOW)
-            steps.remove(1)
+        # If slug exists, use slug as implicit query
+        if slug:
+            args.query = slug
         else:
-            args.query = q
+            # fallback prompt if slug is still missing
+            q = input("Step 1 selected. Enter search query: ").strip()
+            if not q:
+                log("MASTER", "Query missing; dropping step 1.", YELLOW)
+                steps.remove(1)
+            else:
+                args.query = q
 
     return slug, steps, t1
 
@@ -747,7 +788,7 @@ def noninteractive_slug_and_steps(args):
     if not args.steps:
         raise SystemExit("--skip-ui requires --steps (e.g. --steps 24).")
 
-    steps = parse_steps_string(args.steps)
+    steps = set(parse_steps_string(args.steps))
     if not steps:
         return "", []
 
@@ -758,6 +799,14 @@ def noninteractive_slug_and_steps(args):
         if not args.query:
             raise SystemExit("Step 1 selected but no --query provided.")
         slug, _ = run_step1_txt_mp3(args.query)
+    
+        # ----------------------------------------------------------
+        # AUTO-ADVANCE: Step 1 → Step 2
+        # ----------------------------------------------------------
+        status = detect_assets(slug, args.profile)
+        if can_auto_advance(1, status):
+            log("AUTO", "Auto-advancing to step 2", CYAN)
+            steps.add(2)
 
     if not slug:
         raise SystemExit("Slug is required for noninteractive steps 2–5.")
@@ -821,7 +870,11 @@ def main(argv=None):
             return
 
     # Normalize steps into a sorted list
-    steps = sorted(list(steps))
+    steps = set(steps)
+
+    # Hard guarantee: implicit query when reusing slug
+    if 1 in steps and not args.query:
+        args.query = slug
 
     # =============================================================
     # RUN SELECTED STEPS WITH AUTO-ADVANCE LOGIC
@@ -842,17 +895,54 @@ def main(argv=None):
             else:
                 log("STEP1", "Skipping Step 1 (already run).", YELLOW)
 
+            # ----------------------------------------------------------
+            # AUTO-ADVANCE: Step 1 → Step 2  (runs in both cases)
+            # ----------------------------------------------------------
+            status = detect_assets(slug, args.profile)
+            if can_auto_advance(1, status):
+                log("AUTO", "Auto-advancing to step 2", CYAN)
+                steps.add(2)
+
         elif step == 2:
             # Step 2: stems + mix
             t2 = run_step2_stems(slug, args.profile, args.model, interactive=not args.skip_ui)
+            # ----------------------------------------------------------
+            # AUTO-ADVANCE: Step 2 → Step 3
+            # ----------------------------------------------------------
+            status = detect_assets(slug, args.profile)
+            if can_auto_advance(2, status):
+                log("AUTO", "Auto-advancing to step 3", CYAN)
+                steps.add(3)
 
         elif step == 3:
             # Step 3: timing
             t3 = run_step3_timing(slug)
+            # ----------------------------------------------------------
+            # AUTO-ADVANCE: Step 3 → Step 4
+            # ----------------------------------------------------------
+            status = detect_assets(slug, args.profile)
+            if can_auto_advance(3, status):
+                log("AUTO", "Auto-advancing to step 4", CYAN)
+                steps.add(4)
+
 
         elif step == 4:
             # Step 4: mp4 generation
             t4 = run_step4_mp4(slug, args.profile)
+            # ----------------------------------------------------------
+            # NO AUTO-ADVANCE from Step 4 → Step 5 (optional)
+            # But we offer step 5 automatically now.
+            # ----------------------------------------------------------
+            status = detect_assets(slug, args.profile)
+            if not status.get(5, False):
+                print()
+                try:
+                    ans = input("Step 4 complete. Run step 5 upload? [Y/n]: ").strip().lower()
+                except EOFError:
+                    ans = "y"
+                if ans in ("", "y", "yes"):
+                    log("AUTO", "Auto-running step 5", CYAN)
+                    steps.add(5)
 
         elif step == 5:
             # Step 5: upload
@@ -900,6 +990,7 @@ def main(argv=None):
         # Otherwise, find the next explicit step > current (1–4) that hasn't run yet
         remaining_explicit = [s for s in steps if s > current and s <= 4 and s not in executed]
         if remaining_explicit:
+            remaining_explicit = sorted(remaining_explicit)
             current = remaining_explicit[0]
             continue
 
