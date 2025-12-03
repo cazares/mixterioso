@@ -5,12 +5,13 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+import os
 
-import sys, os
+# Adjust sys.path so `scripts` imports work when running from anywhere
 PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PARENT)
 
-from scripts.mix_utils import load_existing_config
+# from scripts.mix_utils import load_existing_config  # currently unused
 
 # ==========================================================
 # COLORS
@@ -76,7 +77,7 @@ def run(cmd: list[str], section: str) -> float:
 
 
 # ==========================================================
-# SLUG DETECTION
+# SLUG / META
 # ==========================================================
 def detect_slug_from_latest_mp3() -> str:
     metas = sorted(META_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
@@ -93,9 +94,6 @@ def detect_slug_from_latest_mp3() -> str:
     return slug
 
 
-# ==========================================================
-# META LOADING
-# ==========================================================
 def load_meta(slug: str):
     meta_path = META_DIR / f"{slug}.json"
     if not meta_path.exists():
@@ -108,9 +106,9 @@ def load_meta(slug: str):
 
 
 # ==========================================================
-# ASSET DETECTION
+# ASSET STATUS
 # ==========================================================
-def detect_assets(slug: str, profile: str) -> dict:
+def detect_assets(slug: str, profile: str) -> dict[int, bool]:
     txt         = TXT_DIR / f"{slug}.txt"
     mp3         = MP3_DIR / f"{slug}.mp3"
     meta        = META_DIR / f"{slug}.json"
@@ -127,49 +125,8 @@ def detect_assets(slug: str, profile: str) -> dict:
 
     return {1: step1, 2: step2, 3: step3, 4: step4, 5: step5}
 
-# ==========================================================
-# AUTO-ADVANCE LOGIC (Option 2)
-# ==========================================================
-def can_auto_advance(current_step: int, status: dict) -> bool:
-    """
-    Auto-advance rules:
 
-    - Applies only to steps 1 → 2, 2 → 3, 3 → 4
-    - Step 5 is ignored in the logic (optional)
-    - Auto-advance to next step N+1 ONLY IF ALL steps > N+1 up to step 4 are MISSING.
-
-    Example:
-        After finishing step 1:
-            can auto-advance if steps 2,3,4 are missing.
-        After finishing step 2:
-            can auto-advance if steps 3,4 are missing.
-        After finishing step 3:
-            can auto-advance if step 4 is missing.
-        After finishing step 4:
-            never auto-advance (step 5 is optional)
-    """
-
-    # Never auto-advance from step 4 → step 5
-    if current_step >= 4:
-        return False
-
-    next_step = current_step + 1
-
-    # If the next step is already done, do NOT auto-advance
-    if status.get(next_step, False):
-        return False
-
-    # All future steps up to step 4 must be missing
-    for future in range(next_step + 1, 5):  # only check steps 3 and 4 max
-        if status.get(future, False):
-            return False
-
-    return True
-
-# ==========================================================
-# STATUS PRINTING
-# ==========================================================
-def print_asset_status(slug: str, profile: str, status: dict) -> None:
+def print_asset_status(slug: str, profile: str, status: dict[int, bool]) -> None:
     print()
     print(f"{BOLD}{WHITE}Pipeline status for slug={slug}, profile={profile}{RESET}")
     labels = {
@@ -187,11 +144,6 @@ def print_asset_status(slug: str, profile: str, status: dict) -> None:
     print()
 
 
-def suggest_steps(status: dict) -> str:
-    missing = "".join(str(k) for k in range(1, 6) if not status.get(k))
-    return missing or "0"
-
-
 def parse_steps_string(s: str) -> list[int]:
     steps: list[int] = []
     for ch in s:
@@ -204,28 +156,18 @@ def parse_steps_string(s: str) -> list[int]:
 
 
 # ==========================================================
-# STEP 1
+# STEP RUNNERS
 # ==========================================================
 def run_step1_txt_mp3(query: str) -> tuple[str, float]:
+    if not query:
+        raise SystemExit("Step 1 (txt/mp3) requires a non-empty query.")
     t = run([sys.executable, str(SCRIPTS_DIR / "1_txt_mp3.py"), query], "STEP1")
     slug = detect_slug_from_latest_mp3()
     log("STEP1", f"Slug detected: {slug}", GREEN)
     return slug, t
 
 
-# ==========================================================
-# STEP 2
-# ==========================================================
 def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> float:
-    """
-    Step 2 now behaves in the correct order:
-      1. Detect existing stems
-      2. Ask user whether to reuse them BEFORE UI
-      3. Run mix UI
-      4. Render mix
-      5. Only re-run Demucs if user declines reuse
-    """
-
     if profile == "lyrics":
         log("STEP2", "Profile 'lyrics' skips stems/mix.", YELLOW)
         return 0.0
@@ -237,7 +179,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
 
     separated_root = BASE_DIR / "separated"
 
-    # Allowed models (strict 4-stem)
+    # Preferred models (strict 4-stem)
     preferred: list[str] = []
     if model:
         preferred.append(model)
@@ -255,7 +197,6 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     reuse = False
     actual = existing_model
 
-    # Ask BEFORE mix UI
     if existing_model and interactive:
         ans = input(
             f"Stems found for model '{existing_model}'. Reuse existing stems? [Y/n]: "
@@ -266,7 +207,6 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
 
     t_demucs = 0.0
 
-    # Run Demucs only if needed
     if not reuse:
         import subprocess as sp
         log("STEP2", f"Running Demucs (4-stem) with models: {preferred}", CYAN)
@@ -285,7 +225,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
 
     log("STEP2", f"Using stems from model '{actual}'", GREEN)
 
-    # --- RUN MIX UI (now after stems decision) ---
+    # Mix UI
     t_ui = run(
         [
             sys.executable, str(SCRIPTS_DIR / "2_stems.py"),
@@ -299,7 +239,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
 
     out_wav = MIXES_DIR / f"{slug}_{profile}.wav"
 
-    # --- RENDER MIX ---
+    # Render mix
     t_render = run(
         [
             sys.executable, str(SCRIPTS_DIR / "2_stems.py"),
@@ -316,9 +256,7 @@ def run_step2_stems(slug: str, profile: str, model: str, interactive: bool) -> f
     log("STEP2", f"Completed in {fmt_secs_mmss(total)}", GREEN)
     return total
 
-# ==========================================================
-# STEP 3
-# ==========================================================
+
 def run_step3_timing(slug: str) -> float:
     mp3_path    = MP3_DIR / f"{slug}.mp3"
     txt_path    = TXT_DIR / f"{slug}.txt"
@@ -337,9 +275,6 @@ def run_step3_timing(slug: str) -> float:
     return t
 
 
-# ==========================================================
-# STEP 4
-# ==========================================================
 def run_step4_mp4(slug: str, profile: str) -> float:
     cmd = [
         sys.executable, str(SCRIPTS_DIR / "4_mp4.py"),
@@ -353,31 +288,11 @@ def run_step4_mp4(slug: str, profile: str) -> float:
         return 0.0
 
 
-# ==========================================================
-# STEP 5 (UPLOAD)
-# ==========================================================
 def run_step5_upload(slug: str, profile: str) -> float:
-    """
-    Upload to YouTube using 5_upload.py.
-
-    Includes:
-      - Colorized upload summary
-      - Relative paths
-      - MM:SS durations
-      - Previous-upload detection with count
-      - Yes/no confirmation
-      - Pretty descriptor prompt with autosuggestions
-    """
-    # -----------------------------------------
-    # Load metadata
-    # -----------------------------------------
     artist, title = load_meta(slug)
     artist = artist or "Unknown Artist"
     title  = title or slug.replace("_", " ").title()
 
-    # -----------------------------------------
-    # Load mix config (volumes + model)
-    # -----------------------------------------
     cfg_path = MIXES_DIR / f"{slug}_{profile}.json"
     model   = "unknown"
     volumes = {}
@@ -389,9 +304,6 @@ def run_step5_upload(slug: str, profile: str) -> float:
         except Exception:
             pass
 
-    # -----------------------------------------
-    # Paths (relative versions)
-    # -----------------------------------------
     mp4_path = OUTPUT_DIR / f"{slug}_{profile}.mp4"
     wav_path = MIXES_DIR / f"{slug}_{profile}.wav"
     mp3_path = MP3_DIR / f"{slug}.mp3"
@@ -402,9 +314,6 @@ def run_step5_upload(slug: str, profile: str) -> float:
         except ValueError:
             return str(p)
 
-    # -----------------------------------------
-    # Compute durations
-    # -----------------------------------------
     def compute_len(p: Path) -> float:
         if not p.exists():
             return 0.0
@@ -425,9 +334,6 @@ def run_step5_upload(slug: str, profile: str) -> float:
     mp3_len = compute_len(mp3_path)
     mp4_len = compute_len(mp4_path)
 
-    # -----------------------------------------
-    # Previous upload detection
-    # -----------------------------------------
     receipt_path = UPLOAD_DIR / f"{slug}_{profile}.uploaded"
     upload_count = 0
     if receipt_path.exists():
@@ -453,9 +359,6 @@ def run_step5_upload(slug: str, profile: str) -> float:
             log("STEP5", "Upload skipped by user.", YELLOW)
             return 0.0
 
-    # -----------------------------------------
-    # Compute descriptor suggestions
-    # -----------------------------------------
     def safe_vol(track: str, default: float = 1.0) -> float:
         try:
             return float(volumes.get(track, default))
@@ -471,24 +374,19 @@ def run_step5_upload(slug: str, profile: str) -> float:
     all_instr_100 = (
         abs(v_bass  - 1.0) < 1e-3 and
         abs(v_gtr   - 1.0) < 1e-3 and
-        abs(v_piano - 1.0) < 1e-3 and
-        abs(v_other - 1.0) < 1e-3
+        abs(v_piano - 1.0) < 1e-3
+        and abs(v_other - 1.0) < 1e-3
     )
 
     suggestions: list[str] = []
 
-    # 0% vocals: classic Karaoke
     if abs(v_vocals) < 1e-3:
         suggestions.append("Karaoke")
 
-    # Instruments 100%, some vocals → Car Karaoke / Karaoke
     if all_instr_100 and 0.0 < v_vocals < 1.0:
-        if "car" in profile:
-            suggestions.append(f"Car Karaoke, {int(round(v_vocals * 100))}% Vocals")
-        else:
-            suggestions.append(f"Karaoke, {int(round(v_vocals * 100))}% Vocals")
+        label = "Car Karaoke" if "car" in profile else "Karaoke"
+        suggestions.append(f"{label}, {int(round(v_vocals * 100))}% Vocals")
 
-    # Non-100% instrument focus
     diff_instr = {
         "bass":   v_bass,
         "guitar": v_gtr,
@@ -507,27 +405,21 @@ def run_step5_upload(slug: str, profile: str) -> float:
         base_label = label_map.get(primary, primary.title())
         suggestions.append(f"{base_label} Karaoke, {int(round(v_vocals * 100))}% Vocals")
 
-    # Lyrics / Letra style when everything is 100%
     if all_instr_100 and abs(v_vocals - 1.0) < 1e-3:
         suggestions.append("Lyrics")
         suggestions.append("Letra")
 
-    # Fallback: profile-based
     if not suggestions:
         suggestions.append(profile.replace("-", " ").title())
 
-    # Deduplicate, keep order
     dedup: list[str] = []
     for s in suggestions:
         if s not in dedup:
             dedup.append(s)
     suggestions = dedup
 
-    default_desc = suggestions[0] if suggestions else profile.replace("-", " ").title()
+    default_desc = suggestions[0]
 
-    # -----------------------------------------
-    # Pretty colorized upload summary
-    # -----------------------------------------
     print()
     print(f"{BOLD}{CYAN}{'=' * 60}{RESET}")
     print(f"{BOLD}{CYAN}UPLOAD SUMMARY for slug='{slug}'  (profile={profile}){RESET}")
@@ -564,9 +456,6 @@ def run_step5_upload(slug: str, profile: str) -> float:
     for idx, s in enumerate(suggestions, start=1):
         print(f"  {WHITE}[{idx}] {s}{RESET}")
 
-    # -----------------------------------------
-    # Ask user for descriptor (with default)
-    # -----------------------------------------
     print()
     try:
         raw = input(
@@ -577,11 +466,9 @@ def run_step5_upload(slug: str, profile: str) -> float:
     except EOFError:
         raw = ""
 
-    desc: str
     if not raw:
         desc = default_desc
     else:
-        # Support picking by number
         if raw.isdigit():
             idx = int(raw)
             if 1 <= idx <= len(suggestions):
@@ -606,9 +493,6 @@ def run_step5_upload(slug: str, profile: str) -> float:
         log("STEP5", "Upload cancelled by user.", YELLOW)
         return 0.0
 
-    # -----------------------------------------
-    # Run uploader script
-    # -----------------------------------------
     cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "5_upload.py"),
@@ -621,9 +505,6 @@ def run_step5_upload(slug: str, profile: str) -> float:
 
     t_upload = run(cmd, "STEP5")
 
-    # -----------------------------------------
-    # Write / update receipt
-    # -----------------------------------------
     new_count = upload_count + 1
     receipt_data = {
         "slug": slug,
@@ -642,7 +523,7 @@ def run_step5_upload(slug: str, profile: str) -> float:
 
 
 # ==========================================================
-# Argument Parsing
+# ARG PARSING
 # ==========================================================
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
@@ -692,48 +573,52 @@ def parse_args(argv=None):
 
     return p.parse_args(argv)
 
-# ==========================================================
-# INTERACTIVE FLOW
-# ==========================================================
-def interactive_slug_and_steps(args):
-    slug = args.slug
-    t1   = 0.0
 
-    # Step 1 automatically triggered when query provided without slug
-    if args.query and not slug:
-        log("MASTER", f'Running step 1 for query "{args.query}"', CYAN)
-        slug, t1 = run_step1_txt_mp3(args.query)
+# ==========================================================
+# INTERACTIVE / NON-INTERACTIVE SLUG + STEPS
+# ==========================================================
+def interactive_choose_slug_and_steps(args):
+    """
+    Option 3 behavior:
 
-    # Infer last slug if still missing
+    - If steps 1–4 are all missing (fresh pipeline), ask:
+        'Run full pipeline 1→4 now? [Y/n]'
+      If 'Y' => steps = [1,2,3,4]
+      If 'N' => ask for explicit step numbers.
+
+    - Otherwise (some assets present), just ask for explicit steps.
+    """
+    slug = args.slug.strip() if args.slug else ""
+    query = args.query or ""
+    t1 = 0.0
+
     last_slug = None
-    if not slug:
+
+    # If neither slug nor query provided, ask the classic question
+    if not slug and not query:
         try:
             last_slug = detect_slug_from_latest_mp3()
         except Exception:
             last_slug = None
 
-    # UI prompt for step 1 query / reuse last slug
-    if not slug:
         if last_slug:
             prompt = (
                 f'Enter search query for step 1 '
                 f'(or ENTER to reuse last slug "{last_slug}"): '
             )
         else:
-            prompt = "Enter search query for step 1 (blank = specify slug manually): "
+            prompt = "Enter search query for step 1 (blank = specify existing slug): "
 
         try:
-            q = input(prompt).strip()
+            ans = input(prompt).strip()
         except EOFError:
-            q = ""
+            ans = ""
 
-        if q:
-            log("MASTER", f'Running step 1 (1_txt_mp3) for query "{q}"', CYAN)
-            slug, t1 = run_step1_txt_mp3(q)
+        if ans:
+            query = ans
         else:
             if last_slug:
                 slug = last_slug
-                args.query = slug
             else:
                 try:
                     slug = input("Enter existing slug: ").strip()
@@ -742,77 +627,82 @@ def interactive_slug_and_steps(args):
                 if not slug:
                     raise SystemExit("Slug is required when no query is given.")
 
-    slug   = slugify(slug)
-    status = detect_assets(slug, args.profile)
-    print_asset_status(slug, args.profile, status)
+    # Normalize slug if present
+    if slug:
+        slug = slugify(slug)
 
-    suggested = suggest_steps(status)
-    try:
-        step_str = input(
-            "Steps to run "
-            "(1=txt/mp3,2=stems,3=timing,4=mp4,5=upload, "
-            f"0=none, ENTER for suggested={suggested}): "
-        ).strip()
-    except EOFError:
-        step_str = ""
+    # Determine pipeline status (if we have a slug)
+    status = None
+    fresh_pipeline = False
 
-    if not step_str:
-        step_str = suggested
-    if step_str == "0":
-        log("MASTER", "Nothing selected; exiting.", YELLOW)
-        return slug, [], t1
+    if slug:
+        status = detect_assets(slug, args.profile)
+        print_asset_status(slug, args.profile, status)
+        fresh_pipeline = not any(status.get(k, False) for k in (1, 2, 3, 4))
+    else:
+        # No slug yet but we do have a query ⇒ brand-new pipeline
+        fresh_pipeline = True
 
-    steps = parse_steps_string(step_str)
+    # Decide steps
+    steps: list[int] = []
 
-    # If user picked step 1 but did not specify a query yet → prompt here
-    if 1 in steps and not args.query:
-        # If slug exists, use slug as implicit query
-        if slug:
-            args.query = slug
+    if fresh_pipeline:
+        # Ask if user wants full pipeline 1–4
+        try:
+            ans = input("Run full pipeline 1→4 now? [Y/n]: ").strip().lower()
+        except EOFError:
+            ans = "y"
+        if ans in ("", "y", "yes"):
+            steps = [1, 2, 3, 4]
         else:
-            # fallback prompt if slug is still missing
-            q = input("Step 1 selected. Enter search query: ").strip()
-            if not q:
-                log("MASTER", "Query missing; dropping step 1.", YELLOW)
-                steps.remove(1)
-            else:
-                args.query = q
+            try:
+                step_str = input(
+                    "Enter step numbers to run (e.g. 24 or 13 or 345, 0=none): "
+                ).strip()
+            except EOFError:
+                step_str = ""
+            if not step_str or step_str == "0":
+                log("MASTER", "Nothing selected; exiting.", YELLOW)
+                return slug, query, [], t1
+            steps = parse_steps_string(step_str)
+    else:
+        # Existing assets present; no auto pipeline suggestion
+        try:
+            step_str = input(
+                "Enter step numbers to run (e.g. 24 or 13 or 345, 0=none): "
+            ).strip()
+        except EOFError:
+            step_str = ""
+        if not step_str or step_str == "0":
+            log("MASTER", "Nothing selected; exiting.", YELLOW)
+            return slug, query, [], t1
+        steps = parse_steps_string(step_str)
 
-    return slug, steps, t1
+    return slug, query, steps, t1
 
 
-# ==========================================================
-# NON-INTERACTIVE FLOW
-# ==========================================================
 def noninteractive_slug_and_steps(args):
     if not args.steps:
-        raise SystemExit("--skip-ui requires --steps (e.g. --steps 24).")
+        raise SystemExit("--skip-ui requires --steps or --do.")
 
-    steps = set(parse_steps_string(args.steps))
+    steps = parse_steps_string(args.steps)
     if not steps:
-        return "", []
+        return None, "", []
 
-    slug = args.slug
+    slug = args.slug.strip() if args.slug else ""
+    query = args.query or ""
 
-    # If step 1 selected
+    # If step 1 is requested, we rely on query and let slug be determined by step 1.
     if 1 in steps:
-        if not args.query:
-            raise SystemExit("Step 1 selected but no --query provided.")
-        slug, _ = run_step1_txt_mp3(args.query)
-    
-        # ----------------------------------------------------------
-        # AUTO-ADVANCE: Step 1 → Step 2
-        # ----------------------------------------------------------
-        status = detect_assets(slug, args.profile)
-        if can_auto_advance(1, status):
-            log("AUTO", "Auto-advancing to step 2", CYAN)
-            steps.add(2)
+        if not query:
+            raise SystemExit("Step 1 selected in non-interactive mode but no --query provided.")
+        slug = ""  # will be set by step 1
+    else:
+        if not slug:
+            raise SystemExit("Steps 2–5 in non-interactive mode require --slug.")
+        slug = slugify(slug)
 
-    if not slug:
-        raise SystemExit("Slug is required for noninteractive steps 2–5.")
-
-    slug = slugify(slug)
-    return slug, steps
+    return slug, query, steps
 
 
 # ==========================================================
@@ -822,213 +712,110 @@ def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
     total_start = time.perf_counter()
 
-    # =============================================================
-    # DO-SHORTCUT HANDLING (Skip interactive menu entirely)
-    # =============================================================
+    # Shortcuts: --do
+    slug: str | None
+    query: str
+    steps: list[int]
+    t1 = t2 = t3 = t4 = t5 = 0.0
+
     if args.do:
-        # Validate required input
         if args.do == "new":
             if not args.query:
                 raise SystemExit("--do new requires --query.")
-            args.steps = "1234"
+            query = args.query
+            slug = slugify(query)
+            steps = [1, 2, 3, 4]
             args.skip_ui = True
 
         elif args.do == "remix":
             if not args.slug:
                 raise SystemExit("--do remix requires --slug.")
-            args.steps = "24"
-            # User chooses UI or not via --skip-ui
+            slug = slugify(args.slug)
+            query = ""
+            steps = [2, 4]
 
         elif args.do == "retime":
             if not args.slug:
                 raise SystemExit("--do retime requires --slug.")
-            args.steps = "34"
+            slug = slugify(args.slug)
+            query = ""
+            steps = [3, 4]
             args.skip_ui = True
 
         elif args.do == "mp4":
             if not args.slug:
                 raise SystemExit("--do mp4 requires --slug.")
-            args.steps = "4"
+            slug = slugify(args.slug)
+            query = ""
+            steps = [4]
             args.skip_ui = True
 
-        # For any --do value, completely skip interactive menu
-        slug = args.slug or slugify(args.query)
-        steps = {int(c) for c in str(args.steps)}
-        t1 = 0.0
-        log("MASTER", f"Running steps {steps} for slug={slug} (do={args.do})", CYAN)
+        log("MASTER", f"Running steps {steps} (do={args.do})", CYAN)
+
     else:
-        # =============================================================
-        # NORMAL INTERACTIVE / NON-INTERACTIVE FLOW
-        # =============================================================
         if args.skip_ui:
-            slug, steps = noninteractive_slug_and_steps(args)
-            t1 = 0.0
+            slug, query, steps = noninteractive_slug_and_steps(args)
         else:
-            slug, steps, t1 = interactive_slug_and_steps(args)
+            slug, query, steps, t1 = interactive_choose_slug_and_steps(args)
 
         if not steps:
             return
 
-    # Normalize steps into a sorted list
-    steps = set(steps)
-
-    # Hard guarantee: implicit query when reusing slug
-    if 1 in steps and not args.query:
-        args.query = slug
-
-    # =============================================================
-    # RUN SELECTED STEPS WITH AUTO-ADVANCE LOGIC
-    # =============================================================
-    t2 = t3 = t4 = t5 = 0.0
-    executed: set[int] = set()
-
-    def execute_step(step: int) -> None:
-        nonlocal t1, t2, t3, t4, t5, slug
-
+    # Execute steps in ascending order, no complex auto-advance.
+    for step in sorted(set(steps)):
         if step == 1:
-            # Step 1: txt/mp3 generation
-            # Run only if we haven't already run it in this master invocation.
-            if t1 == 0.0:
-                if not args.query:
-                    raise SystemExit("Step 1 requires a query.")
-                slug, t1 = run_step1_txt_mp3(args.query)
-            else:
-                log("STEP1", "Skipping Step 1 (already run).", YELLOW)
+            # Ensure we have a query; if missing, prompt once.
+            if not query:
+                try:
+                    q = input("Step 1 (txt/mp3) needs a search query (blank = use slug): ").strip()
+                except EOFError:
+                    q = ""
+                if q:
+                    query = q
+                else:
+                    if not slug:
+                        raise SystemExit("Cannot run step 1: no query and no slug.")
+                    # Fallback: use slug text as query
+                    query = slug
 
-            # ----------------------------------------------------------
-            # AUTO-ADVANCE: Step 1 → Step 2  (runs in both cases)
-            # ----------------------------------------------------------
-            status = detect_assets(slug, args.profile)
-            if can_auto_advance(1, status):
-                log("AUTO", "Auto-advancing to step 2", CYAN)
-                steps.add(2)
+            slug, t1 = run_step1_txt_mp3(query)
 
         elif step == 2:
-            # Step 2: stems + mix
+            if not slug:
+                raise SystemExit("Step 2 requested before slug is known.")
             t2 = run_step2_stems(slug, args.profile, args.model, interactive=not args.skip_ui)
-            # ----------------------------------------------------------
-            # AUTO-ADVANCE: Step 2 → Step 3
-            # ----------------------------------------------------------
-            status = detect_assets(slug, args.profile)
-            if can_auto_advance(2, status):
-                log("AUTO", "Auto-advancing to step 3", CYAN)
-                steps.add(3)
 
         elif step == 3:
-            # Step 3: timing
+            if not slug:
+                raise SystemExit("Step 3 requested before slug is known.")
             t3 = run_step3_timing(slug)
-            # ----------------------------------------------------------
-            # AUTO-ADVANCE: Step 3 → Step 4
-            # ----------------------------------------------------------
-            status = detect_assets(slug, args.profile)
-            if can_auto_advance(3, status):
-                log("AUTO", "Auto-advancing to step 4", CYAN)
-                steps.add(4)
-
 
         elif step == 4:
-            # Step 4: mp4 generation
+            if not slug:
+                raise SystemExit("Step 4 requested before slug is known.")
             t4 = run_step4_mp4(slug, args.profile)
-            # ----------------------------------------------------------
-            # NO AUTO-ADVANCE from Step 4 → Step 5 (optional)
-            # But we offer step 5 automatically now.
-            # ----------------------------------------------------------
-            status = detect_assets(slug, args.profile)
-            if not status.get(5, False):
-                print()
-                try:
-                    ans = input("Step 4 complete. Run step 5 upload? [Y/n]: ").strip().lower()
-                except EOFError:
-                    ans = "y"
-                if ans in ("", "y", "yes"):
-                    log("AUTO", "Auto-running step 5", CYAN)
-                    steps.add(5)
 
         elif step == 5:
-            # Step 5: upload
+            if not slug:
+                raise SystemExit("Step 5 requested before slug is known.")
             t5 = run_step5_upload(slug, args.profile)
 
-    # No steps selected somehow (should already be handled above)
-    if not steps:
-        return
-
-    # Start from the lowest requested step
-    current = min(steps)
-
-    # Auto-advance for steps 1–4 only; step 5 is handled separately.
-    while True:
-        # Run this step if not already executed
-        if current not in executed:
-            execute_step(current)
-            executed.add(current)
-
-        # Auto-advance logic only applies for steps 1–3.
-        # Step 4 (and 5) never trigger N+1 evaluation.
-        if current >= 4:
-            break
-
-        # Refresh asset status so we can see what's "DONE"
+    # After explicit steps: offer upload if appropriate and not already run
+    if 4 in steps and 5 not in steps and not args.skip_ui and slug:
         status = detect_assets(slug, args.profile)
+        if status.get(4, False) and not status.get(5, False):
+            try:
+                ans = input("Step 4 completed. Run upload (step 5) now? [y/N]: ").strip().lower()
+            except EOFError:
+                ans = ""
+            if ans in ("y", "yes"):
+                t5 = run_step5_upload(slug, args.profile)
 
-        # Candidate for N+1
-        next_candidate = current + 1
-
-        # Determine if we can auto-advance to next_candidate (only if <= 4)
-        can_auto = False
-        if next_candidate <= 4:
-            # All steps >= next_candidate up to 4 must NOT be done.
-            # Step 5 is explicitly ignored in this check.
-            future_keys = [k for k in range(next_candidate, 5) if k <= 4]
-            if all(not status.get(k, False) for k in future_keys):
-                can_auto = True
-
-        if can_auto:
-            # Auto-advance to next consecutive step
-            current = next_candidate
-            continue
-
-        # Otherwise, find the next explicit step > current (1–4) that hasn't run yet
-        remaining_explicit = [s for s in steps if s > current and s <= 4 and s not in executed]
-        if remaining_explicit:
-            remaining_explicit = sorted(remaining_explicit)
-            current = remaining_explicit[0]
-            continue
-
-        # No more steps 1–4 to run
-        break
-
-    # After auto-advance loop:
-    # 1) Run explicit step 5 if the user requested it and it hasn't run yet
-    if 5 in steps and 5 not in executed:
-        execute_step(5)
-
-    # 2) Offer step 5 as an additional option at the end of step 4,
-    #    as long as:
-    #       - mp4 exists (step 4 done)
-    #       - upload receipt does not exist (step 5 not done)
-    #       - we are in interactive mode (skip-ui is False)
-    status_after = detect_assets(slug, args.profile)
-    if (
-        status_after.get(4, False)      # mp4 present
-        and not status_after.get(5, False)  # no upload receipt
-        and not args.skip_ui            # interactive mode
-        and 5 not in executed           # haven't already uploaded
-    ):
-        try:
-            ans = input("Step 4 completed. Run upload (step 5) now? [y/N]: ").strip().lower()
-        except EOFError:
-            ans = ""
-        if ans in ("y", "yes"):
-            execute_step(5)
-
-    # =============================================================
-    # SUMMARY
-    # =============================================================
     total_end = time.perf_counter()
     total = total_end - total_start
 
     print()
-    print(f"{BOLD}{BLUE}========= PIPELINE SUMMARY ({slug}, profile={args.profile}) ========={RESET}")
+    print(f"{BOLD}{BLUE}========= PIPELINE SUMMARY ({slug or 'N/A'}, profile={args.profile}) ========={RESET}")
     print(f"{CYAN}Step 1 txt/mp3:  {fmt_secs_mmss(t1)}{RESET}")
     print(f"{CYAN}Step 2 stems:    {fmt_secs_mmss(t2)}{RESET}")
     print(f"{CYAN}Step 3 timing:   {fmt_secs_mmss(t3)}{RESET}")
@@ -1036,6 +823,7 @@ def main(argv=None):
     print(f"{CYAN}Step 5 upload:   {fmt_secs_mmss(t5)}{RESET}")
     print(f"{BOLD}{GREEN}Total pipeline: {fmt_secs_mmss(total)}{RESET}")
     print(f"{BOLD}{BLUE}====================================================={RESET}")
+
 
 if __name__ == "__main__":
     main()
