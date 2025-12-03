@@ -132,3 +132,56 @@ def write_json(path: Path, data: dict) -> None:
     Safe JSON write with indentation.
     """
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+# ----------------------------------------------------------
+# ADDITIVE GENERIC HELPERS (SAFE TO IMPORT ANYWHERE)
+# ----------------------------------------------------------
+
+def ask_yes_no(prompt: str, default_yes: bool = True) -> bool:
+    """
+    A unified yes/no prompt.
+    - default_yes=True → ENTER counts as 'yes'
+    - default_yes=False → ENTER counts as 'no'
+    Returns True for yes, False for no.
+    """
+    suffix = "[Y/n]" if default_yes else "[y/N]"
+    try:
+        ans = input(f"{prompt} {suffix}: ").strip().lower()
+    except EOFError:
+        ans = ""
+
+    if ans == "" and default_yes:
+        return True
+    if ans == "" and not default_yes:
+        return False
+    return ans in ("y", "yes")
+
+
+def print_pipeline_status(slug: str, s1: bool, s2: bool, s3: bool, s4: bool) -> None:
+    """
+    Identical formatted pipeline-state print for ANY runner.
+    Used optionally by 0_master.py or anything else.
+    """
+    print()
+    print(f"{BOLD}{CYAN}Pipeline status for '{slug}':{RESET}")
+    print(f"  Step1 txt/mp3 : {'OK' if s1 else 'MISSING'}")
+    print(f"  Step2 stems   : {'OK' if s2 else 'MISSING'}")
+    print(f"  Step3 timing  : {'OK' if s3 else 'MISSING'}")
+    print(f"  Step4 mp4     : {'OK' if s4 else 'MISSING'}")
+    print()
+
+
+# Centralized path dictionary (read-only convenience)
+from pathlib import Path as _Path
+
+BASE_DIR = _Path(__file__).resolve().parent.parent
+PATHS = {
+    "base":      BASE_DIR,
+    "scripts":   BASE_DIR / "scripts",
+    "txt":       BASE_DIR / "txts",
+    "mp3":       BASE_DIR / "mp3s",
+    "mixes":     BASE_DIR / "mixes",
+    "timings":   BASE_DIR / "timings",
+    "output":    BASE_DIR / "output",
+    "separated": BASE_DIR / "separated",
+    "meta":      BASE_DIR / "meta",
+}
