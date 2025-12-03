@@ -49,13 +49,14 @@ def run_step1(query: str) -> float:
     return run_with_timer(cmd, "STEP1", color=BLUE)
 
 def run_step2(slug: str) -> float:
+    # Step 2 now takes *no arguments*.
     mp3 = MP3_DIR / f"{slug}.mp3"
     if not mp3.exists():
         raise SystemExit("Cannot run stems: mp3 missing.")
+
     cmd = [
         sys.executable,
         str(SCRIPTS / "2_stems.py"),
-        "--mp3", str(mp3),
     ]
     return run_with_timer(cmd, "STEP2", color=BLUE)
 
@@ -137,7 +138,7 @@ def main():
     slug = pick_slug()
 
     steps = ask_steps(slug)
-    if not steps:
+   	if not steps:
         log("MASTER", "No steps selected. Exiting.", YELLOW)
         return
 
