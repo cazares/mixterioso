@@ -132,10 +132,6 @@ def print_status(slug: str) -> None:
 # EXISTING SONG SELECTION (NO NEW SONG CREATION HERE)
 # ==========================================================
 def choose_existing_slug(existing_slugs: List[str]) -> str:
-    """
-    Existing-only selection (used when Step1 is NOT requested).
-    Optional filter text, then numeric choice. No 'new song' option here.
-    """
     if not existing_slugs:
         log("SLUG", "No existing songs found; Step1 is required to create a new one.", RED)
         raise SystemExit(1)
@@ -174,6 +170,43 @@ def choose_existing_slug(existing_slugs: List[str]) -> str:
         log("SLUG", "Invalid selection, please try again.", YELLOW)
 
 # ==========================================================
+# STEP1 — INTERACTIVE CREATION OF NEW SONG
+# ==========================================================
+def run_step1_interactive() -> Optional[str]:
+    """
+    LKGV behavior:
+    - Prompt user for Artist + Title
+    - Compute slug
+    - Run 1_txt_mp3.py with --artist --title --slug
+    """
+
+    print("")
+    log("STEP1", "Creating NEW song (TXT + MP3)", WHITE)
+
+    artist = input("  Artist: ").strip()
+    title  = input("  Title : ").strip()
+
+    if not artist or not title:
+        log("STEP1", "Artist and Title are required.", RED)
+        return None
+
+    slug = slugify(title)
+    print(f"  Slug   : {slug}")
+
+    cmd = [
+        str(SCRIPTS_DIR / "1_txt_mp3.py"),
+        "--artist", artist,
+        "--title", title,
+        "--slug", slug,
+    ]
+
+    rc = run_subprocess(1, cmd)
+    if rc != 0:
+        return None
+
+    return slug
+
+# ==========================================================
 # STEP EXECUTION HELPERS
 # ==========================================================
 def run_subprocess(step: int, args: Sequence[str]) -> int:
@@ -183,52 +216,6 @@ def run_subprocess(step: int, args: Sequence[str]) -> int:
     if r.returncode != 0:
         log(f"STEP{step}", f"Exited {r.returncode}", RED)
     return r.returncode
-
-def run_step1(current_slug: Optional[str]) -> Optional[str]:
-    """
-    Run 1_txt_mp3.py, then detect which slug was created/updated.
-
-    - If current_slug is already present after Step1, keep it.
-    - Else if exactly one new slug appeared, use it.
-    - Else ask user to choose from all slugs.
-    """
-    before = set(collect_existing_slugs())
-    rc = run_subprocess(1, [str(SCRIPTS_DIR / "1_txt_mp3.py")])
-    if rc != 0:
-        return None
-
-    after = set(collect_existing_slugs())
-    new = sorted(after - before)
-
-    if current_slug and current_slug in after:
-        log("STEP1", f"Continuing with slug '{current_slug}'", GREEN)
-        return current_slug
-
-    if len(new) == 1:
-        chosen = new[0]
-        log("STEP1", f"Detected new slug '{chosen}'", GREEN)
-        return chosen
-
-    candidates = sorted(after)
-    if not candidates:
-        log("STEP1", "No slugs found after Step1; cannot continue.", RED)
-        return None
-
-    print("")
-    log("STEP1", "Select which slug Step1 produced:", YELLOW)
-    for i, s in enumerate(candidates, 1):
-        print(f"  {i}) {s}")
-    print("")
-
-    while True:
-        c = input(f"Choose 1–{len(candidates)} (0=abort): ").strip()
-        if c == "0":
-            return None
-        if c.isdigit():
-            n = int(c)
-            if 1 <= n <= len(candidates):
-                return candidates[n - 1]
-        print("Invalid selection, try again.")
 
 def run_step2(slug: str) -> None:
     mp3_path = MP3_DIR / f"{slug}.mp3"
@@ -305,19 +292,20 @@ def main() -> None:
 
     pipeline_slug: Optional[str] = None
 
-    # If Step1 is NOT requested, we must choose an existing slug up front.
+    # If Step1 is NOT requested, choose existing slug
     if 1 not in steps:
         pipeline_slug = choose_existing_slug(existing_slugs)
         print("")
         print_status(pipeline_slug)
 
-    # Execute steps in order.
+    # Execute steps
     for step in steps:
         if step == 1:
-            pipeline_slug = run_step1(pipeline_slug)
-            if not pipeline_slug:
+            slug = run_step1_interactive()
+            if not slug:
                 log("MAIN", "Step1 failed or aborted; stopping.", RED)
                 return
+            pipeline_slug = slug
             print("")
             print_status(pipeline_slug)
 
