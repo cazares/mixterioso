@@ -20,6 +20,8 @@ OUT_DIR = PATHS["output"]
 SCRIPTS = PATHS["scripts"]
 
 # ─────────────────────────────────────────────
+# STEP EXISTENCE CHECKS
+# ─────────────────────────────────────────────
 def exists_step1(slug: str) -> bool:
     return (TXT_DIR / f"{slug}.txt").exists() and (MP3_DIR / f"{slug}.mp3").exists()
 
@@ -33,32 +35,50 @@ def exists_step4(slug: str) -> bool:
     return (OUT_DIR / f"{slug}.mp4").exists()
 
 # ─────────────────────────────────────────────
-def run_step1(query: str) -> float:
-    cmd = [sys.executable, str(SCRIPTS / "1_txt_mp3.py"), query]
+# RUN HELPERS
+# ─────────────────────────────────────────────
+def run_step1() -> float:
+    """
+    Step 1: txt + mp3 generation.
+    1_txt_mp3.py now prompts for Artist/Title itself and does not take arguments.
+    """
+    cmd = [sys.executable, str(SCRIPTS / "1_txt_mp3.py")]
     return run_with_timer(cmd, "STEP1")
 
 def run_step2(slug: str) -> float:
-    cmd = [sys.executable, str(SCRIPTS / "2_stems.py")]
+    """
+    Step 2: stems + mix WAV.
+    2_stems.py currently expects an explicit --mp3 argument.
+    """
+    mp3 = MP3_DIR / f"{slug}.mp3"
+    if not mp3.exists():
+        raise SystemExit(f"Cannot run stems: mp3 missing at {mp3}")
+    cmd = [sys.executable, str(SCRIPTS / "2_stems.py"), "--mp3", str(mp3)]
     return run_with_timer(cmd, "STEP2")
 
 def run_step3(slug: str) -> float:
-    txt = TXT_DIR / f"{slug}.txt"
-    aud = MP3_DIR / f"{slug}.mp3"
-    csv = TIM_DIR / f"{slug}.csv"
-    cmd = [
-        sys.executable, str(SCRIPTS / "3_timing.py"),
-        "--txt", str(txt),
-        "--audio", str(aud),
-        "--timings", str(csv),
-    ]
+    """
+    Step 3: manual timings.
+    3_timing.py now handles slug selection and file paths internally (no args).
+    """
+    cmd = [sys.executable, str(SCRIPTS / "3_timing.py")]
     return run_with_timer(cmd, "STEP3")
 
 def run_step4(slug: str) -> float:
+    """
+    Step 4: MP4 render.
+    Keeps existing --slug contract for current 4_mp4.py.
+    """
     cmd = [sys.executable, str(SCRIPTS / "4_mp4.py"), "--slug", slug]
     return run_with_timer(cmd, "STEP4")
 
 # ─────────────────────────────────────────────
+# SLUG PICKER
+# ─────────────────────────────────────────────
 def pick_slug() -> str:
+    """
+    Ask user for slug, or fall back to latest mp3 stem.
+    """
     try:
         s = input("Enter slug (or ENTER for latest): ").strip()
     except EOFError:
@@ -72,6 +92,8 @@ def pick_slug() -> str:
     return slugify(mp3s[-1].stem)
 
 # ─────────────────────────────────────────────
+# STEP SELECTION
+# ─────────────────────────────────────────────
 def ask_steps(slug: str) -> list[int]:
     s1 = exists_step1(slug)
     s2 = exists_step2(slug)
@@ -84,7 +106,7 @@ def ask_steps(slug: str) -> list[int]:
 
     if fresh:
         if ask_yes_no("Run full pipeline 1→4 now?", default_yes=True):
-            return [1,2,3,4]
+            return [1, 2, 3, 4]
 
     try:
         raw = input("Enter steps (e.g. 134 or 24, 0=none): ").strip()
@@ -98,29 +120,20 @@ def ask_steps(slug: str) -> list[int]:
     return steps
 
 # ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
 def main():
-    ensure_pipeline_dirs()
-
     slug = pick_slug()
     steps = ask_steps(slug)
     if not steps:
         log("MASTER", "No steps selected. Exiting.", YELLOW)
         return
 
-    query = None
-    if 1 in steps:
-        try:
-            q = input("Enter search query for Step 1: ").strip()
-        except EOFError:
-            q = ""
-        if not q:
-            raise SystemExit("Step 1 chosen but no query provided.")
-        query = q
-
     for step in steps:
         if step == 1:
-            run_step1(query)
-            slug = slugify(query)
+            run_step1()
+            # After Step 1, the new slug is determined by the newly created mp3.
+            slug = pick_slug()
         elif step == 2:
             run_step2(slug)
         elif step == 3:
