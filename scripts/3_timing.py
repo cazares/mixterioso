@@ -6,19 +6,15 @@ Behavior:
 - STRICT slug mode when --slug is provided (no slug prompts).
 - Uses original MP3 only (never WAV/mix) for timing.
 - Curses UI with color + bold where useful.
-- Hotkeys (no adjustable step):
-    e = rewind 1s
-    r = rewind 3s
-    t = rewind 5s
-    d = forward 1s
-    f = forward 3s
-    g = forward 5s
-    p = pause / resume
-    ENTER = stamp current lyric line at current time
-    s = skip current lyric line
-    1–= = insert music note “lyric” at current time
-    b = insert blank “lyric” (text = " ") at current time
-    q = quit and save
+- Hotkeys (fixed step sizes):
+    ENTER = stamp current lyric
+    s     = skip current lyric
+    e/r/t = rewind 1s / 3s / 5s
+    d/f/g = forward 1s / 3s / 5s
+    p     = pause / resume
+    1–=   = insert music-note event at current time
+    b     = insert BLANK event (single-space lyric) at current time
+    q     = quit and save
 - Rewind logic:
     When rewinding, any events (lyric timestamps, notes, blanks) AFTER
     the new playback position are removed. Current lyric index snaps to
@@ -91,7 +87,7 @@ def load_lyrics(slug: str) -> List[str]:
         log("TXT", f"Missing lyrics file: {txt_path}", RED)
         raise SystemExit(1)
 
-    lines = []
+    lines: List[str] = []
     for ln in txt_path.read_text(encoding="utf-8").splitlines():
         ln = ln.rstrip()
         if ln.strip():
@@ -170,8 +166,10 @@ class AudioTransport:
                 self._player_ffplay,
                 "-nodisp",
                 "-autoexit",
-                "-loglevel", "quiet",
-                "-ss", f"{self._logical_pos:.3f}",
+                "-loglevel",
+                "quiet",
+                "-ss",
+                f"{self._logical_pos:.3f}",
                 str(self.audio_path),
             ]
         else:
@@ -221,11 +219,137 @@ class AudioTransport:
 # ─────────────────────────────────────────────
 # Notes
 # ─────────────────────────────────────────────
-NOTE_KEY_MAP = {
-    "1": "♪",       "2": "♫",       "3": "♬",       "4": "♩",
-    "5": "♪♫",      "6": "♫♬",      "7": "♬♩",      "8": "♪♩",
-    "9": "♪♬",      "0": "♫♪",      "-": "♩♬♪",     "=": "♫♪♬♩",
+NOTE_KEY_MAP: Dict[str, str] = {
+    "1": "♪",
+    "2": "♫",
+    "3": "♬",
+    "4": "♩",
+    "5": "♪♫",
+    "6": "♫♬",
+    "7": "♬♩",
+    "8": "♪♩",
+    "9": "♪♬",
+    "0": "♫♪",
+    "-": "♩♬♪",
+    "=": "♫♪♬♩",
 }
+
+# ─────────────────────────────────────────────
+# Curses UI helpers
+# ─────────────────────────────────────────────
+def draw_intro_box(stdscr, slug: str, COLOR_HDR, COLOR_GRAY, COLOR_HOT) -> None:
+    stdscr.clear()
+    h, w = stdscr.getmaxyx()
+
+    title = f"Mixterioso Timing – {slug}"
+    try:
+        stdscr.addstr(0, 0, title[: max(0, w - 1)], COLOR_HDR)
+    except curses.error:
+        pass
+
+    # Box content lines (label, description)
+    lines: List[Tuple[str, str]] = [
+        ("ENTER", "stamp current lyric"),
+        ("s", "skip current lyric"),
+        ("e/r/t", "rewind 1s / 3s / 5s"),
+        ("d/f/g", "forward 1s / 3s / 5s"),
+        ("p", "pause / resume audio"),
+        ("1–=", "insert note event"),
+        ("b", "insert BLANK event (\" \")"),
+        ("q", "quit and save CSV"),
+    ]
+
+    max_label = max(len(label) for label, _ in lines)
+    max_desc = max(len(desc) for _, desc in lines)
+
+    inner_width = max_label + 3 + max_desc  # label + " – " + desc
+    box_width = inner_width + 4  # padding
+    box_width = min(box_width, max(20, w - 2))
+
+    # Center box horizontally
+    start_x = max(0, (w - box_width) // 2)
+    start_y = 2
+
+    # Draw box with Unicode borders
+    top = "┌" + "─" * (box_width - 2) + "┐"
+    mid = "├" + "─" * (box_width - 2) + "┤"
+    bot = "└" + "─" * (box_width - 2) + "┘"
+
+    try:
+        stdscr.addstr(start_y, start_x, top, COLOR_GRAY)
+        stdscr.addstr(start_y + 1, start_x, "│" + " " * (box_width - 2) + "│", COLOR_GRAY)
+        header = "Controls"
+        header_x = start_x + (box_width - len(header)) // 2
+        stdscr.addstr(start_y + 1, header_x, header, COLOR_HDR)
+        stdscr.addstr(start_y + 2, start_x, mid, COLOR_GRAY)
+    except curses.error:
+        pass
+
+    row = start_y + 3
+    for label, desc in lines:
+        if row >= h - 2:
+            break
+        line = "│ " + label.ljust(max_label) + " – " + desc.ljust(max_desc) + " │"
+        try:
+            stdscr.addstr(row, start_x, "│ ", COLOR_GRAY)
+            stdscr.addstr(row, start_x + 2, label.ljust(max_label), COLOR_HOT | curses.A_BOLD)
+            stdscr.addstr(row, start_x + 2 + max_label, " – ", COLOR_GRAY)
+            stdscr.addstr(row, start_x + 5 + max_label, desc.ljust(max_desc), COLOR_GRAY)
+            stdscr.addstr(row, start_x + box_width - 1, "│", COLOR_GRAY)
+        except curses.error:
+            pass
+        row += 1
+
+    try:
+        stdscr.addstr(row, start_x, bot, COLOR_GRAY)
+    except curses.error:
+        pass
+
+    row += 2
+    if row < h:
+        msg = "Press ENTER to start audio + timing."
+        try:
+            stdscr.addstr(row, max(0, (w - len(msg)) // 2), msg, COLOR_HOT | curses.A_BOLD)
+        except curses.error:
+            pass
+
+    stdscr.refresh()
+
+def draw_command_bar(stdscr, COLOR_HOT, COLOR_GRAY) -> None:
+    h, w = stdscr.getmaxyx()
+    # Row 2 and 3 for command groups
+    row1 = 2
+    row2 = 3
+
+    def draw_segments(row: int, segments: List[Tuple[str, bool]]) -> None:
+        col = 0
+        for text, is_hot in segments:
+            if col >= w - 1:
+                break
+            chunk = text[: max(0, w - 1 - col)]
+            color = COLOR_HOT | curses.A_BOLD if is_hot else COLOR_GRAY
+            try:
+                stdscr.addstr(row, col, chunk, color)
+            except curses.error:
+                pass
+            col += len(chunk)
+
+    segments1: List[Tuple[str, bool]] = [
+        ("[ENTER]", True), (" stamp   ", False),
+        ("[s]", True),     (" skip   ", False),
+        ("[e/r/t]", True), (" rewind   ", False),
+        ("[d/f/g]", True), (" forward", False),
+    ]
+
+    segments2: List[Tuple[str, bool]] = [
+        ("[p]", True),     (" pause  ", False),
+        ("[1–=]", True),   (" notes  ", False),
+        ("[b]", True),     (" blank  ", False),
+        ("[q]", True),     (" quit", False),
+    ]
+
+    draw_segments(row1, segments1)
+    draw_segments(row2, segments2)
 
 # ─────────────────────────────────────────────
 # Curses UI
@@ -237,15 +361,17 @@ def curses_main(stdscr, slug: str, lyrics: List[str], audio_path: Path) -> None:
 
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_YELLOW, -1)   # primary text
-    curses.init_pair(2, curses.COLOR_CYAN,   -1)   # header
-    curses.init_pair(3, curses.COLOR_MAGENTA, -1)  # controls
-    curses.init_pair(4, curses.COLOR_RED,    -1)   # warnings
+    curses.init_pair(1, curses.COLOR_YELLOW, -1)   # primary lyric text
+    curses.init_pair(2, curses.COLOR_CYAN,   -1)   # headers
+    curses.init_pair(3, curses.COLOR_MAGENTA, -1)  # hotkeys / accents
+    curses.init_pair(4, curses.COLOR_RED,    -1)   # errors
+    curses.init_pair(5, curses.COLOR_WHITE,  -1)   # gray (dim)
 
     COLOR_MAIN = curses.color_pair(1)
     COLOR_HDR  = curses.color_pair(2) | curses.A_BOLD
-    COLOR_CTRL = curses.color_pair(3)
+    COLOR_HOT  = curses.color_pair(3)
     COLOR_ERR  = curses.color_pair(4) | curses.A_BOLD
+    COLOR_GRAY = curses.color_pair(5) | curses.A_DIM
 
     TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = TIMINGS_DIR / f"{slug}.csv"
@@ -256,35 +382,19 @@ def curses_main(stdscr, slug: str, lyrics: List[str], audio_path: Path) -> None:
     # Extra events: notes + blanks [(time, text)]
     extra_events: List[Tuple[float, str]] = []
 
-    # Mini console event log
-    event_log: List[str] = []
+    # Mini console event log: (is_error, ts_str, message)
+    event_log: List[Tuple[bool, str, str]] = []
 
     def log_event(msg: str, is_error: bool = False) -> None:
-        prefix = "ERR" if is_error else "LOG"
-        ts = time.strftime("%H:%M:%S")
-        event_log.append(f"[{prefix} {ts}] {msg}")
+        ts_raw = time.strftime("%H:%M:%S")
+        event_log.append((is_error, ts_raw, msg))
         if len(event_log) > 8:
             del event_log[0]
 
     transport = AudioTransport(audio_path)
 
-    # Pre-start splash
-    stdscr.clear()
-    try:
-        stdscr.addstr(0, 0, f"Mixterioso Timing – {slug}", COLOR_HDR)
-        stdscr.addstr(2, 0, "Controls:", COLOR_CTRL | curses.A_BOLD)
-        stdscr.addstr(3, 2, "ENTER     = stamp current lyric", COLOR_CTRL)
-        stdscr.addstr(4, 2, "s         = skip current lyric", COLOR_CTRL)
-        stdscr.addstr(5, 2, "e/r/t     = rewind 1s / 3s / 5s", COLOR_CTRL)
-        stdscr.addstr(6, 2, "d/f/g     = forward 1s / 3s / 5s", COLOR_CTRL)
-        stdscr.addstr(7, 2, "p         = pause / resume", COLOR_CTRL)
-        stdscr.addstr(8, 2, "1–=       = insert note event", COLOR_CTRL)
-        stdscr.addstr(9, 2, "b         = insert BLANK event (\" \")", COLOR_CTRL)
-        stdscr.addstr(10,2, "q         = quit and save CSV", COLOR_CTRL)
-        stdscr.addstr(12,0, "Press ENTER to start audio + timing.", COLOR_MAIN | curses.A_BOLD)
-    except curses.error:
-        pass
-    stdscr.refresh()
+    # Intro screen with controls box
+    draw_intro_box(stdscr, slug, COLOR_HDR, COLOR_GRAY, COLOR_HOT)
 
     # Wait for ENTER to start
     while True:
@@ -342,19 +452,16 @@ def curses_main(stdscr, slug: str, lyrics: List[str], audio_path: Path) -> None:
 
         # Header
         try:
-            stdscr.addstr(0, 0, f"Mixterioso Timing – {slug}", COLOR_HDR)
-            stdscr.addstr(1, 0, f"Time: {now_t:7.2f}s", COLOR_MAIN)
-            stdscr.addstr(
-                2,
-                0,
-                "[ENTER] stamp  [s] skip  [e/r/t] ←  [d/f/g] →  [p] pause  [1–=] notes  [b] blank  [q] quit",
-                COLOR_CTRL,
-            )
+            stdscr.addstr(0, 0, f"Mixterioso Timing – {slug}"[: max(0, w - 1)], COLOR_HDR)
+            stdscr.addstr(1, 0, f"Time: {now_t:7.2f}s"[: max(0, w - 1)], COLOR_MAIN)
         except curses.error:
             pass
 
+        # Command bar (rows 2–3)
+        draw_command_bar(stdscr, COLOR_HOT, COLOR_GRAY)
+
         # Lyrics window
-        base_row = 4
+        base_row = 5
         log_rows = 9
         window_size = max(3, h - base_row - log_rows - 1)
         offset = max(0, current_idx - window_size // 2)
@@ -365,30 +472,69 @@ def curses_main(stdscr, slug: str, lyrics: List[str], audio_path: Path) -> None:
                 break
             line = lyrics[idx]
             prefix = f"{idx:3d}: "
-            text = (prefix + line)[: max(0, w - 1)]
             row = base_row + i
-            try:
-                if idx == current_idx:
+
+            if row >= h:
+                break
+
+            if idx == current_idx:
+                text = (prefix + line)[: max(0, w - 1)]
+                try:
                     stdscr.addstr(row, 0, text, COLOR_MAIN | curses.A_REVERSE | curses.A_BOLD)
-                else:
-                    stdscr.addstr(row, 0, text, COLOR_MAIN)
-            except curses.error:
-                pass
+                except curses.error:
+                    pass
+            else:
+                try:
+                    # Line number (gray)
+                    stdscr.addstr(row, 0, prefix[: max(0, w - 1)], COLOR_GRAY)
+                    # Lyric text (yellow)
+                    if len(prefix) < w - 1:
+                        stdscr.addstr(
+                            row,
+                            len(prefix),
+                            line[: max(0, w - 1 - len(prefix))],
+                            COLOR_MAIN,
+                        )
+                except curses.error:
+                    pass
 
         # Mini console feed at bottom
         log_start = base_row + window_size + 1
         if log_start < h:
             try:
-                stdscr.addstr(log_start, 0, "-" * max(0, w - 1), COLOR_MAIN)
+                stdscr.addstr(log_start, 0, "-" * max(0, w - 1), COLOR_GRAY)
             except curses.error:
                 pass
             visible_logs = event_log[-(h - log_start - 1) :]
-            for i, msg in enumerate(visible_logs, start=1):
+            for i, (is_error, ts_str, msg) in enumerate(visible_logs, start=1):
                 row = log_start + i
                 if row >= h:
                     break
+                base_color = COLOR_ERR if is_error else COLOR_GRAY
+                col = 0
                 try:
-                    stdscr.addstr(row, 0, msg[: max(0, w - 1)], COLOR_MAIN)
+                    label = "[ERR " if is_error else "[LOG "
+                    if col < w - 1:
+                        chunk = label[: max(0, w - 1 - col)]
+                        stdscr.addstr(row, col, chunk, base_color)
+                    col += len(label)
+
+                    if col < w - 1:
+                        chunk = ts_str[: max(0, w - 1 - col)]
+                        stdscr.addstr(row, col, chunk, base_color | curses.A_BOLD)
+                    col += len(ts_str)
+
+                    if col < w - 1:
+                        stdscr.addstr(row, col, "] ", base_color)
+                    col += 2
+
+                    if col < w - 1:
+                        stdscr.addstr(
+                            row,
+                            col,
+                            msg[: max(0, w - 1 - col)],
+                            base_color,
+                        )
                 except curses.error:
                     pass
 
