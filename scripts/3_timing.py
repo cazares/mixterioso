@@ -2,16 +2,15 @@
 """
 3_timing.py — Curses-based manual lyric timing tool (NO AI)
 
-Key behaviors:
-- STRICT slug mode: if --slug is provided, never prompt for slug.
-- AUTO playback: plays the original MP3 for the slug (never WAV).
-- Global clock: timestamps are song-time seconds, with seek-aware transport.
-- Rewind: 'r' rewinds by N seconds (default 5s; adjust with +/-).
-- Fast-forward: 'f' jumps forward by N seconds.
-- Pause/Resume: 'p' toggles pause for both timing and audio.
-- Note insertion: keys 1–= insert musical-note “lyrics” as normal lines.
-- UI: all text in console yellow.
-- Output: timings/<slug>.csv with header: line_index,time_secs,text
+Features:
+- STRICT slug mode when --slug provided.
+- Auto audio playback (MP3 only).
+- Global clock with seek-aware logic.
+- Rewind (r), Fast-forward (f), Pause/Resume (p).
+- Adjustable rewind step (+/-).
+- Insert musical notes (1–=) as lyric events.
+- Scrolling event log.
+- Entire UI in console yellow.
 """
 
 import sys
@@ -21,10 +20,10 @@ import time
 import subprocess
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 # ─────────────────────────────────────────────
-# Bootstrap import path
+# Bootstrap PATH
 # ─────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -42,117 +41,98 @@ MP3_DIR = PATHS["mp3"]
 # ─────────────────────────────────────────────
 # Arg parsing
 # ─────────────────────────────────────────────
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Curses-based manual lyric timing tool.")
-    p.add_argument("--slug", help="Song slug (required for non-interactive use)")
+def parse_args():
+    p = argparse.ArgumentParser(description="Curses timing tool")
+    p.add_argument("--slug")
     return p.parse_args()
 
-
 # ─────────────────────────────────────────────
-# Helpers
+# Resolve slug
 # ─────────────────────────────────────────────
-def resolve_slug(args: argparse.Namespace) -> str:
+def resolve_slug(args) -> str:
     if args.slug:
         slug = args.slug.strip()
         if not slug:
-            raise SystemExit("Invalid empty --slug.")
-        log("SLUG", f"Using slug '{slug}' (no prompts allowed)", GREEN)
+            raise SystemExit("Invalid empty slug.")
+        log("SLUG", f"Using slug '{slug}' (strict mode)", GREEN)
         return slug
 
-    # Legacy fallback if run standalone without 0_master.py
+    # Legacy fallback if launched independently
     try:
         slug = input("Enter slug for timing: ").strip()
     except EOFError:
-        raise SystemExit("Missing slug (EOF)")
+        raise SystemExit("Missing slug.")
     if not slug:
-        raise SystemExit("Slug is required.")
-    log("SLUG", f"Using slug '{slug}' (legacy prompt)", YELLOW)
+        raise SystemExit("Slug required.")
+    log("SLUG", f"Using slug '{slug}' (legacy)", YELLOW)
     return slug
 
-
+# ─────────────────────────────────────────────
+# Load lyrics
+# ─────────────────────────────────────────────
 def load_lyrics(slug: str) -> List[str]:
-    txt_path = TXT_DIR / f"{slug}.txt"
-    if not txt_path.exists():
-        log("TXT", f"Missing lyrics at {txt_path}", RED)
+    p = TXT_DIR / f"{slug}.txt"
+    if not p.exists():
+        log("TXT", f"Missing {p}", RED)
         raise SystemExit(1)
-
-    content = txt_path.read_text(encoding="utf-8").splitlines()
-    lines = [ln.rstrip() for ln in content if ln.strip()]
-    if not lines:
-        log("TXT", "Lyrics file appears empty.", YELLOW)
-    return lines
-
-
-def resolve_audio_path(slug: str) -> Path:
-    """
-    ALWAYS use MP3 for timing. WAV mixes are never used for timing UI.
-    """
-    mp3 = MP3_DIR / f"{slug}.mp3"
-    if mp3.exists():
-        return mp3
-    log("AUDIO", f"MP3 missing for slug '{slug}' at {mp3}", RED)
-    raise SystemExit(1)
-
+    out = []
+    for ln in p.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if ln:
+            out.append(ln)
+    return out
 
 # ─────────────────────────────────────────────
-# Audio transport (ffplay preferred, afplay fallback)
+# Ensure MP3 path
+# ─────────────────────────────────────────────
+def resolve_audio_path(slug: str) -> Path:
+    mp3 = MP3_DIR / f"{slug}.mp3"
+    if not mp3.exists():
+        log("AUDIO", f"Missing MP3 at {mp3}", RED)
+        raise SystemExit(1)
+    return mp3
+
+# ─────────────────────────────────────────────
+# Audio Transport
 # ─────────────────────────────────────────────
 class AudioTransport:
-    """
-    Transport wrapper with:
-      - play from given offset (seek if ffplay available)
-      - rewind / fast-forward by N seconds
-      - pause / resume
-      - current logical song time
-
-    Logical time is maintained independently of the underlying player
-    and is always monotonically updated relative to the song.
-    """
-
-    def __init__(self, audio_path: Path, rewind_step: float = 5.0) -> None:
+    def __init__(self, audio_path: Path, rewind_step=5.0):
         self.audio_path = audio_path
         self.rewind_step = rewind_step
 
-        self._proc: Optional[subprocess.Popen] = None
+        self._proc: subprocess.Popen | None = None
         self._player_ffplay = shutil.which("ffplay")
         self._player_afplay = shutil.which("afplay")
         self._use_ffplay = self._player_ffplay is not None
         self._supports_seek = self._use_ffplay
 
         if not self._player_ffplay and not self._player_afplay:
-            log("AUDIO", "Neither ffplay nor afplay found in PATH.", RED)
+            log("AUDIO", "Neither ffplay nor afplay found.", RED)
             raise SystemExit(1)
 
         if self._use_ffplay:
-            log("AUDIO", f"Using ffplay for playback (seek-capable): {self._player_ffplay}", CYAN)
+            log("AUDIO", "Using ffplay (seek-capable)", CYAN)
         else:
-            log("AUDIO", f"Using afplay for playback (no seek; transport limited): {self._player_afplay}", YELLOW)
+            log("AUDIO", "Using afplay (no seek)", YELLOW)
 
-        # Logical time bookkeeping
-        self._logical_pos = 0.0        # seconds into track
-        self._state = "stopped"        # "stopped", "playing", "paused"
-        self._state_time = 0.0         # monotonic time of last state change
+        # logical playback state
+        self._logical_pos = 0.0
+        self._state = "stopped"    # playing / paused / stopped
+        self._state_time = 0.0     # last monotonic update
 
-    # ---- internal helpers ----
-    def _kill_proc(self) -> None:
-        if self._proc is not None:
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
+    def _kill_proc(self):
+        if self._proc:
+            try: self._proc.terminate()
+            except: pass
             self._proc = None
 
-    def _update_logical_pos_now(self) -> None:
-        """Update logical_pos based on elapsed time while 'playing'."""
+    def _update_logical(self):
         now = time.monotonic()
         if self._state == "playing":
-            delta = now - self._state_time
-            if delta > 0:
-                self._logical_pos += delta
+            self._logical_pos += (now - self._state_time)
         self._state_time = now
 
-    def _launch_player_at(self, pos: float) -> None:
-        """Start underlying player at logical position `pos`."""
+    def _launch(self, pos: float):
         self._kill_proc()
         self._logical_pos = max(0.0, pos)
         self._state = "playing"
@@ -168,309 +148,260 @@ class AudioTransport:
                 str(self.audio_path),
             ]
         else:
-            # afplay does not support seek; best effort is to restart from 0.
-            # Logical time will still jump to requested pos so timestamps remain meaningful.
             if self._logical_pos > 0:
-                log("AUDIO", "afplay cannot seek; audio restarts from 0, but timestamps follow logical time.", YELLOW)
+                log("AUDIO", "afplay cannot seek; audio restarts but logical time preserved.", YELLOW)
             cmd = [self._player_afplay, str(self.audio_path)]
 
         try:
             self._proc = subprocess.Popen(cmd)
         except Exception as e:
-            log("AUDIO", f"Failed to start audio player: {e}", RED)
+            log("AUDIO", f"Failed to play: {e}", RED)
             raise SystemExit(1)
 
-    # ---- public API ----
-    def start(self) -> None:
-        """Start playback from 0.0."""
-        self._launch_player_at(0.0)
+    # Public API
+    def start(self):
+        self._launch(0.0)
 
     def current_time(self) -> float:
-        """Return current logical song time."""
-        self._update_logical_pos_now()
+        self._update_logical()
         return max(0.0, self._logical_pos)
 
-    def rewind(self) -> None:
-        """Rewind by rewind_step seconds."""
-        if not self._supports_seek:
-            log("AUDIO", "Rewind requested but seek is not supported (afplay-only). Logical time will move, audio restarts.", YELLOW)
+    def rewind(self):
         now = self.current_time()
-        new_pos = max(0.0, now - self.rewind_step)
-        self._launch_player_at(new_pos)
+        new = max(0.0, now - self.rewind_step)
+        self._launch(new)
 
-    def fast_forward(self) -> None:
-        """Fast-forward by rewind_step seconds."""
-        if not self._supports_seek:
-            log("AUDIO", "Fast-forward requested but seek is not supported (afplay-only). Logical time will move, audio restarts.", YELLOW)
+    def fast_forward(self):
         now = self.current_time()
-        new_pos = max(0.0, now + self.rewind_step)
-        self._launch_player_at(new_pos)
+        new = now + self.rewind_step
+        self._launch(new)
 
-    def adjust_step(self, delta: float) -> None:
-        self.rewind_step = max(1.0, min(30.0, self.rewind_step + delta))
+    def adjust_step(self, delta):
+        self.rewind_step = max(1, min(30, self.rewind_step + delta))
 
-    def toggle_pause(self) -> None:
-        """Pause or resume playback and logical time."""
+    def toggle_pause(self):
         if self._state == "playing":
-            # Pause
-            self._update_logical_pos_now()
+            self._update_logical()
             self._kill_proc()
             self._state = "paused"
-            log("AUDIO", "Paused.", YELLOW)
         elif self._state == "paused":
-            # Resume
-            log("AUDIO", "Resuming.", GREEN)
-            self._launch_player_at(self._logical_pos)
+            self._launch(self._logical_pos)
         else:
-            # If stopped, treat toggle as start from current pos
-            log("AUDIO", "Starting from current position.", CYAN)
-            self._launch_player_at(self._logical_pos)
+            self._launch(self._logical_pos)
 
-    def stop(self) -> None:
+    def stop(self):
         self._kill_proc()
-        self._update_logical_pos_now()
+        self._update_logical()
         self._state = "stopped"
 
+# ─────────────────────────────────────────────
+# Note glyphs
+# ─────────────────────────────────────────────
+NOTE_KEY_MAP = {
+    "1": "♪","2": "♫","3": "♬","4": "♩","5": "♪♫","6": "♫♬",
+    "7": "♬♩","8": "♪♩","9": "♪♬","0": "♫♪","-": "♩♬♪","=": "♫♪♬♩"
+}
 
 # ─────────────────────────────────────────────
 # Curses UI
 # ─────────────────────────────────────────────
-NOTE_KEY_MAP = {
-    "1": "♪",
-    "2": "♫",
-    "3": "♬",
-    "4": "♩",
-    "5": "♪♫",
-    "6": "♫♬",
-    "7": "♬♩",
-    "8": "♪♩",
-    "9": "♪♬",
-    "0": "♫♪",
-    "-": "♩♬♪",
-    "=": "♫♪♬♩",
-}
+def curses_main(stdscr, slug, lyrics, audio_path: Path):
 
-
-def curses_main(stdscr, slug: str, lyrics: List[str], audio_path: Path) -> None:
     curses.curs_set(0)
     stdscr.nodelay(False)
     stdscr.keypad(True)
 
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_YELLOW, -1)   # yellow foreground
+    curses.init_pair(1, curses.COLOR_YELLOW, -1)
     COLOR_Y = curses.color_pair(1)
 
-    # Prepare timing output
     TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = TIMINGS_DIR / f"{slug}.csv"
 
-    # Events: (time_secs, text)
-    events: List[Tuple[float, str]] = []
-
-    # Event log (console-style) for bottom of screen
+    events: List[tuple[float,str]] = []
     event_log: List[str] = []
 
-    def add_event(msg: str) -> None:
+    def log_event(msg: str):
         event_log.append(msg)
-        # keep last 5
-        if len(event_log) > 5:
+        if len(event_log) > 6:
             del event_log[0]
 
-    # Audio transport
     transport = AudioTransport(audio_path, rewind_step=5.0)
 
-    # Initial screen
+    # pre-start screen
     stdscr.clear()
     try:
         stdscr.addstr(0, 0, f"Mixterioso Timing – {slug}", COLOR_Y | curses.A_BOLD)
         stdscr.addstr(2, 0, "Controls:", COLOR_Y)
-        stdscr.addstr(3, 2, "ENTER : timestamp current lyric", COLOR_Y)
-        stdscr.addstr(4, 2, "r     : rewind by N seconds", COLOR_Y)
-        stdscr.addstr(5, 2, "+ / - : increase / decrease rewind seconds", COLOR_Y)
-        stdscr.addstr(6, 2, "f     : fast-forward by N seconds", COLOR_Y)
-        stdscr.addstr(7, 2, "p     : play / pause audio + clock", COLOR_Y)
-        stdscr.addstr(8, 2, "1–=   : insert note glyph line at current time", COLOR_Y)
-        stdscr.addstr(9, 2, "s     : skip this lyric (no event)", COLOR_Y)
-        stdscr.addstr(10, 2, "q     : quit and save CSV", COLOR_Y)
-        stdscr.addstr(12, 0, "Press ENTER when ready to start timing + audio playback.", COLOR_Y)
-    except curses.error:
-        pass
+        stdscr.addstr(3, 2, "ENTER = stamp lyric", COLOR_Y)
+        stdscr.addstr(4, 2, "r = rewind", COLOR_Y)
+        stdscr.addstr(5, 2, "+/- = adjust rewind seconds", COLOR_Y)
+        stdscr.addstr(6, 2, "f = fast-forward", COLOR_Y)
+        stdscr.addstr(7, 2, "p = pause/resume", COLOR_Y)
+        stdscr.addstr(8, 2, "1–= = insert note event", COLOR_Y)
+        stdscr.addstr(9, 2, "s = skip lyric", COLOR_Y)
+        stdscr.addstr(10,2, "q = quit/save", COLOR_Y)
+        stdscr.addstr(12,0, "Press ENTER to start playback + timing.", COLOR_Y)
+    except: pass
     stdscr.refresh()
 
-    # Wait for user to start
+    # Wait for start
     while True:
         ch = stdscr.getch()
-        if ch in (10, 13):  # ENTER
+        if ch in (10, 13):
             break
 
-    # Start audio
     transport.start()
-    add_event("Timing started; audio playback begun.")
+    log_event("Timing started; audio playing")
 
-    line_idx = 0
-    num_lines = len(lyrics)
+    idx = 0
+    n = len(lyrics)
 
     while True:
         stdscr.clear()
         h, w = stdscr.getmaxyx()
 
-        # Header
-        now = transport.current_time()
+        tnow = transport.current_time()
+
+        # header
         try:
-            stdscr.addstr(0, 0, f"Mixterioso Timing – {slug}", COLOR_Y | curses.A_BOLD)
-            stdscr.addstr(1, 0, f"Time: {now:7.2f}s   Rewind step: {transport.rewind_step:.1f}s", COLOR_Y)
+            stdscr.addstr(0,0,f"Mixterioso Timing – {slug}", COLOR_Y | curses.A_BOLD)
+            stdscr.addstr(1,0,f"Time: {tnow:7.2f}s   Step: {transport.rewind_step:.1f}s", COLOR_Y)
             stdscr.addstr(
-                2,
-                0,
-                "[ENTER] stamp  [r] rewind  [+/-] step  [f] fwd  [p] pause  [1–=] notes  [s] skip  [q] quit",
-                COLOR_Y,
+                2,0,
+                "[ENTER]stamp [r]rew [+/−]step [f]fwd [p]pause [1–=]notes [s]skip [q]quit",
+                COLOR_Y
             )
-        except curses.error:
-            pass
+        except: pass
 
-        # Lyrics window
-        base_row = 4
-        log_rows = 5
-        window_size = max(3, h - base_row - log_rows - 1)
-        offset = max(0, line_idx - window_size // 2)
+        # lyric window
+        base = 4
+        log_rows = 6
+        win = max(3, h - base - log_rows - 1)
+        off = max(0, idx - win//2)
 
-        for i in range(window_size):
-            idx = offset + i
-            if idx >= num_lines:
-                break
-            line = lyrics[idx]
-            row = base_row + i
-            prefix = f"{idx:3d}: "
-            text = (prefix + line)[: max(0, w - 1)]
+        for i in range(win):
+            li = off + i
+            if li >= n: break
+            line = f"{li:3d}: {lyrics[li]}"
+            row = base + i
+            if li == idx:
+                mode = COLOR_Y | curses.A_REVERSE
+            else:
+                mode = COLOR_Y
             try:
-                if idx == line_idx:
-                    stdscr.addstr(row, 0, text, COLOR_Y | curses.A_REVERSE)
-                else:
-                    stdscr.addstr(row, 0, text, COLOR_Y)
-            except curses.error:
-                pass
+                stdscr.addstr(row, 0, line[:w-1], mode)
+            except: pass
 
-        # Event log region at bottom
-        log_start = base_row + window_size + 1
-        if log_start < h:
+        # event log
+        start = base + win + 1
+        if start < h:
             try:
-                stdscr.addstr(log_start, 0, "-" * max(0, w - 1), COLOR_Y)
-            except curses.error:
-                pass
-            for i, msg in enumerate(event_log[-(h - log_start - 1) :], start=1):
-                row = log_start + i
-                if row >= h:
-                    break
+                stdscr.addstr(start,0,"-"*(w-1),COLOR_Y)
+            except: pass
+            logs = event_log[-(h-start-1):]
+            for i,msg in enumerate(logs,1):
+                row = start + i
+                if row >= h: break
                 try:
-                    stdscr.addstr(row, 0, msg[: max(0, w - 1)], COLOR_Y)
-                except curses.error:
-                    pass
+                    stdscr.addstr(row,0,msg[:w-1],COLOR_Y)
+                except: pass
 
         stdscr.refresh()
 
         ch = stdscr.getch()
 
-        # Quit
         if ch in (ord("q"), ord("Q")):
-            add_event("Quit requested; writing CSV and exiting.")
+            log_event("Quitting – saving CSV")
             break
 
         # Rewind
         if ch in (ord("r"), ord("R")):
             transport.rewind()
-            now = transport.current_time()
-            add_event(f"Rewind {transport.rewind_step:.1f}s → {now:0.3f}s")
+            log_event(f"Rewind → {transport.current_time():.3f}s")
             continue
 
-        # Adjust rewind step
+        # Step adjust
         if ch == ord("+"):
-            transport.adjust_step(+1.0)
-            add_event(f"Rewind step increased to {transport.rewind_step:.1f}s")
+            transport.adjust_step(+1)
+            log_event(f"Step = {transport.rewind_step:.1f}s")
             continue
         if ch == ord("-"):
-            transport.adjust_step(-1.0)
-            add_event(f"Rewind step decreased to {transport.rewind_step:.1f}s")
+            transport.adjust_step(-1)
+            log_event(f"Step = {transport.rewind_step:.1f}s")
             continue
 
         # Fast-forward
         if ch in (ord("f"), ord("F")):
             transport.fast_forward()
-            now = transport.current_time()
-            add_event(f"Fast-forward {transport.rewind_step:.1f}s → {now:0.3f}s")
+            log_event(f"Fwd → {transport.current_time():.3f}s")
             continue
 
         # Pause / resume
         if ch in (ord("p"), ord("P")):
             transport.toggle_pause()
-            now = transport.current_time()
-            add_event(f"Toggle pause/resume at {now:0.3f}s")
+            log_event(f"Pause toggle @ {transport.current_time():.3f}s")
             continue
 
-        # Skip lyric (no event recorded)
+        # Skip lyric
         if ch in (ord("s"), ord("S")):
-            if line_idx < num_lines:
-                add_event(f"Skipped line {line_idx}: {lyrics[line_idx][:40]!r}")
-                line_idx = min(num_lines, line_idx + 1)
+            if idx < n:
+                log_event(f"Skip line {idx}")
+                idx += 1
             continue
 
-        # Handle note keys 1–=
+        # Notes
         if 0 <= ch <= 255:
-            ch_char = chr(ch)
+            cchar = chr(ch)
         else:
-            ch_char = ""
+            cchar = ""
 
-        if ch_char in NOTE_KEY_MAP:
-            note_txt = NOTE_KEY_MAP[ch_char]
+        if cchar in NOTE_KEY_MAP:
+            txt = NOTE_KEY_MAP[cchar]
             ts = transport.current_time()
-            events.append((ts, note_txt))
-            add_event(f"[NOTE] {note_txt} inserted at {ts:0.3f}s")
+            events.append((ts, txt))
+            log_event(f"[NOTE] {txt} @ {ts:0.3f}s")
             continue
 
-        # ENTER = stamp current lyric
+        # ENTER = stamp lyric
         if ch in (10, 13):
-            if line_idx < num_lines:
+            if idx < n:
                 ts = transport.current_time()
-                txt = lyrics[line_idx]
-                events.append((ts, txt))
-                add_event(f"[LINE] {line_idx} stamped at {ts:0.3f}s")
-                line_idx += 1
+                events.append((ts, lyrics[idx]))
+                log_event(f"[LINE] {idx} @ {ts:0.3f}s")
+                idx += 1
             else:
-                add_event("No more lyrics to stamp; ENTER ignored.")
+                log_event("No more lyrics")
             continue
 
-        # Ignore unknown keys
+        # ignore everything else
 
-    # Stop audio
     transport.stop()
 
-    # Build final events sorted by time
+    # write CSV
     events_sorted = sorted(events, key=lambda x: x[0])
-
-    # Write CSV
     with out_path.open("w", encoding="utf-8") as f:
         f.write("line_index,time_secs,text\n")
-        for idx, (ts, text) in enumerate(events_sorted):
-            f.write(f"{idx},{ts:.6f},{text}\n")
+        for i,(ts,txt) in enumerate(events_sorted):
+            f.write(f"{i},{ts:.6f},{txt}\n")
 
-    log("CSV", f"Wrote: {out_path}", GREEN)
-
+    log("CSV", f"Wrote {out_path}", GREEN)
 
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
-def main() -> None:
-    log("MODE", "Manual timing (curses, strict --slug mode)", CYAN)
+def main():
+    log("MODE","Curses Timing Tool",CYAN)
     args = parse_args()
     slug = resolve_slug(args)
     lyrics = load_lyrics(slug)
-    audio_path = resolve_audio_path(slug)
+    audio = resolve_audio_path(slug)
 
     try:
-        curses.wrapper(curses_main, slug, lyrics, audio_path)
+        curses.wrapper(curses_main, slug, lyrics, audio)
     except KeyboardInterrupt:
-        log("ABORT", "Interrupted by user (Ctrl+C).", YELLOW)
-
+        log("ABORT","Ctrl+C",YELLOW)
 
 if __name__ == "__main__":
     main()
