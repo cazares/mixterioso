@@ -3,9 +3,9 @@
 0_master.py — Orchestrator for Mixterioso Karaoke Pipeline.
 
 Major rules:
-- NO free-form slug/query at startup anymore.
+- NO free-form slug/query at startup.
 - Step1 (1_txt_mp3.py) is the ONLY place a NEW slug is created.
-- For existing songs (no Step1), user picks a slug from a filtered list.
+- For existing songs (when Step1 is not run), user picks a slug from a filtered list.
 - Slug is constant for Steps 2–5 once chosen/created.
 - Offset is only asked at Step4, default = –1.50 seconds.
 """
@@ -134,7 +134,7 @@ def print_status(slug: str) -> None:
 def choose_existing_slug(existing_slugs: List[str]) -> str:
     """
     Existing-only selection (used when Step1 is NOT requested).
-    Optional filter text, then numeric choice. No "new song" here.
+    Optional filter text, then numeric choice. No 'new song' option here.
     """
     if not existing_slugs:
         log("SLUG", "No existing songs found; Step1 is required to create a new one.", RED)
@@ -146,11 +146,10 @@ def choose_existing_slug(existing_slugs: List[str]) -> str:
         flt = input("Filter songs (optional; ENTER to list all): ").strip().lower()
 
         if flt:
-            filtered = [s for s in existing_slugs if flt in s.lower()]
-            if not filtered:
+            songs = [s for s in existing_slugs if flt in s.lower()]
+            if not songs:
                 log("SLUG", f"No songs match filter '{flt}'. Try again.", YELLOW)
                 continue
-            songs = filtered
         else:
             songs = existing_slugs
 
