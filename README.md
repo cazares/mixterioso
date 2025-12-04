@@ -1,163 +1,182 @@
-# 🎤 Karaoke Time — CLI Pipeline
+# 📀 Mixterioso Karaoke Pipeline — README (Dec-4 LKGV)
 
-An end-to-end, manual-first yet automation-ready pipeline for creating professional karaoke videos.  
-From YouTube audio to fully timed MP4 with synced lyrics — all modular, cache-aware, and human-verified.
+A fast, manual-first, precision-controlled karaoke creation pipeline. Designed for full human control, zero AI drift, clean visuals, and stable re-runs.
 
----
-
-## 🗺️ Pipeline Overview
-
-| Step | Script | Purpose |
-|------|---------|----------|
-| 0 | `0_master.py` | Orchestrates the entire pipeline; can auto-run all steps. |
-| 1 | `1_txt_mp3.py` | Fetches or downloads lyrics and audio (usually from YouTube). |
-| 2 | `2_stems.py` | Splits audio into stems (vocals, drums, bass, etc.) via Demucs. |
-| 3 | `3_timing.py` | Interactive lyric timing UI (using curses). |
-| 4 | `4_mp4.py` | Renders synchronized karaoke video with styled overlays. |
-| 5 | `5_upload.py` | Uploads the finished MP4 to YouTube (optional). |
+This pipeline takes a song from metadata → audio download → stem remix → lyric timing → MP4 render → YouTube upload using clean modular scripts.
 
 ---
 
-## 🚀 Quick Start
+# 🗺️ Pipeline Overview
 
+| Step | Script            | Purpose |
+|------|-------------------|---------|
+| 0    | `0_master.py`     | Orchestrator: runs Steps 1–5 interactively |
+| 1    | `1_txt_mp3.py`    | Fetch artist/title → lyrics → MP3 source |
+| 2    | `2_stems.py`      | Demucs separation + custom mix → `mixes/<slug>.wav` |
+| 3    | `3_timing.py`     | Manual timestamping (curses UI) |
+| 4    | `4_mp4.py`        | Render final MP4 with karaoke visuals |
+| 5    | `5_upload.py`     | Upload to YouTube with title builder + thumbnail |
+
+Everything is powered by `mix_utils.py`, which defines paths, logging, and safety helpers.
+
+---
+
+# 🚀 Quick Start
+
+### Run the full pipeline
 ```bash
-# Clone + prepare environment
-python3 -m venv demucs_env
-source demucs_env/bin/activate
-pip3 install -U pip wheel
-pip3 install -r requirements.txt
-
-# Run the full pipeline
-python3 scripts/0_master.py --slug "imagine_-_remastered_2010" --offset -1.5
-
-# Or run step-by-step:
-python3 scripts/1_txt_mp3.py --url "https://youtu.be/YQHsXMglC9A"
-python3 scripts/2_stems.py --slug adele_hello
-python3 scripts/3_timing.py --slug adele_hello
-python3 scripts/4_mp4.py --slug adele_hello
-python3 scripts/5_upload.py --file output/adele_hello_karaoke.mp4
+python3 scripts/0_master.py
 ```
 
----
-
-## ⚙️ Configuration
-
-All scripts share environment variables loaded from `.env`:
-
+### Run steps manually
 ```bash
-YOUTUBE_API_KEY=your_api_key_here
-OPENAI_API_KEY=your_api_key_here
-GENIUS_API_KEY=your_api_key_here
+python3 scripts/1_txt_mp3.py --slug "my_song"
+python3 scripts/2_stems.py --slug my_song
+python3 scripts/3_timing.py --slug my_song
+python3 scripts/4_mp4.py --slug my_song --offset -1.5
+python3 scripts/5_upload.py --slug my_song
 ```
-
-- Output and cache directories: `mp3s/`, `stems/`, `offsets/`, `timings/`, `output/`
-- Fonts and video defaults: adjustable at top of `4_mp4.py`
-- ffmpeg, yt-dlp, and Demucs are required dependencies.
 
 ---
 
-## 🧩 File Structure
+# 🧩 Directory Structure
 
 ```
-karaoke-time-by-miguel/
+mixterioso/
+│
 ├── scripts/
 │   ├── 0_master.py
 │   ├── 1_txt_mp3.py
 │   ├── 2_stems.py
 │   ├── 3_timing.py
 │   ├── 4_mp4.py
-│   └── 5_upload.py
+│   ├── 5_upload.py
+│   └── mix_utils.py
+│
 ├── mp3s/
-├── stems/
+├── txts/
+├── separated/
+├── mixes/
 ├── timings/
-├── offsets/
 ├── output/
-└── .env
+└── meta/
 ```
 
 ---
 
-## 🧠 Core Features
+# 🎚️ Step-by-Step Behavior
 
-- **Interactive lyric timing:** Full curses-based UI for precise alignment.  
-- **Stem separation:** Powered by Demucs (`torch` + `torchaudio` backend).  
-- **Smart caching:** Skips reprocessing if artifacts exist.  
-- **Lyric syncing:** Auto-merges lyric text + timestamps into CSV/JSON.  
-- **Video rendering:** Produces crisp MP4s using `ffmpeg-python` with ASS overlays.  
-- **Auto-upload:** (Optional) Uses YouTube Data API with customizable metadata.
+## Step 1 — `1_txt_mp3.py`
+- Fetch lyrics + MP3
+- Create canonical slug
+- Write:
+  - `txts/<slug>.txt`
+  - `mp3s/<slug>.mp3`
+  - `meta/<slug>.json`
 
----
-
-## 🎹 Hotkeys (Timing UI)
-
-`3_timing.py`
-- **Space:** Mark lyric start  
-- **← / →:** Adjust ±0.1s  
-- **↓ / ↑:** Adjust ±0.5s  
-- **q:** Quit and save  
-
-`4_mp4.py`
-- Automatically generates up-next lyric previews and visual fades.  
-
----
-
-## 🧩 Requirements
-
+## Step 2 — `2_stems.py`
+- Run Demucs
+- UI to remix stems
+- Always writes:
 ```
-soundfile
-demucs
-torch
-torchaudio
-ffmpeg-python
-tqdm
-requests
-python-dotenv
-openai
-yt-dlp
-rich
-torchcodec
+mixes/<slug>.wav
 ```
 
+## Step 3 — `3_timing.py`  
+Manual curses timing UI.
+
+Hotkeys:
+- ENTER = stamp lyric
+- s = skip
+- p = pause/resume
+- e/r/t = rewind 1/3/5 sec
+- d/f/g = forward 1/3/5 sec
+- 1–= = insert notes
+- b = blank
+- q = save + quit
+
+Writes:
+```
+timings/<slug>.csv
+```
+
+## Step 4 — `4_mp4.py`
+- Classic karaoke visuals restored  
+- Divider + "Next:" preview  
+- Title card  
+- Fade transitions  
+- Offset applied during render (`--offset`)  
+
+Outputs:
+```
+output/<slug>.mp4
+output/<slug>.ass
+```
+
+Uses only:
+```
+mixes/<slug>.wav
+```
+
+## Step 5 — `5_upload.py`
+- OAuth login  
+- Title builder (presets + custom)  
+- Optional description  
+- Auto thumbnail (0.5s)  
+
+Outputs:
+```
+youtube_token.json
+output/<slug>.jpg
+```
+
 ---
 
-## 💡 Tips
+# 🎨 Visual System (Step 4)
 
-- Always re-activate your virtualenv (`source demucs_env/bin/activate`) before running scripts.  
-- Use `--offset` in `0_master.py` or `4_mp4.py` to fine-tune sync (e.g., `--offset -1.75`).  
-- Regenerate missing files automatically with `SAFE_REGEN=True`.  
-- Use the same slug consistently across steps (e.g., `adele_hello`).  
+Controlled via constants in `4_mp4.py`:
 
----
-
-## ☁️ REST API + Mobile Integration
-
-This CLI pipeline is designed to work with a future **REST API backend** hosted on macincloud or a cloud Mac VM.
-
-### Architecture
-- **Backend (FastAPI)**: wraps each CLI script as an async endpoint.  
-- **Queue/worker model**: ensures long-running jobs (e.g., Demucs separation) don’t block requests.  
-- **Storage**: results stored in `output/` and accessible via signed URLs.  
-- **Auth**: secured via API key or OAuth2 bearer tokens.
-
-### Example Endpoints
-| Endpoint | Method | Purpose |
-|-----------|--------|----------|
-| `/jobs/start` | POST | Starts pipeline job with YouTube URL |
-| `/jobs/status/{id}` | GET | Polls job progress |
-| `/files/{slug}/preview` | GET | Returns generated MP4 or thumbnail |
-
-### Mobile App Integration
-- The **mobile client** (React Native or Swift) uploads cookies, YouTube links, or timing files via REST.  
-- Upload progress and YouTube publish status are displayed in real-time.  
-- The backend can offload heavy lifting (e.g., `yt-dlp`, `demucs`, `ffmpeg`) to macincloud.
+- Band sizes
+- Font scaling
+- Colors + alpha
+- Fade durations
+- Divider geometry
+- Offset
+- Title behavior
 
 ---
 
-## 🧱 Future Expansion
+# 🔧 Requirements
 
-- JSON-timing format with explicit `start` and `end` for every lyric.  
-- Multi-user pipeline support via FastAPI background tasks.  
-- Live waveform preview during timing UI.  
-- Web dashboard for monitoring pipelines.  
+- Python 3.10+
+- ffmpeg + ffprobe
+- afplay or ffplay
+- yt-dlp
+- demucs
+- Google API libraries
 
 ---
+
+# ❓ Troubleshooting
+
+### Lyrics out of sync?
+```
+python3 scripts/4_mp4.py --slug song --offset -1.7
+```
+
+### Wrong audio?
+```
+rm mixes/song.wav
+python3 scripts/2_stems.py --slug song
+```
+
+### Upload error?
+Ensure:
+- OAuth token exists
+- `YOUTUBE_CLIENT_SECRETS_JSON` is set
+- Network connectivity
+
+---
+
+# 🧊 Checkpoint
+**Dec-4 Pipeline B-Profile LKGV** — authoritative version snapshot.

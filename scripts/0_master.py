@@ -1,601 +1,351 @@
 #!/usr/bin/env python3
-# scripts/0_master.py
-#
-# FULL PIPELINE ORCHESTRATOR
-# Compatible with Option A (2_download.py expects --task)
-# Steps:
-# 1_config.py
-# 2_download.py  (lyrics, mp3, meta)
-# 3_mix.py       (optional Demucs / stems)
-# 4_merge.py     (WhisperX timings; always mp3-based)
-# 5_gen.py       (mp4)
-# 6_upload.py    (YouTube upload)
-#
-# New behavior:
-# - As soon as lyrics + mp3 are ready (end of Step 2), launch 4_merge.py ASYNC.
-# - WhisperX ALWAYS uses mp3s/<slug>.mp3 for alignment (not stems).
-# - Demucs can run in parallel with WhisperX (if needed).
-# - Master waits for timings CSV before Step 5.
-# - Always prints performance summary at the end.
+"""
+0_master.py — Orchestrator for Mixterioso Karaoke Pipeline.
 
-import argparse
-import json
-import os
+Major rules:
+- NO free-form slug/query at startup.
+- Step1 (1_txt_mp3.py) is the ONLY place a NEW slug is created.
+- For existing songs (when Step1 is not run), user picks a slug from a filtered list.
+- Slug is constant for Steps 2–5 once chosen/created.
+- Offset is only asked at Step4, default = –1.50 seconds.
+"""
+
 import subprocess
 import sys
-import threading
-import time
+import re
 from pathlib import Path
-from dotenv import load_dotenv
+from typing import Dict, List, Optional, Sequence, Set
 
-RESET = "\033[0m"
-BOLD = "\033[1m"
-CYAN = "\033[36m"
-GREEN = "\033[32m"
+# ==========================================================
+# COLORS / LOGGING
+# ==========================================================
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+CYAN   = "\033[36m"
+WHITE  = "\033[97m"
+GREEN  = "\033[32m"
 YELLOW = "\033[33m"
-RED = "\033[31m"
-BLUE = "\033[34m"
+RED    = "\033[31m"
+BLUE   = "\033[34m"
 
-BASE_DIR = REPO_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(REPO_ROOT / ".env")
-TXT_DIR = BASE_DIR / "txts"
-MP3_DIR = BASE_DIR / "mp3s"
-TIMINGS_DIR = BASE_DIR / "timings"
-MIXES_DIR = BASE_DIR / "mixes"
-OUTPUT_DIR = BASE_DIR / "output"
-META_DIR = BASE_DIR / "meta"
-
-TIMINGS_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-META_DIR.mkdir(exist_ok=True)
-
-# -------------------------------------------------
-# Simple timing/performance bookkeeping
-# -------------------------------------------------
-TIMERS: dict[str, float | tuple[float, str]] = {}
-
-
-def t_start(label: str) -> None:
-    TIMERS[label] = time.time()
-
-
-def t_end(label: str, note: str | None = None) -> None:
-    if label in TIMERS and isinstance(TIMERS[label], (int, float)):
-        start = float(TIMERS[label])
-        elapsed = time.time() - start
-        TIMERS[label] = elapsed if note is None else (elapsed, note)
-    else:
-        elapsed = 0.0
-        TIMERS[label] = elapsed if note is None else (elapsed, note)
-
-    if note:
-        val = TIMERS[label]
-        TIMERS[label] = (val, note)
-
-
-def t_mark(label: str, value: float | str, note: str | None = None) -> None:
-    """Set an explicit value (e.g., 'skipped', 'cached')."""
-    if note:
-        TIMERS[label] = (value, note)
-    else:
-        TIMERS[label] = value
-
-
-# -------------------------------------------------
-# Logging helpers
-# -------------------------------------------------
 def log(section: str, msg: str, color: str = CYAN) -> None:
-    ts = time.strftime("%H:%M:%S")
-    print(f"{color}[{ts}] [{section}]{RESET} {msg}", flush=True)
+    print(f"{color}[{section}]{RESET} {msg}")
 
+# ==========================================================
+# PATHS / SLUGIFY
+# ==========================================================
+try:
+    from mix_utils import PATHS, slugify  # type: ignore
+except Exception:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+    PATHS = {
+        "base": BASE_DIR,
+        "scripts": BASE_DIR / "scripts",
+        "txt": BASE_DIR / "txts",
+        "mp3": BASE_DIR / "mp3s",
+        "mixes": BASE_DIR / "mixes",
+        "timings": BASE_DIR / "timings",
+        "output": BASE_DIR / "output",
+    }
 
-def log_error(section: str, msg: str) -> None:
-    log(section, msg, RED)
+    def slugify(text: str) -> str:
+        s = text.lower()
+        s = re.sub(r"[^a-z0-9]+", "_", s)
+        s = re.sub(r"_+", "_", s)
+        return s.strip("_")
 
+BASE_DIR     = PATHS["base"]
+SCRIPTS_DIR  = PATHS["scripts"]
+TXT_DIR      = PATHS["txt"]
+MP3_DIR      = PATHS["mp3"]
+MIXES_DIR    = PATHS["mixes"]
+TIMINGS_DIR  = PATHS["timings"]
+OUTPUT_DIR   = PATHS["output"]
+PYTHON_BIN   = sys.executable
 
-def _format_duration(sec: float | int) -> str:
-    """Pretty-print duration as seconds, plus mm:ss when >= 60."""
-    if not isinstance(sec, (int, float)):
-        return str(sec)
-    if sec < 0:
-        sec = 0.0
-    if sec < 60:
-        return f"{sec:6.2f}s"
-    minutes = int(sec // 60)
-    rem = sec - minutes * 60
-    return f"{sec:6.2f}s (~{minutes}m {rem:04.1f}s)"
+# ==========================================================
+# SLUG DISCOVERY
+# ==========================================================
+def _stems_from_dir(d: Path, exts: Sequence[str]) -> Set[str]:
+    out: Set[str] = set()
+    if d.exists():
+        for ext in exts:
+            for p in d.glob(f"*{ext}"):
+                if p.is_file():
+                    out.add(p.stem)
+    return out
 
+def collect_existing_slugs() -> List[str]:
+    slugs: Set[str] = set()
+    slugs |= _stems_from_dir(TXT_DIR, [".txt"])
+    slugs |= _stems_from_dir(MP3_DIR, [".mp3"])
+    slugs |= _stems_from_dir(MIXES_DIR, [".wav", ".mp3"])
+    slugs |= _stems_from_dir(TIMINGS_DIR, [".csv"])
+    slugs |= _stems_from_dir(OUTPUT_DIR, [".mp4", ".mkv"])
+    return sorted(slugs)
 
-def print_performance_summary() -> None:
-    print("\n" + "=" * 55)
-    print("               PERFORMANCE SUMMARY")
-    print("=" * 55)
+# ==========================================================
+# PIPELINE STATUS
+# ==========================================================
+def step1_ready(slug: str) -> bool:
+    return (TXT_DIR / f"{slug}.txt").exists() and (MP3_DIR / f"{slug}.mp3").exists()
 
-    def get(label, default=None):
-        v = TIMERS.get(label, default)
-        if isinstance(v, tuple):
-            return v[0]
-        return v
+def step2_ready(slug: str) -> bool:
+    if (MIXES_DIR / f"{slug}.wav").exists():
+        return True
+    for _ in MIXES_DIR.glob(f"{slug}_*.wav"):
+        return True
+    for _ in MIXES_DIR.glob(f"{slug}_*.mp3"):
+        return True
+    return False
 
-    pipeline_total = get("pipeline")
-    if isinstance(pipeline_total, (int, float)):
-        print(f"Total pipeline           : {_format_duration(pipeline_total)}")
+def step3_ready(slug: str) -> bool:
+    return (TIMINGS_DIR / f"{slug}.csv").exists()
 
-    labels = [
-        ("step1_config", "Step 1 (Config)"),
-        ("step2_lyrics", "Step 2a (Lyrics)"),
-        ("step2_meta",   "Step 2b (Meta)"),
-        ("step2_mp3",    "Step 2c (MP3)"),
-        ("whisperx",     "WhisperX (timings)"),
-        ("step3_mix",    "Step 3 (Demucs Mix)"),
-        ("step5_gen",    "Step 5 (MP4 Gen)"),
-        ("step6_upload", "Step 6 (Upload)"),
-    ]
+def step4_ready(slug: str) -> bool:
+    for _ in OUTPUT_DIR.glob(f"{slug}*.mp4"):
+        return True
+    for _ in OUTPUT_DIR.glob(f"{slug}*.mkv"):
+        return True
+    return False
 
-    longest_label = None
-    longest_time: float = -1.0
+def compute_status(slug: str) -> Dict[int, str]:
+    return {
+        1: "READY" if step1_ready(slug) else "MISSING",
+        2: "READY" if step2_ready(slug) else "MISSING",
+        3: "READY" if step3_ready(slug) else "MISSING",
+        4: "READY" if step4_ready(slug) else "MISSING",
+        5: "READY",
+    }
 
-    for key, desc in labels:
-        v = TIMERS.get(key)
-        if v is None:
-            print(f"{desc:24}: (n/a)")
-            continue
-        note = None
-        if isinstance(v, tuple):
-            if isinstance(v[0], tuple):
-                val, note = v[0]
-            else:
-                val, note = v
-        else:
-            val = v
+def print_status(slug: str) -> None:
+    st = compute_status(slug)
+    log("STATUS", f"Pipeline status for '{slug}':", BOLD + WHITE)
+    print(f"  1 txt/mp3 : {st[1]}")
+    print(f"  2 stems   : {st[2]}")
+    print(f"  3 timing  : {st[3]}")
+    print(f"  4 mp4     : {st[4]}")
+    print(f"  5 upload  : {st[5]}")
+    print("")
 
-        if isinstance(val, (int, float)):
-            print(f"{desc:24}: {_format_duration(val)}", end="")
-            if note:
-                print(f"  [{note}]")
-            else:
-                print()
-            if desc.startswith("Step") or desc.startswith("WhisperX"):
-                if val > longest_time:
-                    longest_time = val
-                    longest_label = desc
-        else:
-            print(f"{desc:24}: {val}")
-    if longest_label is not None:
-        print(f"Longest component: {longest_label} ({longest_time:0.2f}s)")
-    print("=" * 55 + "\n")
-
-
-# ----------------------------------------------------------------------
-# RUN STEP HELPER (blocking, JSON on last line)
-# ----------------------------------------------------------------------
-def run_step(cmd, section):
+# ==========================================================
+# EXISTING SONG SELECTION (NO NEW SONG CREATION HERE)
+# ==========================================================
+def choose_existing_slug(existing_slugs: List[str]) -> str:
     """
-    Run a subprocess, stream its output with a step prefix, and try to parse
-    a JSON object printed by the child.
-
-    Supports both:
-      - single-line JSON: {"ok": true, ...}
-      - pretty multi-line JSON:
-        {
-          "ok": true,
-          ...
-        }
+    Existing-only selection (used when Step1 is NOT requested).
+    Optional filter text, then numeric choice. No 'new song' option here.
     """
-    cmd = [str(x) if x is not None else "" for x in cmd]
+    if not existing_slugs:
+        log("SLUG", "No existing songs found; Step1 is required to create a new one.", RED)
+        raise SystemExit(1)
 
-    log(section, f"START  → {' '.join(cmd)}", BLUE)
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    result_json = None
-    json_lines: list[str] = []
-    capturing = False
-    brace_depth = 0
-
-    for raw in proc.stdout:
-        line = raw.rstrip("\n")
-        print(f"[{section}] {line}")
-        stripped = line.strip()
-
-        # If we're already inside a JSON block, keep accumulating
-        if capturing:
-            json_lines.append(stripped)
-            brace_depth += stripped.count("{") - stripped.count("}")
-            if brace_depth <= 0:
-                capturing = False
-                try:
-                    merged = "\n".join(json_lines)
-                    result_json = json.loads(merged)
-                except Exception as e:
-                    print(f"[{section}] JSON parse error: {e}")
-                    result_json = None
-            continue
-
-        # Not currently capturing — see if this line starts JSON
-        if "{" in stripped:
-            idx = stripped.find("{")
-            possible_json = stripped[idx:]
-            if possible_json.startswith("{"):
-                json_lines = [possible_json]
-                capturing = True
-                brace_depth = possible_json.count("{") - possible_json.count("}")
-                # Single-line JSON
-                if brace_depth <= 0:
-                    capturing = False
-                    try:
-                        result_json = json.loads(possible_json)
-                    except Exception as e:
-                        print(f"[{section}] JSON parse error: {e}")
-                        result_json = None
-                continue
-
-    proc.wait()
-
-    if result_json is None:
-        print(f"[{section}] WARNING: No JSON captured from command (returncode={proc.returncode})")
-
-    return result_json, proc.returncode
-
-
-# ----------------------------------------------------------------------
-# ASYNC LAUNCH (for WhisperX step)
-# ----------------------------------------------------------------------
-def launch_async_step(cmd, section):
-    """
-    Launch a step asynchronously, stream its logs in a background thread,
-    and return the Popen process handle.
-    """
-    log(section, f"START (async) → {' '.join(cmd)}")
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    def _reader():
-        for line in proc.stdout:
-            print(f"{CYAN}[{section}]{RESET} {line.rstrip()}")
-        proc.stdout.close()
-
-    t = threading.Thread(target=_reader, daemon=True)
-    t.start()
-    return proc
-
-
-# ----------------------------------------------------------------------
-# FILE WAIT HELPER (for WhisperX CSV, etc.)
-# ----------------------------------------------------------------------
-def wait_for_file(path: Path, timeout: float = 900.0, poll: float = 1.0, label: str = "file"):
-    """
-    Wait for a file to appear, polling at `poll` seconds, up to `timeout` seconds.
-    Raises TimeoutError on failure.
-    """
-    start = time.time()
     while True:
-        if path.exists():
-            return
-        if time.time() - start > timeout:
-            raise TimeoutError(f"Timed out waiting for {label}: {path}")
-        time.sleep(poll)
+        print("")
+        log("SONGS", f"{len(existing_slugs)} existing song(s) available.", WHITE)
+        flt = input("Filter songs (optional; ENTER to list all): ").strip().lower()
 
+        if flt:
+            songs = [s for s in existing_slugs if flt in s.lower()]
+            if not songs:
+                log("SLUG", f"No songs match filter '{flt}'. Try again.", YELLOW)
+                continue
+        else:
+            songs = existing_slugs
 
-# ----------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------
-def build_arg_parser():
-    p = argparse.ArgumentParser(description="Karaoke Time pipeline master.")
-    p.add_argument("--slug", help="Slug (if known).")
-    p.add_argument("--query", help="Search query (if slug not provided).")
-    p.add_argument("--offset", type=float, default=None, help="Global offset for MP4.")
-    p.add_argument("--mode", help="Mix mode (e.g., vocals-100).")
-    p.add_argument("--language", help="Lyrics/ASR language (e.g., en, es).")
-    p.add_argument(
-        "--no-upload",
-        action="store_true",
-        help="Skip YouTube upload step.",
-    )
-    p.add_argument(
-        "--pass",
-        dest="passthrough",
-        nargs="*",
-        default=[],
-        help="Additional args to pass through to underlying scripts.",
-    )
-    return p
+        print("")
+        log("SONGS", "Matching songs:", CYAN)
+        for i, s in enumerate(songs, 1):
+            print(f"  {i:3d}) {s}")
+        print("")
+        choice = input(f"Choose 1–{len(songs)} (0=filter again, q=quit): ").strip().lower()
 
+        if choice == "q":
+            raise SystemExit(0)
+        if choice == "0":
+            continue
+        if choice.isdigit():
+            n = int(choice)
+            if 1 <= n <= len(songs):
+                slug = songs[n - 1]
+                log("SLUG", f"Using existing slug '{slug}'", GREEN)
+                return slug
 
-def main():
-    t_start("pipeline")
+        log("SLUG", "Invalid selection, please try again.", YELLOW)
 
-    parser = build_arg_parser()
-    args = parser.parse_args()
+# ==========================================================
+# STEP EXECUTION HELPERS
+# ==========================================================
+def run_subprocess(step: int, args: Sequence[str]) -> int:
+    cmd = [PYTHON_BIN] + list(args)
+    log(f"STEP{step}", " ".join(str(x) for x in cmd), GREEN)
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        log(f"STEP{step}", f"Exited {r.returncode}", RED)
+    return r.returncode
 
-    slug = args.slug
-    query = args.query
+def run_step1(current_slug: Optional[str]) -> Optional[str]:
+    """
+    Run 1_txt_mp3.py, then detect which slug was created/updated.
 
-    if not slug and not query:
-        # Interactive slug/query prompt
-        print(f"{BOLD}{CYAN}Enter slug or query for the song:{RESET}")
-        print("  - Leave blank to cancel")
-        entered = input("> ").strip()
-        if not entered:
-            log("Master", "No slug or query provided. Exiting.", YELLOW)
-            t_end("pipeline")
-            print_performance_summary()
-            sys.exit(1)
-        # For now, treat as query; slug will be inferred later.
-        query = entered
+    - If current_slug is already present after Step1, keep it.
+    - Else if exactly one new slug appeared, use it.
+    - Else ask user to choose from all slugs.
+    """
+    before = set(collect_existing_slugs())
+    rc = run_subprocess(1, [str(SCRIPTS_DIR / "1_txt_mp3.py")])
+    if rc != 0:
+        return None
 
-    log("Master", f"Pipeline starting for query: {query or slug}", CYAN)
+    after = set(collect_existing_slugs())
+    new = sorted(after - before)
 
-    # ------------------------------------------------------------------
-    # STEP 1 — CONFIG (Mixer/Mode Selector)
-    # ------------------------------------------------------------------
-    t_start("step1_config")
+    if current_slug and current_slug in after:
+        log("STEP1", f"Continuing with slug '{current_slug}'", GREEN)
+        return current_slug
 
-    cfg_json, rc = run_step(
-        ["python3", "scripts/1_config.py"],
-        "Config"
-    )
+    if len(new) == 1:
+        chosen = new[0]
+        log("STEP1", f"Detected new slug '{chosen}'", GREEN)
+        return chosen
 
-    if cfg_json is None:
-        log("Config", "Falling back to defaults", YELLOW)
-        cfg_json = {
-            "vocals": 100,
-            "bass": 100,
-            "guitar": 100,
-            "drums": 100,
-            "mode": args.mode or "vocals-100",
-            "language": args.language or "en",
-        }
+    candidates = sorted(after)
+    if not candidates:
+        log("STEP1", "No slugs found after Step1; cannot continue.", RED)
+        return None
 
-    selected_lang = args.language or cfg_json["language"]
-    selected_mode = args.mode or cfg_json["mode"]
+    print("")
+    log("STEP1", "Select which slug Step1 produced:", YELLOW)
+    for i, s in enumerate(candidates, 1):
+        print(f"  {i}) {s}")
+    print("")
 
-    t_end("step1_config")
-    log("Config", f"Selected config: {cfg_json}", GREEN)
+    while True:
+        c = input(f"Choose 1–{len(candidates)} (0=abort): ").strip()
+        if c == "0":
+            return None
+        if c.isdigit():
+            n = int(c)
+            if 1 <= n <= len(candidates):
+                return candidates[n - 1]
+        print("Invalid selection, try again.")
 
-    # Determine Demucs behavior
-    all_100 = (
-        cfg_json.get("vocals", 100) == 100 and
-        cfg_json.get("bass", 100) == 100 and
-        cfg_json.get("guitar", 100) == 100 and
-        cfg_json.get("drums", 100) == 100
-    )
+def run_step2(slug: str) -> None:
+    mp3_path = MP3_DIR / f"{slug}.mp3"
+    if not mp3_path.exists():
+        log("STEP2", f"Missing MP3 for slug '{slug}' at {mp3_path}", RED)
+        raise SystemExit(1)
+    run_subprocess(2, [str(SCRIPTS_DIR / "2_stems.py"), "--mp3", str(mp3_path)])
 
-    should_run_demucs = not all_100
-    log(
-        "Master",
-        f"Demucs decision: should_run_demucs={should_run_demucs} (auto-skipped)"
-        if not should_run_demucs
-        else f"Demucs decision: should_run_demucs={should_run_demucs}",
-        YELLOW if not should_run_demucs else GREEN,
-    )
+def run_step3(slug: str) -> None:
+    run_subprocess(3, [str(SCRIPTS_DIR / "3_timing.py"), "--slug", slug])
 
-    slug = args.slug
-    # ------------------------------------------------------------------
-    # STEP 2 — DOWNLOAD (lyrics, meta, mp3)
-    # ------------------------------------------------------------------
-    if not slug and query:
-        # First call: lyrics by query (also infers slug)
-        t_start("step2_lyrics")
-        lyrics_cmd = [
-            "python3",
-            "scripts/2_download.py",
-            "--task", "lyrics",
-            "--query", query,
-            "--language", selected_lang,
-        ]
-        lyrics_json, rc = run_step(lyrics_cmd, "Step2:Download")
-        t_end("step2_lyrics")
-
-        if not lyrics_json or not lyrics_json.get("ok"):
-            log_error("Master", f"Lyrics step failed: json={lyrics_json}, rc={rc}")
-            t_end("pipeline")
-            print_performance_summary()
-            sys.exit(1)
-
-        slug = lyrics_json.get("slug")
-
-    if not slug:
-        log_error("Master", "Slug could not be determined from lyrics step.")
-        t_end("pipeline")
-        print_performance_summary()
-        sys.exit(1)
-
-    log("Master", f"Slug detected: {slug}", GREEN)
-
-    # STEP 2b: META
-    t_start("step2_meta")
-    meta_cmd = [
-        "python3",
-        "scripts/2_download.py",
-        "--task", "meta",
-        "--slug", slug,
-    ]
-    if query:
-        meta_cmd.extend(["--query", query])
-    meta_json, rc = run_step(meta_cmd, "Step2:Download")
-    t_end("step2_meta")
-
-    if not meta_json or not meta_json.get("ok"):
-        log_error("Master", f"Metadata step failed: json={meta_json}, rc={rc}")
-        t_end("pipeline")
-        print_performance_summary()
-        sys.exit(1)
-
-    artist = meta_json.get("artist", "Unknown Artist")
-    title = meta_json.get("title", slug)
-    log("Master", f"Metadata received: {meta_json}", GREEN)
-
-    # STEP 2c: MP3
-    t_start("step2_mp3")
-    mp3_cmd = [
-        "python3",
-        "scripts/2_download.py",
-        "--task", "mp3",
-        "--slug", slug,
-    ]
-    mp3_json, rc = run_step(mp3_cmd, "Step2:Download")
-    t_end("step2_mp3")
-
-    if not mp3_json or not mp3_json.get("ok"):
-        log_error("Master", f"MP3 download step failed: json={mp3_json}, rc={rc}")
-        t_end("pipeline")
-        print_performance_summary()
-        sys.exit(1)
-
-    mp3_path = mp3_json.get("mp3_path")
-    if not mp3_path:
-        log_error("Master", "MP3 path missing from Step 2 JSON.")
-        t_end("pipeline")
-        print_performance_summary()
-        sys.exit(1)
-
-    log("Master", "MP3 downloaded.", GREEN)
-
-    # ------------------------------------------------------------------
-    # STEP 4 (LAUNCH EARLY) — MERGE (WhisperX) ASYNC
-    #    - Uses mp3s/<slug>.mp3 for alignment.
-    #    - Launched as soon as txt + mp3 exist (right after Step 2).
-    # ------------------------------------------------------------------
-    timings_csv_path = TIMINGS_DIR / f"{slug}.csv"
-    whisper_proc = None
-
-    t_start("whisperx")
-    whisper_cmd = [
-        "python3",
-        "scripts/4_merge.py",
-        "--slug", slug,
-        "--language", selected_lang,
-    ]
-    whisper_proc = launch_async_step(whisper_cmd, "Step4:Merge")
-
-    # ------------------------------------------------------------------
-    # STEP 3 — MIX (Demucs), OPTIONAL
-    # ------------------------------------------------------------------
-    if should_run_demucs:
-        t_start("step3_mix")
-        mix_json, rc = run_step(
-            [
-                "python3", "scripts/3_mix.py",
-                "--slug", slug,
-                "--mode", selected_mode,
-            ],
-            "Step3:Mix"
-        )
-        t_end("step3_mix")
-        if not mix_json or not mix_json.get("ok"):
-            log("Master", f"Mixing failed! json={mix_json}, rc={rc}", RED)
-            t_end("pipeline")
-            print_performance_summary()
-            sys.exit(1)
-    else:
-        log("Master", "Skipping Demucs mix (mp3-only mode).", YELLOW)
-        t_mark("step3_mix", "skipped")
-
-    # ------------------------------------------------------------------
-    # WAIT FOR WHISPERX TIMINGS CSV
-    # ------------------------------------------------------------------
+def prompt_for_offset() -> float:
+    print("")
+    log("OFFSET", "MP4 render timing offset", WHITE)
+    print("  Positive → lyrics later / delayed")
+    print("  Negative → lyrics earlier")
+    print("  Default = –1.50s")
+    print("")
+    raw = input("Offset seconds [default=-1.50]: ").strip()
+    if not raw:
+        return -1.50
     try:
-        log("Master", "Waiting for WhisperX timings CSV...", BLUE)
-        wait_for_file(timings_csv_path, timeout=3600, poll=1.0, label="timings CSV")
-        t_end("whisperx")
-        log("Master", f"WhisperX timings ready: {timings_csv_path}", GREEN)
-    except TimeoutError as e:
-        log("Master", str(e), RED)
-        if whisper_proc is not None:
-            rc = whisper_proc.poll()
-            log("Master", f"WhisperX process exit code: {rc}", RED)
-        t_end("pipeline")
-        print_performance_summary()
-        sys.exit(1)
+        return float(raw)
+    except Exception:
+        log("OFFSET", "Invalid input; using -1.50s", YELLOW)
+        return -1.50
 
-    # Optionally confirm WhisperX proc exit code
-    if whisper_proc is not None:
-        whisper_rc = whisper_proc.wait()
-        if whisper_rc != 0:
-            log("Master", f"WhisperX process exited with code {whisper_rc}", YELLOW)
+def run_step4(slug: str) -> None:
+    offset = prompt_for_offset()
+    run_subprocess(4, [str(SCRIPTS_DIR / "4_mp4.py"), "--slug", slug, "--offset", str(offset)])
 
-    # ------------------------------------------------------------------
-    # STEP 5 — GEN (mp4)
-    # ------------------------------------------------------------------
-    t_start("step5_gen")
+def run_step5(slug: str) -> None:
+    run_subprocess(5, [str(SCRIPTS_DIR / "5_upload.py"), "--slug", slug])
 
-    offset = args.offset if args.offset is not None else 0.0
-    base_filename = slug
-    gen_cmd = [
-        "python3",
-        "scripts/5_gen.py",
-        "--slug", base_filename,
-        "--offset", str(offset),
-    ]
-    if args.passthrough:
-        gen_cmd.extend(["--pass", *args.passthrough])
+# ==========================================================
+# MAIN
+# ==========================================================
+def normalize_steps(raw: str) -> List[int]:
+    raw = raw.strip()
+    if not raw or raw == "0":
+        return []
+    steps: List[int] = []
+    for ch in raw:
+        if ch.isdigit():
+            n = int(ch)
+            if 1 <= n <= 5 and n not in steps:
+                steps.append(n)
+    steps.sort()
+    return steps
 
-    gen_json, rc = run_step(gen_cmd, "Step5:Gen")
-    t_end("step5_gen")
+def main() -> None:
+    existing_slugs = collect_existing_slugs()
 
-    if not gen_json or not gen_json.get("ok"):
-        log("Master", f"MP4 generation failed! json={gen_json}, rc={rc}", RED)
-        t_end("pipeline")
-        print_performance_summary()
-        sys.exit(1)
+    print("")
+    log("MIXTERIOSO", "Welcome to Mixterioso", BOLD + BLUE)
+    print("")
+    log("SONGS", f"{len(existing_slugs)} existing song(s) detected.", WHITE)
+    print("")
+    print("Available Steps:")
+    print("  1) TXT/MP3      – Fetch lyrics + download MP3 (creates/updates slug)")
+    print("  2) STEMS        – Demucs stem extraction + mix")
+    print("  3) TIMING       – Manual lyric timing (curses)")
+    print("  4) MP4 RENDER   – Create karaoke video (offset applied here)")
+    print("  5) UPLOAD       – YouTube uploader")
+    print("")
+    raw = input("Select steps to run (e.g. 1345; 0=none): ").strip()
+    steps = normalize_steps(raw)
 
-    mp4_path = (
-        gen_json.get("file")
-        or gen_json.get("mp4")
-        or gen_json.get("mp4_path")
-    )
-    log("Master", f"MP4 generated at: {mp4_path}", GREEN)
-
-    # ------------------------------------------------------------------
-    # STEP 6 — UPLOAD (optional)
-    # ------------------------------------------------------------------
-    if args.no_upload:
-        log("Master", "Upload skipped (--no-upload).", YELLOW)
-        t_mark("step6_upload", "skipped")
-        t_end("pipeline")
-        print_performance_summary()
+    if not steps:
+        log("MAIN", "No steps selected. Exiting.", YELLOW)
         return
 
-    t_start("step6_upload")
-    upload_cmd = [
-        "python3",
-        "scripts/6_upload.py",
-        "--file", mp4_path,
-        "--slug", base_filename,
-        "--title", title,
-    ]
-    if args.passthrough:
-        upload_cmd.extend(["--pass", *args.passthrough])
+    log("MAIN", f"Running steps: {''.join(str(s) for s in steps)}", WHITE)
 
-    upload_json, rc = run_step(upload_cmd, "Step6:Upload")
-    t_end("step6_upload")
+    pipeline_slug: Optional[str] = None
 
-    if not upload_json or not upload_json.get("ok"):
-        log("Master", f"Upload step failed. json={upload_json}, rc={rc}", RED)
-        t_end("pipeline")
-        print_performance_summary()
-        sys.exit(1)
+    # If Step1 is NOT requested, we must choose an existing slug up front.
+    if 1 not in steps:
+        pipeline_slug = choose_existing_slug(existing_slugs)
+        print("")
+        print_status(pipeline_slug)
 
-    url = upload_json.get("watch_url", "<no-url>")
-    log("Master", f"YouTube upload complete → {url}", GREEN)
-    log("Master", "Pipeline complete", GREEN)
+    # Execute steps in order.
+    for step in steps:
+        if step == 1:
+            pipeline_slug = run_step1(pipeline_slug)
+            if not pipeline_slug:
+                log("MAIN", "Step1 failed or aborted; stopping.", RED)
+                return
+            print("")
+            print_status(pipeline_slug)
 
-    t_end("pipeline")
-    print_performance_summary()
+        elif step == 2:
+            if not pipeline_slug:
+                log("STEP2", "No slug available. Step1 or existing selection required.", RED)
+                return
+            run_step2(pipeline_slug)
 
+        elif step == 3:
+            if not pipeline_slug:
+                log("STEP3", "No slug available. Step1 or existing selection required.", RED)
+                return
+            run_step3(pipeline_slug)
+
+        elif step == 4:
+            if not pipeline_slug:
+                log("STEP4", "No slug available. Step1 or existing selection required.", RED)
+                return
+            run_step4(pipeline_slug)
+
+        elif step == 5:
+            if not pipeline_slug:
+                log("STEP5", "No slug available. Step1 or existing selection required.", RED)
+                return
+            run_step5(pipeline_slug)
+
+    log("MAIN", "Pipeline finished.", GREEN)
 
 if __name__ == "__main__":
     main()
