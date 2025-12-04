@@ -3,14 +3,11 @@
 4_mp4.py — Final MP4 renderer for Mixterioso
 
 - 1920x1080, black background
-- 3.5s title card using top/middle/bottom "bands":
-    [Title band]
-    [by/de band]
-    [Artist band]
+- 3.5s title card using top/middle/bottom "bands"
 - Manual-timing CSV (line_index,time_secs,text)
 - Current line in middle band
 - "Next: ..." preview in bottom band
-- Music-note rows (line_index < 0) shown as brief note pops
+- Music-note rows (line_index < 0) shown visually
 - --offset adjusts lyric timing (positive = later, negative = earlier)
 """
 
@@ -40,9 +37,9 @@ MIX_DIR  = PATHS["mixes"]
 OUT_DIR  = PATHS["output"]
 META_DIR = PATHS["meta"]
 
-TITLE_DURATION = 3.5  # seconds
-NOTE_DURATION  = 0.8  # length of music-note pops
-LAST_LINE_EXTRA = 4.0 # how long last line stays on screen
+TITLE_DURATION   = 3.5  # seconds
+NOTE_DURATION    = 0.8  # length of music-note pops
+LAST_LINE_EXTRA  = 4.0  # how long last line stays on screen
 
 
 # ─────────────────────────────────────────────
@@ -60,12 +57,13 @@ def sec_to_ass(t: float) -> str:
 
 def ass_escape(text: str) -> str:
     """Escape characters that annoy ASS."""
-    return (text
-            .replace("\\", r"\\")
+    return (
+        text.replace("\\", r"\\")
             .replace("{", r"\{")
             .replace("}", r"\}")
             .replace("\n", r"\N")
-            .strip())
+            .strip()
+    )
 
 
 # ─────────────────────────────────────────────
@@ -95,8 +93,8 @@ def load_timings(slug: str):
     Load timings CSV: line_index,time_secs,text
 
     Returns:
-        notes: list of (time_secs, text) where line_index < 0
-        lyrics: list of (time_secs, text) where line_index >= 0
+        notes:   list[(time_secs, text)] where line_index < 0
+        lyrics:  list[(time_secs, text)] where line_index >= 0
     """
     csv_path = TIM_DIR / f"{slug}.csv"
     if not csv_path.exists():
@@ -109,20 +107,18 @@ def load_timings(slug: str):
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         if not {"line_index", "time_secs", "text"} <= set(reader.fieldnames or []):
-            raise SystemExit(
-                "Timings CSV must have header: line_index,time_secs,text"
-            )
+            raise SystemExit("Timings CSV must have header: line_index,time_secs,text")
 
         for row in reader:
             try:
                 idx = int(row["line_index"])
             except ValueError:
-                # treat as non-lyric "note"
                 idx = -1
             try:
                 t = float(row["time_secs"])
             except ValueError:
                 continue
+
             txt = (row.get("text") or "").strip()
             if not txt:
                 continue
@@ -133,12 +129,10 @@ def load_timings(slug: str):
                 lyrics.append((t, txt))
 
     if not lyrics:
-        raise SystemExit("No lyric rows (line_index >= 0) found in timings CSV.")
+        raise SystemExit("No lyric rows found with line_index >= 0")
 
-    # Sort by time just in case
     notes.sort(key=lambda x: x[0])
     lyrics.sort(key=lambda x: x[0])
-
     return notes, lyrics
 
 
@@ -159,6 +153,7 @@ def build_ass(slug: str,
       - Current line in middle band
       - Next line preview in bottom band
     """
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     ass_path = OUT_DIR / f"{slug}.ass"
 
     # Styles tuned for "band" layout on 1920x1080
@@ -187,8 +182,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     events = []
 
     # Title card (fixed time 0–TITLE_DURATION)
-    top_txt = ass_escape(title)
-    bot_txt = ass_escape(artist)
+    top_txt  = ass_escape(title)
+    bot_txt  = ass_escape(artist)
     conn_txt = ass_escape(connector)
 
     start_tc = sec_to_ass(0.0)
@@ -236,7 +231,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f"Dialogue: 0,{s},{e},Current,,0000,0000,0000,,{cur_txt}"
         )
 
-        # Next preview (if there is a next line)
+        # Next preview
         if i + 1 < len(lyrics):
             next_txt = ass_escape(texts[i + 1])
             events.append(
@@ -249,6 +244,76 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 # ─────────────────────────────────────────────
+# Output filename resolution (simple)
+# ─────────────────────────────────────────────
+def choose_output_path(slug: str) -> Path:
+    """
+    Decide which MP4 path to use.
+
+    - If <slug>.mp4 does not exist → use it directly.
+    - If it exists → prompt:
+        1) overwrite
+        2) use <slug>_new.mp4
+        3) enter custom filename (no extension)
+        4) cancel
+    """
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    default_path = OUT_DIR / f"{slug}.mp4"
+
+    if not default_path.exists():
+        return default_path
+
+    while True:
+        print()
+        print(f"Output file already exists: {default_path.name}")
+        print("")
+        print("Choose:")
+        print("  1) Overwrite existing file")
+        print("  2) Save as '<slug>_new.mp4'")
+        print("  3) Enter custom filename (no extension)")
+        print("  4) Cancel MP4 render")
+        try:
+            choice = input("Choice [1-4]: ").strip()
+        except EOFError:
+            choice = "4"
+
+        if choice == "1":
+            log("OUT", f"Overwriting existing file: {default_path}", YELLOW)
+            return default_path
+
+        if choice == "2":
+            alt = OUT_DIR / f"{slug}_new.mp4"
+            if alt.exists():
+                print(f"File '{alt.name}' already exists. Choose 1, 3, or 4.")
+                continue
+            log("OUT", f"Using alternate filename: {alt.name}", CYAN)
+            return alt
+
+        if choice == "3":
+            try:
+                raw = input("Enter custom filename (no extension): ").strip()
+            except EOFError:
+                raw = ""
+            if not raw:
+                print("Custom filename cannot be empty.")
+                continue
+            # Very light sanitization
+            raw = raw.replace(" ", "_").replace("/", "_").replace("\\", "_")
+            custom = OUT_DIR / f"{raw}.mp4"
+            if custom.exists():
+                print(f"File '{custom.name}' already exists. Choose 1, 2, or 4.")
+                continue
+            log("OUT", f"Using custom filename: {custom.name}", CYAN)
+            return custom
+
+        if choice == "4":
+            log("ABORT", "User cancelled MP4 render (filename conflict).", YELLOW)
+            raise SystemExit(0)
+
+        print("Invalid choice. Please select 1–4.")
+
+
+# ─────────────────────────────────────────────
 # ffmpeg assembly
 # ─────────────────────────────────────────────
 def render_mp4(slug: str, offset: float, connector: str):
@@ -256,8 +321,7 @@ def render_mp4(slug: str, offset: float, connector: str):
     Final render:
       - color black 1920x1080 video
       - audio from mixes/<slug>.wav
-      - draw subtle "bands" via ASS positioning (and optional boxes later)
-      - overlay ASS (title card + lyrics)
+      - overlay ASS (title card + lyrics) via -vf ass=...
     """
     mix_wav = MIX_DIR / f"{slug}.wav"
     if not mix_wav.exists():
@@ -271,11 +335,8 @@ def render_mp4(slug: str, offset: float, connector: str):
     # Build ASS overlay
     ass_path = build_ass(slug, artist, title, connector, offset, notes, lyrics)
 
-    out_path = OUT_DIR / f"{slug}.mp4"
-
-    # We let audio drive duration via -shortest
-    # Video: black background; overlay subtitles via ASS
-    filter_complex = f"subtitles={ass_path}"
+    # Decide output file
+    out_path = choose_output_path(slug)
 
     cmd = [
         "ffmpeg",
@@ -283,7 +344,7 @@ def render_mp4(slug: str, offset: float, connector: str):
         "-f", "lavfi",
         "-i", "color=c=black:size=1920x1080",
         "-i", str(mix_wav),
-        "-filter_complex", filter_complex,
+        "-vf", f"ass={ass_path}",
         "-map", "0:v",
         "-map", "1:a",
         "-c:v", "libx264",
@@ -308,15 +369,13 @@ def parse_args(argv=None):
         description="Render final MP4 with title card + current/next lyrics."
     )
     p.add_argument("--slug", required=True, help="Song slug.")
-    # Default offset may come from env, but CLI wins
     env_offset = os.getenv("KARAOKE_OFFSET_SECS")
     default_offset = float(env_offset) if env_offset not in (None, "") else 0.0
     p.add_argument(
         "--offset",
         type=float,
         default=default_offset,
-        help="Timing offset for lyrics in seconds "
-             "(+ = later text, - = earlier text).",
+        help="Timing offset for lyrics in seconds (+ = later text, - = earlier text).",
     )
     return p.parse_args(argv)
 
@@ -324,32 +383,10 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
     slug = slugify(args.slug)
+    offset = float(args.offset)
 
-    # Offset confirmation
-    print()
-    print(f"Current lyrics offset: {args.offset:+.3f} seconds.")
-    print("  Positive offset = lyrics appear later (delay the text).")
-    print("  Negative offset = lyrics appear earlier (advance the text).")
-    try:
-        keep = input("Use this offset value? [Y/n]: ").strip().lower()
-    except EOFError:
-        keep = "y"
-
-    offset = args.offset
-    if keep in ("n", "no"):
-        try:
-            raw = input("Enter new offset in seconds (e.g. -1.50 for earlier): ").strip()
-        except EOFError:
-            raw = ""
-        if raw:
-            try:
-                offset = float(raw)
-            except ValueError:
-                log("OFFSET", f"Invalid number '{raw}', keeping {args.offset:+.3f}s.", YELLOW)
-                offset = args.offset
-        log("OFFSET", f"Using offset {offset:+.3f}s", CYAN)
-    else:
-        log("OFFSET", f"Using offset {offset:+.3f}s", CYAN)
+    # Offset is already chosen/confirmed in 0_master.py or via CLI.
+    log("OFFSET", f"Using offset {offset:+.3f}s (from CLI/0_master.py).", CYAN)
 
     # Language choice for connector
     print()
@@ -371,7 +408,7 @@ def main(argv=None):
         return
 
     render_mp4(slug, offset, connector)
-    log("DONE", f"MP4 ready for upload: {OUT_DIR / f'{slug}.mp4'}", GREEN)
+    log("DONE", f"MP4 ready in: {OUT_DIR}", GREEN)
 
 
 if __name__ == "__main__":
