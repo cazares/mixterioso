@@ -590,50 +590,29 @@ def build_ass(
     log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
     return ass_path
 
-
-def choose_audio(slug: str, profile: str) -> Path:
+def choose_audio(slug: str) -> Path:
     """
-    Choose the correct audio for MP4 rendering.
-
-    NEW RULES:
-    - Profile "lyrics" always uses the original mp3.
-    - All other profiles MUST have a mixed WAV present.
-      If the WAV is missing, DO NOT FALL BACK to mp3.
-      Instead, error clearly so you never silently lose your mix.
+    Always use mixes/<slug>.wav if it exists.
+    If WAV is missing but mixes/<slug>.mp3 exists, use that.
+    Never fall back to the original mp3 again.
     """
-    mix_wav = MIXES_DIR / f"{slug}_{profile}.wav"
-    mix_mp3 = MIXES_DIR / f"{slug}_{profile}.mp3"
-    mp3_path = MP3_DIR / f"{slug}.mp3"
+    mix_wav = MIXES_DIR / f"{slug}.wav"
+    mix_mp3 = MIXES_DIR / f"{slug}.mp3"
 
-    # Lyrics profile = always original mp3.
-    if profile == "lyrics":
-        if not mp3_path.exists():
-            print(f"[AUDIO-ERROR] Original mp3 not found for slug={slug}: {mp3_path}")
-            sys.exit(1)
-        print(f"[AUDIO] Using original mp3 for profile=lyrics: {mp3_path}")
-        return mp3_path
-
-    # === NEW STRICT BEHAVIOR ===
-    # Mixed WAV required for ALL non-lyrics profiles.
     if mix_wav.exists():
-        print(f"[AUDIO] Using mixed WAV for profile={profile}: {mix_wav}")
+        print(f"[AUDIO] Using mixed WAV: {mix_wav}")
         return mix_wav
 
-    # If user mixed to MP3 instead of WAV and it's present:
     if mix_mp3.exists():
-        print(f"[AUDIO] Using mixed MP3 for profile={profile}: {mix_mp3}")
+        print(f"[AUDIO] Using mixed MP3: {mix_mp3}")
         return mix_mp3
 
-    # WAV missing → HARD FAILURE (no more silent fallback)
     print(
-        f"\n[AUDIO-ERROR] No mixed WAV found for slug={slug}, profile={profile}.\n"
-        f"Expected file:\n"
-        f"   {mix_wav}\n\n"
-        f"To fix:\n"
-        f"  • Run 2_stems.py with --mix-ui-only to create the mix config\n"
-        f"  • Then run 2_stems.py normally to generate the mixed WAV\n"
-        f"  • Verify the file exists in: mixes/\n\n"
-        f"Aborting MP4 generation to avoid using incorrect audio.\n"
+        f"\n[AUDIO-ERROR] No mixed audio found for slug={slug}.\n"
+        f"Expected one of:\n"
+        f"   {mix_wav}\n"
+        f"   {mix_mp3}\n\n"
+        f"Run 2_stems.py to generate the mix.\n"
     )
     sys.exit(1)
 
@@ -648,16 +627,9 @@ def open_path(path: Path) -> None:
     except Exception as e:
         log("OPEN", f"Failed to open {path}: {e}", YELLOW)
 
-
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Generate karaoke MP4 from slug/profile.")
+    p = argparse.ArgumentParser(description="Generate karaoke MP4 from slug.")
     p.add_argument("--slug", required=True, help="Song slug, e.g. californication")
-    p.add_argument(
-    "--profile",
-        default="lyrics",
-        choices=["lyrics", "karaoke", "car-karaoke", "no-bass", "car-bass-karaoke"],
-        help="Mix profile name (default: lyrics)",
-    )
     p.add_argument(
         "--font-size",
         type=int,
@@ -677,11 +649,9 @@ def parse_args(argv=None):
     )
     return p.parse_args(argv)
 
-
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
     slug = slugify(args.slug)
-    profile = args.profile
 
     default_font_size = DEFAULT_UI_FONT_SIZE
     font_size_value = args.font_size
@@ -724,9 +694,10 @@ def main(argv=None):
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    log("MP4GEN", f"Slug={slug}, profile={profile}", CYAN)
+    log("MP4GEN", f"Slug={slug}", CYAN)
+    audio_path = choose_audio(slug)
+    out_mp4 = OUTPUT_DIR / f"{slug}.mp4"
 
-    audio_path = choose_audio(slug, profile)
     audio_duration = probe_audio_duration(audio_path)
     if audio_duration <= 0:
         log("DUR", f"Audio duration unknown or zero for {audio_path}", YELLOW)
@@ -738,8 +709,6 @@ def main(argv=None):
     ass_path = build_ass(
         slug, artist, title, timings, audio_duration, args.font_name, ass_font_size
     )
-
-    out_mp4 = OUTPUT_DIR / f"{slug}_{profile}.mp4"
 
     cmd = [
         "ffmpeg",

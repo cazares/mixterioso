@@ -1,74 +1,182 @@
-📀 Karaoke Pipeline README
+# 📀 Mixterioso Karaoke Pipeline — README (Dec-4 LKGV)
 
-Welcome to the manual-first, ultra-optimized karaoke creation pipeline. It runs from raw video download to timestamped subtitles to a full MP4 export — human-guided and bulletproof.
+A fast, manual-first, precision-controlled karaoke creation pipeline. Designed for full human control, zero AI drift, clean visuals, and stable re-runs.
 
-🗺️ Pipeline Overview
+This pipeline takes a song from metadata → audio download → stem remix → lyric timing → MP4 render → YouTube upload using clean modular scripts.
 
-| Step | Script            | Purpose                                    |
-|------|-------------------|--------------------------------------------|
-| 1    | `1_download.py`   | Download audio and lyrics (if missing)     |
-| 2    | `2_mix.py`        | Display audio stem UI and optionally split |
-| 3    | `3_time.py`       | Manually timestamp each lyrics line        |
-| 4    | `4_calibrate.py`  | Adjust A/V sync interactively              |
-| 5    | `5_gen_mp4.py`    | Generate final karaoke-style MP4           |
+---
 
-Everything is orchestrated by `0_master.py`, which can auto-run all steps.
+# 🗺️ Pipeline Overview
 
-🚀 Quick Start
+| Step | Script            | Purpose |
+|------|-------------------|---------|
+| 0    | `0_master.py`     | Orchestrator: runs Steps 1–5 interactively |
+| 1    | `1_txt_mp3.py`    | Fetch artist/title → lyrics → MP3 source |
+| 2    | `2_stems.py`      | Demucs separation + custom mix → `mixes/<slug>.wav` |
+| 3    | `3_timing.py`     | Manual timestamping (curses UI) |
+| 4    | `4_mp4.py`        | Render final MP4 with karaoke visuals |
+| 5    | `5_upload.py`     | Upload to YouTube with title builder + thumbnail |
 
+Everything is powered by `mix_utils.py`, which defines paths, logging, and safety helpers.
+
+---
+
+# 🚀 Quick Start
+
+### Run the full pipeline
 ```bash
-# Run the full pipeline
-python 0_master.py "Jerry Was a Race Car Driver"
-
-# OR run steps manually:
-python 1_download.py "Jerry Was a Race Car Driver"
-python 2_mix.py jerry_was_a_race_car_driver
-python 3_time.py jerry_was_a_race_car_driver
-python 4_calibrate.py jerry_was_a_race_car_driver [start_sec] [end_sec]
-python 5_gen_mp4.py jerry_was_a_race_car_driver
+python3 scripts/0_master.py
 ```
 
-⚙️ Config + Behavior
+### Run steps manually
+```bash
+python3 scripts/1_txt_mp3.py --slug "my_song"
+python3 scripts/2_stems.py --slug my_song
+python3 scripts/3_timing.py --slug my_song
+python3 scripts/4_mp4.py --slug my_song --offset -1.5
+python3 scripts/5_upload.py --slug my_song
+```
 
-- ⏱️ Manual timing is fully interactive via `curses` (Steps 3 + 4).
-- 🧠 Offset is manually calibrated and saved as JSON.
-- 🧼 No rework: files are cached and reused unless you say otherwise.
-- 🎨 Console output is vivid and styled (via `rich`).
-- 🎛️ Tune it all via constants at the top of each script (e.g., font size, directories).
+---
 
-🔥 Hotkeys Reference
+# 🧩 Directory Structure
 
-`3_time.py`
-- Space: log timestamp
-- q: quit early
-
-`4_calibrate.py`
-- ← / →: adjust by ±0.1s
-- ↓ / ↑: adjust by ±0.5s
-- Space: play snippet
-- s: save offset
-- q: quit
-
-🧩 File Structure
-
-karaoke-time-by-miguel/
+```
+mixterioso/
+│
 ├── scripts/
 │   ├── 0_master.py
-│   ├── 1_download.py
-│   ├── 2_mix.py
-│   ├── 3_time.py
-│   ├── 4_calibrate.py
-│   └── 5_gen_mp4.py
+│   ├── 1_txt_mp3.py
+│   ├── 2_stems.py
+│   ├── 3_timing.py
+│   ├── 4_mp4.py
+│   ├── 5_upload.py
+│   └── mix_utils.py
+│
 ├── mp3s/
 ├── txts/
-├── timing/
-├── offsets/
-├── stems/
-├── meta/
-├── mp4s/
+├── separated/
+├── mixes/
+├── timings/
+├── output/
+└── meta/
+```
 
-❓ Common Issues
+---
 
-- Already downloaded? Files are skipped unless missing.
-- Wrong slug? Check filename slugs match across `mp3s/`, `txts/`, etc.
-- Audio won’t play? Ensure `afplay` (macOS) or swap to `ffplay`.
+# 🎚️ Step-by-Step Behavior
+
+## Step 1 — `1_txt_mp3.py`
+- Fetch lyrics + MP3
+- Create canonical slug
+- Write:
+  - `txts/<slug>.txt`
+  - `mp3s/<slug>.mp3`
+  - `meta/<slug>.json`
+
+## Step 2 — `2_stems.py`
+- Run Demucs
+- UI to remix stems
+- Always writes:
+```
+mixes/<slug>.wav
+```
+
+## Step 3 — `3_timing.py`  
+Manual curses timing UI.
+
+Hotkeys:
+- ENTER = stamp lyric
+- s = skip
+- p = pause/resume
+- e/r/t = rewind 1/3/5 sec
+- d/f/g = forward 1/3/5 sec
+- 1–= = insert notes
+- b = blank
+- q = save + quit
+
+Writes:
+```
+timings/<slug>.csv
+```
+
+## Step 4 — `4_mp4.py`
+- Classic karaoke visuals restored  
+- Divider + "Next:" preview  
+- Title card  
+- Fade transitions  
+- Offset applied during render (`--offset`)  
+
+Outputs:
+```
+output/<slug>.mp4
+output/<slug>.ass
+```
+
+Uses only:
+```
+mixes/<slug>.wav
+```
+
+## Step 5 — `5_upload.py`
+- OAuth login  
+- Title builder (presets + custom)  
+- Optional description  
+- Auto thumbnail (0.5s)  
+
+Outputs:
+```
+youtube_token.json
+output/<slug>.jpg
+```
+
+---
+
+# 🎨 Visual System (Step 4)
+
+Controlled via constants in `4_mp4.py`:
+
+- Band sizes
+- Font scaling
+- Colors + alpha
+- Fade durations
+- Divider geometry
+- Offset
+- Title behavior
+
+---
+
+# 🔧 Requirements
+
+- Python 3.10+
+- ffmpeg + ffprobe
+- afplay or ffplay
+- yt-dlp
+- demucs
+- Google API libraries
+
+---
+
+# ❓ Troubleshooting
+
+### Lyrics out of sync?
+```
+python3 scripts/4_mp4.py --slug song --offset -1.7
+```
+
+### Wrong audio?
+```
+rm mixes/song.wav
+python3 scripts/2_stems.py --slug song
+```
+
+### Upload error?
+Ensure:
+- OAuth token exists
+- `YOUTUBE_CLIENT_SECRETS_JSON` is set
+- Network connectivity
+
+---
+
+# 🧊 Checkpoint
+**Dec-4 Pipeline B-Profile LKGV** — authoritative version snapshot.
