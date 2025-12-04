@@ -1,1 +1,0 @@
-python3 -m demucs.separate --two-stems=drums mp3s/$1.mp3
