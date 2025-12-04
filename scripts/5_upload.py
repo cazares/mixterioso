@@ -51,6 +51,20 @@ load_dotenv()
 # Scope required for uploading videos
 YOUTUBE_UPLOAD_SCOPE = ["https://www.googleapis.com/auth/youtube.upload"]
 
+# Preset endings for titles
+SUFFIX_PRESETS = {
+    "1": "Karaoke",
+    "2": "Lyrics",
+    "3": "Letra",
+    "4": "No bass",
+    "5": "Car Karaoke – 35% reduced vocals",
+    "6": "Car Karaoke – 25% reduced vocals",
+    "7": "Car Karaoke – 15% reduced vocals",
+    "8": "Sin guitarrón",
+    "9": "No drums",
+    "10": "No guitar",
+}
+
 
 # ─────────────────────────────────────────────
 # Secrets / OAuth helpers
@@ -223,26 +237,20 @@ def load_meta_for_slug(slug: str) -> dict | None:
     return read_json(meta_path) or None
 
 
-def propose_title(slug: str, meta: dict | None) -> str:
+def auto_main_title(slug: str, meta: dict | None) -> str:
     """
-    Build a default YouTube title from meta if available.
-
-    Prefer:
-        "<artist> – <title> (Karaoke by Miguel)"
-
-    Fallback:
-        "<slug> (Karaoke by Miguel)"
+    Auto-generate the main (pre-parenthesis) title portion.
+    Prefer "Artist – Title" from meta; fall back to nicely formatted slug.
     """
     if meta:
-        artist = meta.get("artist") or ""
-        title  = meta.get("title") or ""
+        artist = (meta.get("artist") or "").strip()
+        title = (meta.get("title") or "").strip()
         if artist and title:
-            return f"{artist} – {title} (Karaoke by Miguel)"
+            return f"{artist} – {title}"
         if title:
-            return f"{title} (Karaoke by Miguel)"
-    # Fallback on slug
+            return title
     pretty = slug.replace("_", " ").title()
-    return f"{pretty} (Karaoke by Miguel)"
+    return pretty
 
 
 def build_tags(meta: dict | None) -> list[str]:
@@ -265,6 +273,140 @@ def build_tags(meta: dict | None) -> list[str]:
             seen.add(t)
             out.append(t)
     return out
+
+
+def choose_suffix_with_presets(main_title: str) -> str:
+    """
+    Show preset endings and let the user choose one.
+    Returns the chosen ending (without parentheses).
+    """
+    print()
+    print("Choose an ending (the text inside parentheses).")
+    print("Examples using your main title:")
+    for key in sorted(SUFFIX_PRESETS.keys(), key=lambda k: int(k)):
+        ending = SUFFIX_PRESETS[key]
+        example = f"{main_title} ({ending})"
+        print(f"  {key}) {ending}")
+        print(f"     e.g. {example}")
+    print("  99) Custom ending (you type it)")
+    print()
+
+    while True:
+        try:
+            choice = input("Enter choice [1-10 or 99]: ").strip()
+        except EOFError:
+            choice = ""
+        if choice in SUFFIX_PRESETS:
+            return SUFFIX_PRESETS[choice]
+        if choice == "99":
+            try:
+                custom = input("Enter your ending (no parentheses): ").strip()
+            except EOFError:
+                custom = ""
+            if not custom:
+                print("Ending cannot be empty. Try again.")
+                continue
+            return custom
+        print("Invalid choice. Please enter 1-10 or 99.")
+
+
+def choose_title(slug: str, meta: dict | None) -> str:
+    """
+    Full title builder with four modes:
+
+    1) Auto main title + preset ending
+    2) Auto main title + custom ending
+    3) Custom main title + preset ending
+    4) Full custom title (replace everything)
+    """
+    auto_main = auto_main_title(slug, meta)
+
+    while True:
+        print()
+        print("Title builder options (examples use your auto main title):")
+        print(f"  Auto main title: {auto_main}")
+        print()
+        print("  1) Auto main title + preset ending")
+        print(f"       e.g. {auto_main} (Karaoke)")
+        print("  2) Auto main title + custom ending")
+        print(f"       e.g. {auto_main} (My special version)")
+        print("  3) Custom main title + preset ending")
+        print("       e.g. Mujer Hilandera – Live Remix (Lyrics)")
+        print("  4) Full custom title (replace everything)")
+        print("       e.g. Mujer Hilandera – Karaoke Version – 2025 HD")
+        print()
+
+        try:
+            mode = input("Choose how to build the YouTube title [1-4]: ").strip()
+        except EOFError:
+            mode = ""
+
+        if mode not in ("1", "2", "3", "4"):
+            print("Invalid choice. Please enter 1, 2, 3, or 4.")
+            continue
+
+        # Mode 1: auto main + preset ending
+        if mode == "1":
+            main_title = auto_main
+            ending = choose_suffix_with_presets(main_title)
+            full_title = f"{main_title} ({ending})"
+
+        # Mode 2: auto main + custom ending (no presets)
+        elif mode == "2":
+            main_title = auto_main
+            print()
+            print(f"Auto main title: {main_title}")
+            print("Now type the ending yourself (no parentheses).")
+            print(f"Example final title: {main_title} (Your ending here)")
+            print()
+            try:
+                ending = input("Ending: ").strip()
+            except EOFError:
+                ending = ""
+            if not ending:
+                print("Ending cannot be empty. Let's start over.")
+                continue
+            full_title = f"{main_title} ({ending})"
+
+        # Mode 3: custom main title + preset ending
+        elif mode == "3":
+            print()
+            print("Type your main title (everything before parentheses).")
+            print(f"Example using presets later: My Song Title (Karaoke)")
+            print()
+            try:
+                main_title = input("Main title: ").strip()
+            except EOFError:
+                main_title = ""
+            if not main_title:
+                print("Main title cannot be empty. Let's start over.")
+                continue
+            ending = choose_suffix_with_presets(main_title)
+            full_title = f"{main_title} ({ending})"
+
+        # Mode 4: full custom title
+        else:  # mode == "4"
+            print()
+            print("Full custom title mode.")
+            print("You will type the entire YouTube title exactly as it should appear.")
+            print("Nothing will be added or changed automatically.")
+            print(f"Auto main title example (for reference only): {auto_main}")
+            print()
+            try:
+                full_title = input("Enter full YouTube title: ").strip()
+            except EOFError:
+                full_title = ""
+            if not full_title:
+                print("Title cannot be empty. Let's start over.")
+                continue
+
+        print()
+        print("Resulting title will be:")
+        print(f"  {full_title}")
+        print()
+        if ask_yes_no("Use this title?", default_yes=True):
+            return full_title
+        print("Okay, let's choose again.")
 
 
 # ─────────────────────────────────────────────
@@ -304,25 +446,8 @@ def main(argv=None):
     else:
         log("META", f"No meta JSON found for '{slug}'", YELLOW)
 
-    # Title proposal
-    default_title = propose_title(slug, meta)
-    print()
-    print("Proposed YouTube title:")
-    print(f"  {default_title}")
-    print()
-
-    if ask_yes_no("Use this title?", default_yes=True):
-        title = default_title
-    else:
-        try:
-            custom = input("Enter custom title: ").strip()
-        except EOFError:
-            custom = ""
-        if not custom:
-            log("TITLE", "No custom title entered; using default.", YELLOW)
-            title = default_title
-        else:
-            title = custom
+    # Title selection flow
+    title = choose_title(slug, meta)
 
     # Description: optional one-liner
     print()
