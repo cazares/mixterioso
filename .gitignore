@@ -44,3 +44,10 @@ mfa_env/pyvenv.cfg
 mfa_env/share/man/man1/ttx.1
 *.jpg
 *.uploaded
+!requirements.txt
+!devcontainer.json
+*.webm
+gentle*/
+mfa_env/
+!wavs/**
+!corpus/
