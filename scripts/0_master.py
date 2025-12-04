@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import sys
 from pathlib import Path
+import argparse
+import subprocess
 
 # ─────────────────────────────────────────────
 # Bootstrap import path
@@ -15,15 +17,13 @@ from mix_utils import (
     run_with_timer, PATHS,
 )
 
-import subprocess
-
-TXT_DIR = PATHS["txt"]
-MP3_DIR = PATHS["mp3"]
-MIX_DIR = PATHS["mixes"]
-TIM_DIR = PATHS["timings"]
-OUT_DIR = PATHS["output"]
+TXT_DIR  = PATHS["txt"]
+MP3_DIR  = PATHS["mp3"]
+MIX_DIR  = PATHS["mixes"]
+TIM_DIR  = PATHS["timings"]
+OUT_DIR  = PATHS["output"]
 META_DIR = PATHS["meta"]
-SCRIPTS = PATHS["scripts"]
+SCRIPTS  = PATHS["scripts"]
 
 # ─────────────────────────────────────────────
 # Step existence checks (1–4 only)
@@ -69,8 +69,12 @@ def run_step3(slug: str) -> float:
     ]
     return run_with_timer(cmd, "STEP3")
 
-def run_step4(slug: str) -> float:
+def run_step4(slug: str, offset: float) -> float:
     cmd = [sys.executable, str(SCRIPTS / "4_mp4.py"), "--slug", slug]
+    # Only pass offset flag if non-zero, to keep CLI minimal
+    if abs(offset) > 1e-6:
+        cmd += ["--offset", str(offset)]
+    log("STEP4", f"Invoking 4_mp4.py with offset {offset:+.3f}s", CYAN)
     return run_with_timer(cmd, "STEP4")
 
 def run_step5(slug: str) -> float:
@@ -124,9 +128,28 @@ def ask_steps(slug: str) -> list[int]:
     return steps
 
 # ─────────────────────────────────────────────
+# CLI parsing
+# ─────────────────────────────────────────────
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Mixterioso pipeline master (steps 1–5)."
+    )
+    p.add_argument(
+        "--offset",
+        type=float,
+        default=0.0,
+        help="Lyrics offset in seconds for step 4 "
+             "(positive = lyrics later, negative = earlier).",
+    )
+    return p.parse_args(argv or sys.argv[1:])
+
+# ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
-def main():
+def main(argv=None):
+    args = parse_args(argv)
+    offset = args.offset
+
     slug = pick_slug()
     steps = ask_steps(slug)
     if not steps:
@@ -143,7 +166,7 @@ def main():
         elif step == 3:
             run_step3(slug)
         elif step == 4:
-            run_step4(slug)
+            run_step4(slug, offset)
 
             # After rendering MP4 → offer to open folder and/or upload
             out_file = OUT_DIR / f"{slug}.mp4"

@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
 4_mp4.py — Final MP4 renderer for Mixterioso
-- Black background
-- Title card for 3.5s (fade-in/out)
-- English/Spanish connector: "by" / "de" (user-selected)
-- Lyric ASS overlay for rest of video
-- Keeps --offset for timing alignment
+Implements:
+- Title card (3.5s) with English/Spanish connector
+- Unified lyric + note timing logic (D1)
+- Notes keep distinct visual style but behave like lyrics
+- Notes DO NOT receive 'Next:' previews (N)
+- Offset prompt with explanation
+- Black background, 1920x1080
 """
 
 import sys
 import subprocess
-from pathlib import Path
 import argparse
 import time
+from pathlib import Path
+import json
 
 # ─────────────────────────────────────────────
 # Bootstrap import path for mix_utils
@@ -30,107 +33,189 @@ TXT_DIR  = PATHS["txt"]
 TIM_DIR  = PATHS["timings"]
 MIX_DIR  = PATHS["mixes"]
 OUT_DIR  = PATHS["output"]
+META_DIR = PATHS["meta"]
+
+TITLE_DURATION = 3.5
+FADE = 0.20  # fade in/out for title card (ms = ×1000 internally)
+
 
 # ─────────────────────────────────────────────
-# Build title card ASS file
+# Title Card ASS
 # ─────────────────────────────────────────────
 def create_title_ass(artist: str, title: str, connector: str, out_path: Path) -> None:
     """
-    Generates a 3.5s ASS overlay:
-
-        TITLE (large)
-        
+    Title card for first 3.5s:
+        TITLE
         by/de
-        
-        ARTIST (large)
-
-    Uses same font family as lyric overlays. Fade-in/out included.
+        ARTIST
     """
 
-    duration = 3.5
-    fade = 0.3  # fade in/out
+    fade_ms = int(FADE * 1000)
 
-    # Large text
-    # Matches your lyric styling: fontsize 120 * ASS scale typically 1.5
     ass = f"""[Script Info]
 ScriptType: v4.00+
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Title,Arial,110,&H00FFFFFF,&H00000000,&H00000000,&H64000000,-1,0,0,0,100,100,2,0,1,4,0,2,30,30,30,1
-Style: Subtitle,Arial,80,&H00FFFFFF,&H00000000,&H00000000,&H64000000,-1,0,0,0,100,100,2,0,1,4,0,2,30,30,30,1
+Style: Title,Arial,110,&H00FFFFFF,&H00000000,&H00000000,&H64000000,-1,0,0,0,100,100,3,0,1,5,0,2,40,40,40,1
+Style: Subtitle,Arial,80,&H00FFFFFF,&H00000000,&H00000000,&H64000000,-1,0,0,0,100,100,3,0,1,5,0,2,40,40,40,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-
-Dialogue: 0,0:00:00.00,0:00:{duration:.2f},Title,,0000,0000,0000,,{{\\fad({int(fade*1000)},{int(fade*1000)})}}{title.replace('{','[').replace('}',']')}
-
-Dialogue: 0,0:00:00.00,0:00:{duration:.2f},Subtitle,,0000,0000,0200,,{{\\fad({int(fade*1000)},{int(fade*1000)})}}{connector}
-
-Dialogue: 0,0:00:00.00,0:00:{duration:.2f},Title,,0000,0000,0400,,{{\\fad({int(fade*1000)},{int(fade*1000)})}}{artist.replace('{','[').replace('}',']')}
+Dialogue: 0,0:00:00.00,0:00:{TITLE_DURATION:.2f},Title,,0000,0000,0000,,{{\\fad({fade_ms},{fade_ms})}}{title}
+Dialogue: 0,0:00:00.00,0:00:{TITLE_DURATION:.2f},Subtitle,,0000,0000,0200,,{{\\fad({fade_ms},{fade_ms})}}{connector}
+Dialogue: 0,0:00:00.00,0:00:{TITLE_DURATION:.2f},Title,,0000,0000,0400,,{{\\fad({fade_ms},{fade_ms})}}{artist}
 """
-
     out_path.write_text(ass, encoding="utf-8")
     log("ASS", f"Created title card ASS: {out_path}", GREEN)
 
 
 # ─────────────────────────────────────────────
-# Build lyric ASS overlay (already created elsewhere)
+# Lyric + Notes ASS Builder (D1 + N)
 # ─────────────────────────────────────────────
-def load_lyric_ass(slug: str) -> Path:
+def build_lyrics_ass(slug: str, offset: float) -> Path:
     """
-    You already generate an ASS file inside 4_mp4 logic (lyrics + timeline).
-    For now we assume it's at: output/<slug>_lyrics.ass
-    If your existing pipeline builds ASS differently, you can adapt here.
+    Build unified ASS overlay for lyrics + note lines.
+    Notes (line_index < 0) use NoteStyle but behave EXACTLY like lyrics:
+        - Same interpolation
+        - Same fade
+        - Same offset
+        - NO 'Next:' preview (N)
     """
-    ass_path = OUT_DIR / f"{slug}_lyrics.ass"
-    if not ass_path.exists():
-        log("ASS", f"No lyric ASS found at {ass_path}", RED)
-        raise SystemExit("Missing lyric ASS.")
+
+    timings_csv = TIM_DIR / f"{slug}.csv"
+    txt_file    = TXT_DIR / f"{slug}.txt"
+    ass_path    = OUT_DIR / f"{slug}_lyrics.ass"
+
+    if not timings_csv.exists():
+        log("TIM", f"Missing timings CSV: {timings_csv}", RED)
+        raise SystemExit("Missing timings CSV.")
+
+    # Load lines
+    rows = []
+    for line in timings_csv.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.startswith("line_index"):
+            continue
+        parts = line.split(",", 2)
+        if len(parts) < 3:
+            continue
+        idx = int(parts[0])
+        t   = float(parts[1])
+        txt = parts[2].strip()
+        rows.append((idx, t, txt))
+
+    if not rows:
+        raise SystemExit("Timings CSV contains no rows.")
+
+    # Interpolate end times:
+    # last line gets +2.0s default
+    interpolated = []
+    for i, (idx, t, txt) in enumerate(rows):
+        if i < len(rows) - 1:
+            t_next = rows[i+1][1]
+            end = t_next - 0.10
+        else:
+            end = t + 2.0
+        interpolated.append((idx, t, end, txt))
+
+    # Offset shift
+    for i in range(len(interpolated)):
+        idx, t0, t1, txt = interpolated[i]
+        interpolated[i] = (idx, t0 + offset, t1 + offset, txt)
+
+    # ASS writing
+    fade_ms = 150
+
+    ass = []
+    ass.append("[Script Info]")
+    ass.append("ScriptType: v4.00+\n")
+
+    ass.append("[V4+ Styles]")
+    ass.append(
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour,"
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline,"
+        "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
+    )
+
+    # Lyrics
+    ass.append("Style: LyricTop,Arial,80,&H00FFFFFF,&H00000000,&H00000000,&H64000000,"
+               "-1,0,0,0,100,100,2,0,1,4,0,2,40,40,40,1")
+
+    # Notes distinct style
+    ass.append("Style: NoteStyle,Arial,80,&H00FFFF00,&H00000000,&H00000000,&H64000000,"
+               "-1,0,0,0,100,100,2,0,1,4,0,2,40,40,40,1")
+
+    # Preview style
+    ass.append("Style: NextStyle,Arial,60,&H0080FF80,&H00000000,&H00000000,&H64000000,"
+               "-1,0,0,0,100,100,2,0,1,4,0,2,40,40,40,1\n")
+
+    ass.append("[Events]")
+    ass.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
+
+    # Write lines
+    for i, (idx, t0, t1, txt) in enumerate(interpolated):
+        start = max(0.0, t0)
+        end   = max(start + 0.05, t1)
+
+        style = "NoteStyle" if idx < 0 else "LyricTop"
+        clean_txt = txt.replace("{", "[").replace("}", "]")
+        ass.append(
+            f"Dialogue: 0,{fmt_ts(start)},{fmt_ts(end)},{style},,0000,0000,0000,,"
+            f"{{\\fad({fade_ms},{fade_ms})}}{clean_txt}"
+        )
+
+        # NEXT PREVIEW — ONLY FOR NORMAL LINES
+        if idx >= 0:
+            if i < len(interpolated) - 1:
+                _, _, _, next_txt = interpolated[i+1]
+                next_clean = next_txt.replace("{", "[").replace("}", "]")
+                prev_start = max(0, start - 1.0)
+                prev_end   = start - 0.05
+                if prev_end > prev_start:
+                    ass.append(
+                        f"Dialogue: 1,{fmt_ts(prev_start)},{fmt_ts(prev_end)},NextStyle,,0000,0000,0000,,"
+                        f"{{\\fad({fade_ms},{fade_ms})}}Next: {next_clean}"
+                    )
+
+    ass_path.write_text("\n".join(ass), encoding="utf-8")
+    log("ASS", f"Wrote lyric/note ASS: {ass_path}", GREEN)
     return ass_path
 
 
 # ─────────────────────────────────────────────
-# ffmpeg assembly
+# Timecode helper
+# ─────────────────────────────────────────────
+def fmt_ts(t: float) -> str:
+    if t < 0:
+        t = 0
+    m, s = divmod(t, 60)
+    h, m = divmod(int(m), 60)
+    return f"{h:d}:{m:02d}:{s:06.3f}"
+
+
+# ─────────────────────────────────────────────
+# Rendering
 # ─────────────────────────────────────────────
 def render_mp4(slug: str, offset: float, connector: str, artist: str, title: str):
-    """
-    Final render:
-    - black background 1920x1080
-    - title card ASS (0–3.5s)
-    - lyric ASS (starting after 3.5s)
-    - audio = mixes/<slug>.wav
-    """
-
     mix_wav = MIX_DIR / f"{slug}.wav"
     if not mix_wav.exists():
-        log("AUDIO", f"Missing mix WAV: {mix_wav}", RED)
-        raise SystemExit("Missing WAV mix.")
+        log("AUDIO", f"Missing WAV: {mix_wav}", RED)
+        raise SystemExit("Missing mix WAV.")
 
-    # Build title card ASS
-    title_ass_path = OUT_DIR / f"{slug}_title.ass"
-    create_title_ass(artist, title, connector, title_ass_path)
+    title_ass = OUT_DIR / f"{slug}_title.ass"
+    create_title_ass(artist, title, connector, title_ass)
 
-    # lyric ASS (already built)
-    lyric_ass_path = load_lyric_ass(slug)
+    lyrics_ass = build_lyrics_ass(slug, offset)
 
-    # output final mp4
     out_path = OUT_DIR / f"{slug}.mp4"
 
-    # Offset for lyrics (shift ASS timing)
-    # Negative offset moves lyrics earlier, positive later
-    offset_filter = f"ass={lyric_ass_path}:original=1:delay={int(offset*1000)}"
-
-    # Compose filter:
-    # 1. main black background
-    # 2. title_card overlay for first 3.5s
-    # 3. lyric overlay
+    # Build filter
     filter_complex = (
-        f"[0:v]trim=0:3.5,setpts=PTS-STARTPTS[vbg0];"
-        f"[0:v]trim=3.5,setpts=PTS-STARTPTS[vbg1];"
-        f"[vbg0]ass={title_ass_path}[v0];"
-        f"[vbg1]{offset_filter}[v1];"
-        f"[v0][v1]concat=n=2:v=1:a=0[vout]"
+        f"[0:v]trim=0:{TITLE_DURATION},setpts=PTS-STARTPTS[v0];"
+        f"[0:v]trim={TITLE_DURATION},setpts=PTS-STARTPTS[v1];"
+        f"[v0]ass={title_ass}[vtc];"
+        f"[v1]ass={lyrics_ass}[vlyr];"
+        f"[vtc][vlyr]concat=n=2:v=1:a=0[vout]"
     )
 
     cmd = [
@@ -149,19 +234,18 @@ def render_mp4(slug: str, offset: float, connector: str, artist: str, title: str
         str(out_path)
     ]
 
-    log("FFMPEG", " ".join(cmd), CYAN)
+    log("FF", " ".join(cmd), CYAN)
     subprocess.run(cmd, check=True)
-
-    log("OUT", f"Wrote video: {out_path}", GREEN)
+    log("DONE", f"Wrote MP4: {out_path}", GREEN)
 
 
 # ─────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Render final MP4 with title card + lyrics.")
-    p.add_argument("--slug", required=True, help="Song slug.")
-    p.add_argument("--offset", type=float, default=0.0, help="Timing offset (seconds).")
+    p = argparse.ArgumentParser(description="Render final MP4.")
+    p.add_argument("--slug", required=True)
+    p.add_argument("--offset", type=float, default=0.0)
     return p.parse_args(argv)
 
 
@@ -169,46 +253,49 @@ def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
     slug = slugify(args.slug)
 
-    # Load meta for artist/title
-    meta_path = PATHS["meta"] / f"{slug}.json"
-    if not meta_path.exists():
-        log("META", f"Missing meta JSON: {meta_path}", RED)
-        raise SystemExit("Need meta JSON to extract artist/title.")
-
-    meta = meta_path.read_text(encoding="utf-8")
-    import json
-    meta = json.loads(meta)
+    # Load meta
+    meta_file = META_DIR / f"{slug}.json"
+    if not meta_file.exists():
+        log("META", f"Missing meta JSON: {meta_file}", RED)
+        raise SystemExit("Missing meta JSON.")
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
 
     artist = meta.get("artist", "").strip()
     title  = meta.get("title", "").strip()
-
     if not artist or not title:
         raise SystemExit("Meta missing artist/title.")
 
+    # Confirm offset
     print()
-    print("Select language for title card connector:")
+    print(f"Current lyrics offset: {args.offset:+.3f} seconds.")
+    print("  Positive = lyrics appear later (delayed).")
+    print("  Negative = lyrics appear earlier (advanced).")
+    if input("Use this offset? [Y/n]: ").strip().lower() == "n":
+        try:
+            new_off = float(input("Enter new offset (e.g. -1.50): ").strip())
+            args.offset = new_off
+            print(f"[OFFSET] Using offset {args.offset:+.3f}s")
+        except Exception:
+            print("Invalid offset, keeping original.")
+
+    # Connector
+    print()
+    print("Select title-card language:")
     print("  1) English: by")
     print("  2) Spanish: de")
     print("  3) Cancel")
-    try:
-        lang_choice = input("Choose [1-3]: ").strip()
-    except EOFError:
-        lang_choice = "1"
-
-    if lang_choice == "1":
-        connector = "by"
-    elif lang_choice == "2":
+    choice = input("Choose [1-3]: ").strip()
+    if choice == "2":
         connector = "de"
+    elif choice == "1":
+        connector = "by"
     else:
         log("ABORT", "User cancelled.", YELLOW)
         return
 
     render_mp4(slug, args.offset, connector, artist, title)
 
-    log("DONE", f"MP4 ready for upload: {OUT_DIR / f'{slug}.mp4'}", GREEN)
-
 
 if __name__ == "__main__":
     main()
-
 # end of 4_mp4.py
