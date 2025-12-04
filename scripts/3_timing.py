@@ -256,6 +256,7 @@ def draw_intro_box(stdscr, slug: str, COLOR_HDR, COLOR_GRAY, COLOR_HOT) -> None:
         ("p", "pause / resume audio"),
         ("1–=", "insert note event"),
         ("b", "insert BLANK event (\" \")"),
+        (">", "NO LYRICS: keep title card only"),
         ("q", "quit and save CSV"),
     ]
 
@@ -345,6 +346,7 @@ def draw_command_bar(stdscr, COLOR_HOT, COLOR_GRAY) -> None:
         ("[p]", True),     (" pause  ", False),
         ("[1–=]", True),   (" notes  ", False),
         ("[b]", True),     (" blank  ", False),
+        ("[>]", True),     (" no-lyrics  ", False),
         ("[q]", True),     (" quit", False),
     ]
 
@@ -604,6 +606,41 @@ def curses_main(stdscr, slug: str, lyrics: List[str], audio_path: Path) -> None:
             log_event(f"Blank event inserted at {ts:.3f}s")
             continue
 
+                # --- NEW FEATURE: NO-LYRICS HOTKEY ------------------------------
+        if ch_char == ">":
+            # Pause audio so they don’t miss anything
+            transport.toggle_pause()
+
+            # Leave curses mode to safely prompt in the terminal
+            curses.endwin()
+            print()
+            print("You pressed '>': This will produce a NO-LYRICS render.")
+            print("To confirm, type exactly:  no lyrics")
+            try:
+                confirm = input("Confirm: ").strip().lower()
+            except EOFError:
+                confirm = ""
+
+            if confirm == "no lyrics":
+                # Write an EMPTY CSV with only the header row.
+                out_path = TIMINGS_DIR / f"{slug}.csv"
+                with out_path.open("w", encoding="utf-8") as f:
+                    f.write("line_index,time_secs,text\n")
+                log("CSV", f"Wrote EMPTY no-lyrics CSV: {out_path}", GREEN)
+                return  # fully exit curses_main
+
+            else:
+                print("No-lyrics mode cancelled. Returning to timing UI...")
+                time.sleep(1)
+                # Resume curses
+                stdscr = curses.initscr()
+                curses.noecho()
+                curses.cbreak()
+                stdscr.keypad(True)
+                transport.toggle_pause()
+                continue
+        # -----------------------------------------------------------------
+
         # ENTER = stamp current lyric
         if ch in (10, 13):
             if current_idx < num_lines:
@@ -649,6 +686,9 @@ def main() -> None:
 
     try:
         curses.wrapper(curses_main, slug, lyrics, audio_path)
+        # If curses_main returns normally (including NO-LYRICS early exit),
+        # we simply stop here.
+        return
     except KeyboardInterrupt:
         log("ABORT", "Interrupted by user (Ctrl+C).", YELLOW)
 

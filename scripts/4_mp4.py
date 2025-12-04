@@ -324,52 +324,53 @@ def probe_audio_duration(path: Path) -> float:
 # =============================================================================
 def compute_default_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
     """
-    Default title card:
-      - If we have meta: 'Title' / 'by Artist'
-      - Else fallback to a prettified slug.
+    Default title card format:
+    
+        Title
+        (blank)
+        by
+        (blank)
+        Artist
     """
     pretty_slug = slug.replace("_", " ").title()
-    lines: list[str] = []
 
     if title and artist:
-        lines.append(title)
-        lines.append(f"by {artist}")
-    elif title:
-        lines.append(title)
-    elif artist:
-        lines.append(artist)
-    else:
-        lines.append(pretty_slug)
+        return [
+            title,
+            "",
+            "by",
+            "",
+            artist,
+        ]
 
-    return lines
+    if title:
+        return [title]
 
+    if artist:
+        return [artist]
+
+    return [pretty_slug]
 
 def prompt_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
     """
-    Per-render, non-persistent title card override.
-
-    - Shows what the current default card text would be.
-    - Lets the user keep it or edit it.
-    - Never mutates meta.json.
+    Interactively allow a temporary per-render override of the title card.
+    Never modifies meta.json.
     """
     default_lines = compute_default_title_card_lines(slug, artist, title)
 
-    # Non-interactive: just use the default.
     if not sys.stdin.isatty():
         log("TITLE", "Non-interactive mode; using default title card.", CYAN)
         return default_lines
 
     print()
-    print(f"{CYAN}Title card preview (before lyrics):{RESET}")
-    print("  This card shows during the black intro.")
-    print()
-    print("  Default card would say:")
+    print(f"{CYAN}Title Card Preview (before lyrics):{RESET}")
+    print("  Default card would say:\n")
     for line in default_lines:
         print(f"    {line}")
     print()
     print("Options:")
-    print("  1) Use this default title card")
-    print("  2) Edit the title card text")
+    print("  1) Use default")
+    print("  2) Edit title card text manually")
     print()
 
     while True:
@@ -379,14 +380,12 @@ def prompt_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
             choice = ""
 
         if choice in ("", "1"):
-            log("TITLE", "Using default title card.", GREEN)
             return default_lines
         if choice == "2":
             break
-        print("Please enter 1 or 2 (or just ENTER for 1).")
+        print("Please choose 1 or 2.")
 
-    # Edit flow
-    def prompt_line(label: str, current: str) -> str:
+    def edit_line(label: str, current: str) -> str:
         try:
             raw = input(f"{label} [{current}]: ").strip()
         except EOFError:
@@ -395,45 +394,39 @@ def prompt_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
 
     while True:
         print()
-        print("Edit your title card lines. ENTER keeps the suggested value.")
-        print("Line 3 is optional; leave blank to omit.")
+        print("Edit title card lines (ENTER keeps default).")
+        print("Leave empty lines if desired (blank lines preserved).")
         print()
 
-        base1 = default_lines[0] if default_lines else ""
-        base2 = default_lines[1] if len(default_lines) > 1 else ""
-        base3 = ""
+        # We preserve 5-line structure like the default
+        bases = default_lines + ["", "", "", "", ""]
+        line1 = edit_line("Line 1", bases[0])
+        line2 = edit_line("Line 2", bases[1])
+        line3 = edit_line("Line 3", bases[2])
+        line4 = edit_line("Line 4", bases[3])
+        line5 = edit_line("Line 5", bases[4])
 
-        line1 = prompt_line("Line 1", base1)
-        line2 = prompt_line("Line 2", base2)
-        line3 = prompt_line("Line 3", base3)
+        lines = [line1, line2, line3, line4, line5]
 
-        lines = [line1, line2, line3]
-
-        # Trim trailing empties.
-        while lines and not lines[-1]:
-            lines.pop()
-
+        # Do not allow fully-empty card
         if not any(l.strip() for l in lines):
-            print("Title card cannot be completely empty. Let's try again.")
+            print("Title card cannot be completely empty.")
             continue
 
         print()
-        print("Your title card will be:")
+        print("Final title card:")
         for l in lines:
             print(f"    {l}")
         print()
 
         try:
-            confirm = input("Use this title card? [Y/n]: ").strip().lower()
+            ok = input("Use this title card? [Y/n]: ").strip().lower()
         except EOFError:
-            confirm = "y"
+            ok = "y"
 
-        if confirm in ("", "y", "yes"):
+        if ok in ("", "y", "yes"):
             log("TITLE", "Using custom title card override.", GREEN)
             return lines
-
-        print("Okay, let's edit again.")
-
 
 def build_ass(
     slug: str,
@@ -445,64 +438,51 @@ def build_ass(
     font_size_script: int,
     title_card_lines: list[str] | None = None,
 ) -> Path:
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ass_path = OUTPUT_DIR / f"{slug}.ass"
 
-    if audio_duration <= 0.0 and timings:
-        audio_duration = max(t for t, _, _ in timings) + 5.0
     if audio_duration <= 0.0:
-        audio_duration = 5.0
+        if timings:
+            audio_duration = max(t for t, _, _ in timings) + 5
+        else:
+            audio_duration = 5.0
 
     playresx = VIDEO_WIDTH
     playresy = VIDEO_HEIGHT
 
-    # Geometry for top/bottom regions.
+    # Geometry
     top_band_height = int(playresy * TOP_BAND_FRACTION)
     y_divider_nominal = top_band_height
     bottom_band_height = playresy - y_divider_nominal
-
-    # Vertical positions for the top region.
     center_top = top_band_height // 2
     offset_px = int(top_band_height * VERTICAL_OFFSET_FRACTION)
     y_main_top = center_top + offset_px
-    y_title = y_main_top + int(top_band_height * TITLE_EXTRA_OFFSET_FRACTION)
-
-    x_center = playresx // 2
     y_center_full = playresy // 2
 
-    # Divider line position.
+    # Divider + next baseline
+    inner_bottom = max(
+        1,
+        bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX,
+    )
+    y_next = y_divider_nominal + NEXT_LYRIC_TOP_MARGIN_PX + inner_bottom // 2
     line_y = max(0, y_divider_nominal - DIVIDER_LINE_OFFSET_UP_PX)
 
-    # Next-lyric baseline position.
-    inner_bottom_box_height = max(
-        1, bottom_band_height - NEXT_LYRIC_TOP_MARGIN_PX - NEXT_LYRIC_BOTTOM_MARGIN_PX
-    )
-    y_next = (
-        y_divider_nominal
-        + NEXT_LYRIC_TOP_MARGIN_PX
-        + inner_bottom_box_height // 2
-    )
-
-    # Font sizes.
+    # Fonts
     preview_font = max(1, int(font_size_script * NEXT_LINE_FONT_SCALE))
     next_label_font = max(1, int(font_size_script * NEXT_LABEL_FONT_SCALE))
 
-    margin_v = 0
-
-    # Precomputed ASS color strings for top band.
+    # Colors for ASS
     top_primary_ass = f"&H{TOP_LYRIC_TEXT_ALPHA_HEX}{rgb_to_bgr(TOP_LYRIC_TEXT_COLOR_RGB)}"
-    top_back_ass = f"&H{TOP_BOX_BG_ALPHA_HEX}{rgb_to_bgr(TOP_BOX_BG_COLOR_RGB)}"
-    secondary_ass = "&H000000FF"  # unchanged
-    outline_ass = "&H00000000"    # black outline
-    back_ass = top_back_ass
+    secondary_ass = "&H000000FF"
+    outline_ass = "&H00000000"
+    back_ass = f"&H{TOP_BOX_BG_ALPHA_HEX}{rgb_to_bgr(TOP_BOX_BG_COLOR_RGB)}"
 
     header_lines = [
         "[Script Info]",
         "ScriptType: v4.00+",
-        "Collisions: Normal",
-        f"PlayResX: {playresx}",
-        f"PlayResY: {playresy}",
-        "ScaledBorderAndShadow: yes",
+        "PlayResX: {}".format(playresx),
+        "PlayResY: {}".format(playresy),
         "",
         "[V4+ Styles]",
         (
@@ -514,205 +494,150 @@ def build_ass(
         (
             f"Style: Default,{font_name},{font_size_script},"
             f"{top_primary_ass},{secondary_ass},{outline_ass},{back_ass},"
-            "0,0,0,0,100,100,0,0,1,4,0,5,50,50,"
-            f"{margin_v},0"
+            f"0,0,0,0,100,100,0,0,1,4,0,5,50,50,0,0"
         ),
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
-    def ass_escape(text: str) -> str:
-        text = text.replace("{", "(").replace("}", ")")
-        text = text.replace("\\N", "\\N")
-        text = text.replace("\n", r"\N")
-        return text
+    def ass_escape(text: str):
+        return text.replace("{", "(").replace("}", ")").replace("\n", r"\N")
 
     events = []
 
-    # Normalize timings and filter.
+    # Filter timings
     unified = []
-    for t, text, line_index in timings:
-        if t < 0 or (audio_duration and t > audio_duration):
-            continue
-        text = (text or "").strip()
-        if not text:
-            continue
-        unified.append((t, text, line_index))
+    for t, raw, idx in timings:
+        if 0 <= t <= audio_duration:
+            raw = (raw or "").strip()
+            if raw:
+                unified.append((t, raw, idx))
 
     unified.sort(key=lambda x: x[0])
-
     offset = LYRICS_OFFSET_SECS
 
-    # If no timings, just show centered title card.
-    if not unified:
-        if title_card_lines is not None and title_card_lines:
-            title_lines = title_card_lines
-        else:
-            title_lines = []
-            if title:
-                title_lines.append(title)
-            if artist:
-                title_lines.append(f"by {artist}")
-            if not title_lines:
-                title_lines = ["No lyrics"]
-
-        intro_block = "\\N".join(title_lines)
-        events.append(
-            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(0.0),
-                end=seconds_to_ass_time(audio_duration),
-                text=f"{{\\an5\\pos({x_center},{y_center_full})}}{ass_escape(intro_block)}",
-            )
-        )
-
-        ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
-        log("ASS", f"Wrote ASS subtitles (title only) to {ass_path}", GREEN)
-        return ass_path
-
-    first_lyric_time = max(0.0, unified[0][0] + offset)
-
-    # Intro title / artist card.
-    if title_card_lines is not None and title_card_lines:
+    # Title card lines
+    if title_card_lines:
         title_lines = title_card_lines
     else:
-        title_lines = []
-        if title:
-            title_lines.append(title)
-        if artist:
-            title_lines.append(f"by {artist}")
+        title_lines = compute_default_title_card_lines(slug, artist, title)
 
-    if title_lines:
-        if first_lyric_time > 0.1:
-            title_end = min(first_lyric_time, 5.0)
-        else:
-            title_end = first_lyric_time
-        intro_block = "\\N".join(title_lines)
+    intro_text = ass_escape("\\N".join(title_lines))
+
+    # CASE A — NO LYRICS AT ALL
+    if len(unified) == 0:
         events.append(
-            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(0.0),
-                end=seconds_to_ass_time(title_end),
-                text=f"{{\\an5\\pos({x_center},{y_center_full})}}{ass_escape(intro_block)}",
+            "Dialogue: 0,{},{},Default,,0,0,0,,{}".format(
+                seconds_to_ass_time(0.0),
+                seconds_to_ass_time(audio_duration),
+                f"{{\\an5\\pos({playresx//2},{playresy//2})}}{intro_text}",
             )
         )
+        ass_path.write_text("\n".join(header_lines + events), encoding="utf-8")
+        return ass_path
 
-    # Fade tag for lyrics only (main and next-line text).
+    # CASE B — NORMAL SONG WITH INTRO (first lyric ≥ 0)
+    first_lyric_start = max(0.0, unified[0][0] + offset)
+    title_end = min(5.0, first_lyric_start)
+
+    events.append(
+        "Dialogue: 0,{},{},Default,,0,0,0,,{}".format(
+            seconds_to_ass_time(0.0),
+            seconds_to_ass_time(title_end),
+            f"{{\\an5\\pos({playresx//2},{playresy//2})}}{intro_text}",
+        )
+    )
+
+    # Fade effects
     fade_tag_main = ""
     if FADE_IN_MS > 0 or FADE_OUT_MS > 0:
-        fade_tag_main = f"\\fad({int(FADE_IN_MS)},{int(FADE_OUT_MS)})"
+        fade_tag_main = f"\\fad({FADE_IN_MS},{FADE_OUT_MS})"
 
-    n = len(unified)
+    # Render lyrics + next preview
+    left = float(DIVIDER_LEFT_MARGIN_PX)
+    right = float(playresx - DIVIDER_RIGHT_MARGIN_PX)
+    divider_height = max(0.5, float(DIVIDER_HEIGHT_PX))
     next_color_bgr = rgb_to_bgr(GLOBAL_NEXT_COLOR_RGB)
     divider_color_bgr = rgb_to_bgr(DIVIDER_COLOR_RGB)
     next_label_color_bgr = rgb_to_bgr(NEXT_LABEL_COLOR_RGB)
 
-    divider_height = max(0.5, float(DIVIDER_HEIGHT_PX))
-    left_margin = float(DIVIDER_LEFT_MARGIN_PX)
-    right_margin = float(DIVIDER_RIGHT_MARGIN_PX)
-    x_left = left_margin
-    x_right = playresx - right_margin
-    if x_right <= x_left:
-        x_left = 0.0
-        x_right = float(playresx)
-
-    label_x = NEXT_LABEL_LEFT_MARGIN_PX
-    label_y = y_divider_nominal + NEXT_LABEL_TOP_MARGIN_PX
-
-    # Per-line events.
-    for i, (t, raw_text, _line_index) in enumerate(unified):
+    n = len(unified)
+    for i, (t, raw, _) in enumerate(unified):
         start = max(0.0, t + offset)
-        if i < n - 1:
-            end = max(start, unified[i + 1][0] + offset)
-        else:
-            end = audio_duration or (start + 5.0)
+        end = unified[i + 1][0] + offset if i < n - 1 else audio_duration
 
-        if end > audio_duration:
-            end = audio_duration
         if end <= start:
             continue
 
-        text_stripped = raw_text.strip()
+        text_stripped = raw.strip()
         music_only = is_music_only(text_stripped)
 
-        # Main lyric line (with fade).
-        main_text = ass_escape(text_stripped)
-        y_for_line = y_center_full if music_only else y_main_top
-        main_tag = f"{{\\an5\\pos({x_center},{y_for_line}){fade_tag_main}}}"
+        # MAIN LYRIC
+        y_line = y_center_full if music_only else y_main_top
         events.append(
-            "Dialogue: 1,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(start),
-                end=seconds_to_ass_time(end),
-                text=main_tag + main_text,
+            "Dialogue: 1,{},{},Default,,0,0,0,,{}".format(
+                seconds_to_ass_time(start),
+                seconds_to_ass_time(end),
+                f"{{\\an5\\pos({playresx//2},{y_line}){fade_tag_main}}}{ass_escape(text_stripped)}",
             )
         )
 
-        # Decide whether to show bottom UI (divider, label, next-lyric preview).
-        if i >= n - 1:
-            continue  # last line: no "Next:" UI at all
-
-        next_raw = unified[i + 1][1]
-        if not next_raw:
+        # Skip bottom UI cases
+        if i == n - 1:
+            continue
+        next_text = unified[i + 1][1]
+        if not next_text or music_only or is_music_only(next_text):
             continue
 
-        # Do not show next UI if current or next is "music only".
-        if music_only or is_music_only(next_raw):
-            continue
-
-        # Divider line (no fade).
-        divider_tag = (
+        # Divider
+        divider = (
             f"{{\\an7\\pos(0,{line_y})"
             f"\\1c&H{divider_color_bgr}&"
             f"\\1a&H{DIVIDER_ALPHA_HEX}&"
             f"\\bord0\\shad0\\p1}}"
-        )
-        divider_shape = (
-            f"m {x_left} 0 l {x_right} 0 "
-            f"l {x_right} {divider_height} l {x_left} {divider_height}{{\\p0}}"
+            f"m {left} 0 l {right} 0 l {right} {divider_height} l {left} {divider_height}{{\\p0}}"
         )
         events.append(
-            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(start),
-                end=seconds_to_ass_time(end),
-                text=divider_tag + divider_shape,
+            "Dialogue: 0,{},{},Default,,0,0,0,,{}".format(
+                seconds_to_ass_time(start),
+                seconds_to_ass_time(end),
+                divider,
             )
         )
 
-        # "Next:" label (no fade).
-        label_tag = (
-            f"{{\\an7\\pos({label_x},{label_y})"
-            f"\\fs{next_label_font}"
-            f"\\1c&H{next_label_color_bgr}&"
-            f"\\1a&H{NEXT_LABEL_ALPHA_HEX}&}}"
-        )
+        # Next: label
         events.append(
-            "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(start),
-                end=seconds_to_ass_time(end),
-                text=label_tag + "Next:",
+            "Dialogue: 0,{},{},Default,,0,0,0,,{}".format(
+                seconds_to_ass_time(start),
+                seconds_to_ass_time(end),
+                (
+                    f"{{\\an7\\pos({NEXT_LABEL_LEFT_MARGIN_PX},{line_y + NEXT_LABEL_TOP_MARGIN_PX})"
+                    f"\\fs{next_label_font}"
+                    f"\\1c&H{next_label_color_bgr}&"
+                    f"\\1a&H{NEXT_LABEL_ALPHA_HEX}&}}Next:"
+                ),
             )
         )
 
-        # Next-lyric preview text (with fade).
-        preview_text = ass_escape(next_raw)
-        preview_tag = (
-            f"{{\\an5\\pos({x_center},{y_next})"
+        # Preview line
+        preview = (
+            f"{{\\an5\\pos({playresx//2},{y_next})"
             f"\\fs{preview_font}"
             f"\\1c&H{next_color_bgr}&"
             f"\\1a&H{GLOBAL_NEXT_ALPHA_HEX}&"
-            f"{fade_tag_main}}}"
+            f"{fade_tag_main}}}{ass_escape(next_text)}"
         )
         events.append(
-            "Dialogue: 2,{start},{end},Default,,0,0,0,,{text}".format(
-                start=seconds_to_ass_time(start),
-                end=seconds_to_ass_time(end),
-                text=preview_tag + preview_text,
+            "Dialogue: 2,{},{},Default,,0,0,0,,{}".format(
+                seconds_to_ass_time(start),
+                seconds_to_ass_time(end),
+                preview,
             )
         )
 
-    ass_path.write_text("\n".join(header_lines + events) + "\n", encoding="utf-8")
-    log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
+    ass_path.write_text("\n".join(header_lines + events), encoding="utf-8")
     return ass_path
-
 
 def choose_audio(slug: str) -> Path:
     """
