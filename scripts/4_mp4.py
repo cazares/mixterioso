@@ -319,6 +319,122 @@ def probe_audio_duration(path: Path) -> float:
         return 0.0
 
 
+# =============================================================================
+# TITLE CARD OVERRIDE (INTERACTIVE)
+# =============================================================================
+def compute_default_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
+    """
+    Default title card:
+      - If we have meta: 'Title' / 'by Artist'
+      - Else fallback to a prettified slug.
+    """
+    pretty_slug = slug.replace("_", " ").title()
+    lines: list[str] = []
+
+    if title and artist:
+        lines.append(title)
+        lines.append(f"by {artist}")
+    elif title:
+        lines.append(title)
+    elif artist:
+        lines.append(artist)
+    else:
+        lines.append(pretty_slug)
+
+    return lines
+
+
+def prompt_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
+    """
+    Per-render, non-persistent title card override.
+
+    - Shows what the current default card text would be.
+    - Lets the user keep it or edit it.
+    - Never mutates meta.json.
+    """
+    default_lines = compute_default_title_card_lines(slug, artist, title)
+
+    # Non-interactive: just use the default.
+    if not sys.stdin.isatty():
+        log("TITLE", "Non-interactive mode; using default title card.", CYAN)
+        return default_lines
+
+    print()
+    print(f"{CYAN}Title card preview (before lyrics):{RESET}")
+    print("  This card shows during the black intro.")
+    print()
+    print("  Default card would say:")
+    for line in default_lines:
+        print(f"    {line}")
+    print()
+    print("Options:")
+    print("  1) Use this default title card")
+    print("  2) Edit the title card text")
+    print()
+
+    while True:
+        try:
+            choice = input("Choose [1/2, ENTER=1]: ").strip()
+        except EOFError:
+            choice = ""
+
+        if choice in ("", "1"):
+            log("TITLE", "Using default title card.", GREEN)
+            return default_lines
+        if choice == "2":
+            break
+        print("Please enter 1 or 2 (or just ENTER for 1).")
+
+    # Edit flow
+    def prompt_line(label: str, current: str) -> str:
+        try:
+            raw = input(f"{label} [{current}]: ").strip()
+        except EOFError:
+            raw = ""
+        return current if raw == "" else raw
+
+    while True:
+        print()
+        print("Edit your title card lines. ENTER keeps the suggested value.")
+        print("Line 3 is optional; leave blank to omit.")
+        print()
+
+        base1 = default_lines[0] if default_lines else ""
+        base2 = default_lines[1] if len(default_lines) > 1 else ""
+        base3 = ""
+
+        line1 = prompt_line("Line 1", base1)
+        line2 = prompt_line("Line 2", base2)
+        line3 = prompt_line("Line 3", base3)
+
+        lines = [line1, line2, line3]
+
+        # Trim trailing empties.
+        while lines and not lines[-1]:
+            lines.pop()
+
+        if not any(l.strip() for l in lines):
+            print("Title card cannot be completely empty. Let's try again.")
+            continue
+
+        print()
+        print("Your title card will be:")
+        for l in lines:
+            print(f"    {l}")
+        print()
+
+        try:
+            confirm = input("Use this title card? [Y/n]: ").strip().lower()
+        except EOFError:
+            confirm = "y"
+
+        if confirm in ("", "y", "yes"):
+            log("TITLE", "Using custom title card override.", GREEN)
+            return lines
+
+        print("Okay, let's edit again.")
+
+
 def build_ass(
     slug: str,
     artist: str,
@@ -327,6 +443,7 @@ def build_ass(
     audio_duration: float,
     font_name: str,
     font_size_script: int,
+    title_card_lines: list[str] | None = None,
 ) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ass_path = OUTPUT_DIR / f"{slug}.ass"
@@ -429,13 +546,16 @@ def build_ass(
 
     # If no timings, just show centered title card.
     if not unified:
-        title_lines = []
-        if title:
-            title_lines.append(title)
-        if artist:
-            title_lines.append(f"by {artist}")
-        if not title_lines:
-            title_lines = ["No lyrics"]
+        if title_card_lines is not None and title_card_lines:
+            title_lines = title_card_lines
+        else:
+            title_lines = []
+            if title:
+                title_lines.append(title)
+            if artist:
+                title_lines.append(f"by {artist}")
+            if not title_lines:
+                title_lines = ["No lyrics"]
 
         intro_block = "\\N".join(title_lines)
         events.append(
@@ -453,11 +573,14 @@ def build_ass(
     first_lyric_time = max(0.0, unified[0][0] + offset)
 
     # Intro title / artist card.
-    title_lines = []
-    if title:
-        title_lines.append(title)
-    if artist:
-        title_lines.append(f"by {artist}")
+    if title_card_lines is not None and title_card_lines:
+        title_lines = title_card_lines
+    else:
+        title_lines = []
+        if title:
+            title_lines.append(title)
+        if artist:
+            title_lines.append(f"by {artist}")
 
     if title_lines:
         if first_lyric_time > 0.1:
@@ -590,6 +713,7 @@ def build_ass(
     log("ASS", f"Wrote ASS subtitles to {ass_path}", GREEN)
     return ass_path
 
+
 def choose_audio(slug: str) -> Path:
     """
     Always use mixes/<slug>.wav if it exists.
@@ -616,6 +740,7 @@ def choose_audio(slug: str) -> Path:
     )
     sys.exit(1)
 
+
 def open_path(path: Path) -> None:
     try:
         if sys.platform == "darwin":
@@ -626,6 +751,7 @@ def open_path(path: Path) -> None:
             subprocess.run(["xdg-open", str(path)])
     except Exception as e:
         log("OPEN", f"Failed to open {path}: {e}", YELLOW)
+
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Generate karaoke MP4 from slug.")
@@ -648,6 +774,7 @@ def parse_args(argv=None):
         help="Offset in seconds",
     )
     return p.parse_args(argv)
+
 
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
@@ -706,8 +833,18 @@ def main(argv=None):
     timings = read_timings(slug)
     log("META", f'Artist="{artist}", Title="{title}", entries={len(timings)}', CYAN)
 
+    # Per-render title card override (does NOT touch meta.json).
+    title_card_lines = prompt_title_card_lines(slug, artist, title)
+
     ass_path = build_ass(
-        slug, artist, title, timings, audio_duration, args.font_name, ass_font_size
+        slug,
+        artist,
+        title,
+        timings,
+        audio_duration,
+        args.font_name,
+        ass_font_size,
+        title_card_lines,
     )
 
     cmd = [
