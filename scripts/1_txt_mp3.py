@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
 # ─────────────────────────────────────────────
 # Imports
 # ─────────────────────────────────────────────
+import argparse
 import json
 import os
 import subprocess
@@ -159,37 +160,40 @@ def youtube_download_mp3(artist: str, title: str, slug: str) -> None:
         raise SystemExit("yt-dlp audio download failed.")
 
 # ─────────────────────────────────────────────
-# ARTIST/TITLE PROMPTS
+# ARG PARSING
 # ─────────────────────────────────────────────
-def prompt_artist_title() -> tuple[str, str]:
+def parse_args() -> argparse.Namespace:
     """
-    Ask user explicitly for Artist and Title.
-    No inference, no automagic, no defaults.
+    Non-interactive interface for Step1.
+
+    0_master.py is responsible for:
+      - Prompting user for Artist and Title.
+      - Deriving the canonical slug from Title.
+      - Deciding whether to overwrite existing artifacts.
+    This script simply executes the txt/mp3 generation for the given inputs.
     """
-    print()
-    print("We need the Artist and Title.")
-    print("These fields drive BOTH lyrics (Musixmatch) and audio search (YouTube).")
-    print()
-
-    try:
-        artist = input("Artist: ").strip()
-    except EOFError:
-        artist = ""
-
-    try:
-        title = input("Title: ").strip()
-    except EOFError:
-        title = ""
-
-    if not artist or not title:
-        raise SystemExit("Artist and Title are required.")
-    return artist, title
+    parser = argparse.ArgumentParser(
+        description="Step1: Generate TXT + MP3 for a song (non-interactive)."
+    )
+    parser.add_argument("--artist", required=True, help="Artist name")
+    parser.add_argument("--title", required=True, help="Song title")
+    parser.add_argument("--slug", required=True, help="Canonical slug (from title)")
+    return parser.parse_args()
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
     log("MODE", "txt + mp3 generation", CYAN)
+
+    args = parse_args()
+    artist = args.artist.strip()
+    title = args.title.strip()
+    slug = args.slug.strip()
+
+    if not artist or not title or not slug:
+        log("INPUT", "Artist, Title, and Slug are required.", RED)
+        raise SystemExit(1)
 
     # Load API key
     mm_api_key = load_mm_env()
@@ -198,9 +202,6 @@ def main():
     TXT_DIR.mkdir(parents=True, exist_ok=True)
     MP3_DIR.mkdir(parents=True, exist_ok=True)
     META_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Prompt directly
-    artist, title = prompt_artist_title()
 
     # Musixmatch metadata
     track_info = musixmatch_search_track(artist, title, mm_api_key)
@@ -211,8 +212,7 @@ def main():
     # Lyrics
     lyrics_text = musixmatch_fetch_lyrics(track_id, mm_api_key)
 
-    # Slug from title only
-    slug = slugify(mm_title)
+    # Slug is provided by 0_master (from Title); do NOT change it here.
     log("SLUG", f'Slug: "{slug}"', GREEN)
 
     # Paths
@@ -236,6 +236,8 @@ def main():
         "lyrics_source": "musixmatch",
         "audio_source": "yt-dlp",
         "youtube_query": f"{mm_artist} {mm_title}",
+        "input_artist": artist,
+        "input_title": title,
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     log("META", f"Wrote: {meta_path}", GREEN)

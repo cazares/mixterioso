@@ -1,8 +1,27 @@
 #!/usr/bin/env python3
+"""
+3_timing.py — Curses-based manual lyric timing tool (NO AI)
+
+Key behaviors:
+- STRICT slug mode: if --slug is provided, never prompt for slug.
+- AUTO playback: plays the original MP3 for the slug (never WAV).
+- Global clock: timestamps are song-time seconds, with seek-aware transport.
+- Rewind: 'r' rewinds by N seconds (default 5s; adjust with +/-).
+- Fast-forward: 'f' jumps forward by N seconds.
+- Pause/Resume: 'p' toggles pause for both timing and audio.
+- Note insertion: keys 1–= insert musical-note “lyrics” as normal lines.
+- UI: all text in console yellow.
+- Output: timings/<slug>.csv with header: line_index,time_secs,text
+"""
+
 import sys
-import csv
+import argparse
+import curses
 import time
+import subprocess
+import shutil
 from pathlib import Path
+from typing import List, Tuple, Optional
 
 # ─────────────────────────────────────────────
 # Bootstrap import path
@@ -11,199 +30,446 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# ─────────────────────────────────────────────
-# Imports
-# ─────────────────────────────────────────────
 from mix_utils import (
-    log, RESET, CYAN, GREEN, YELLOW, RED,
-    slugify, PATHS, ask_yes_no, ffprobe_duration,
+    log, CYAN, GREEN, YELLOW, RED,
+    PATHS,
 )
 
-TXT_DIR     = PATHS["txt"]
-MP3_DIR     = PATHS["mp3"]
+TXT_DIR = PATHS["txt"]
 TIMINGS_DIR = PATHS["timings"]
+MP3_DIR = PATHS["mp3"]
+
+# ─────────────────────────────────────────────
+# Arg parsing
+# ─────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Curses-based manual lyric timing tool.")
+    p.add_argument("--slug", help="Song slug (required for non-interactive use)")
+    return p.parse_args()
 
 
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
-def latest_slug_from_txt() -> str | None:
-    """
-    Return slug (filename without .txt) of the most recently modified txt,
-    or None if no txt files exist.
-    """
-    txts = sorted(TXT_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime)
-    if not txts:
-        return None
-    return txts[-1].stem
+def resolve_slug(args: argparse.Namespace) -> str:
+    if args.slug:
+        slug = args.slug.strip()
+        if not slug:
+            raise SystemExit("Invalid empty --slug.")
+        log("SLUG", f"Using slug '{slug}' (no prompts allowed)", GREEN)
+        return slug
 
-
-def pick_slug() -> str:
-    """
-    Ask user for slug, defaulting to latest txt slug.
-    """
-    TXT_DIR.mkdir(parents=True, exist_ok=True)
-    MP3_DIR.mkdir(parents=True, exist_ok=True)
-    TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
-
-    latest = latest_slug_from_txt()
-    if latest:
-        prompt = f"Enter slug for timing (ENTER for latest='{latest}'): "
-    else:
-        prompt = "Enter slug for timing (no txts found yet, slug required): "
-
+    # Legacy fallback if run standalone without 0_master.py
     try:
-        s = input(prompt).strip()
+        slug = input("Enter slug for timing: ").strip()
     except EOFError:
-        s = ""
-
-    if not s:
-        if not latest:
-            raise SystemExit("No txt files found and no slug provided.")
-        return latest
-
-    return slugify(s)
+        raise SystemExit("Missing slug (EOF)")
+    if not slug:
+        raise SystemExit("Slug is required.")
+    log("SLUG", f"Using slug '{slug}' (legacy prompt)", YELLOW)
+    return slug
 
 
-def load_lyrics_lines(slug: str) -> list[tuple[int, str]]:
-    """
-    Load txts/<slug>.txt and return a list of (line_index, text),
-    skipping empty/whitespace-only lines.
-    """
+def load_lyrics(slug: str) -> List[str]:
     txt_path = TXT_DIR / f"{slug}.txt"
     if not txt_path.exists():
-        raise SystemExit(f"Missing lyrics txt: {txt_path}")
+        log("TXT", f"Missing lyrics at {txt_path}", RED)
+        raise SystemExit(1)
 
-    raw = txt_path.read_text(encoding="utf-8").splitlines()
-    lines: list[tuple[int, str]] = []
-    idx = 0
-    for line in raw:
-        text = line.strip()
-        if not text:
-            continue
-        lines.append((idx, text))
-        idx += 1
-
+    content = txt_path.read_text(encoding="utf-8").splitlines()
+    lines = [ln.rstrip() for ln in content if ln.strip()]
     if not lines:
-        raise SystemExit(f"Lyrics file has no non-empty lines: {txt_path}")
-
+        log("TXT", "Lyrics file appears empty.", YELLOW)
     return lines
 
 
-def check_mp3(slug: str) -> Path:
+def resolve_audio_path(slug: str) -> Path:
     """
-    Ensure mp3s/<slug>.mp3 exists, return its path.
+    ALWAYS use MP3 for timing. WAV mixes are never used for timing UI.
     """
-    mp3_path = MP3_DIR / f"{slug}.mp3"
-    if not mp3_path.exists():
-        raise SystemExit(f"Missing mp3 audio: {mp3_path}")
-    return mp3_path
-
-
-def maybe_overwrite_timings(slug: str) -> Path:
-    """
-    Decide whether to overwrite existing timings file.
-    """
-    TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
-    csv_path = TIMINGS_DIR / f"{slug}.csv"
-    if not csv_path.exists():
-        return csv_path
-
-    log("TIMING", f"Timings file already exists: {csv_path}", YELLOW)
-    if not ask_yes_no("Overwrite existing timings file?", default_yes=False):
-        raise SystemExit("Cancelled to avoid overwriting timings.")
-    return csv_path
+    mp3 = MP3_DIR / f"{slug}.mp3"
+    if mp3.exists():
+        return mp3
+    log("AUDIO", f"MP3 missing for slug '{slug}' at {mp3}", RED)
+    raise SystemExit(1)
 
 
 # ─────────────────────────────────────────────
-# Manual timing loop
+# Audio transport (ffplay preferred, afplay fallback)
 # ─────────────────────────────────────────────
-def manual_timing(slug: str, lines: list[tuple[int, str]], mp3_path: Path, out_csv: Path) -> None:
+class AudioTransport:
     """
-    Manual timing UI:
-    - User starts playback of mp3 externally.
-    - Press ENTER to start timer at the moment audio starts.
-    - For each line, script shows text and waits for ENTER tap to record time.
-    - Writes CSV with header: line_index,time_secs,text
+    Transport wrapper with:
+      - play from given offset (seek if ffplay available)
+      - rewind / fast-forward by N seconds
+      - pause / resume
+      - current logical song time
+
+    Logical time is maintained independently of the underlying player
+    and is always monotonically updated relative to the song.
     """
-    print()
-    log("TIMING", f"Slug: {slug}", CYAN)
-    log("TIMING", f"Lyrics txt: {TXT_DIR / f'{slug}.txt'}", CYAN)
-    log("TIMING", f"Audio mp3:  {mp3_path}", CYAN)
 
-    dur = ffprobe_duration(mp3_path)
-    if dur > 0:
-        log("AUDIO", f"Detected duration ~{dur:.1f}s", GREEN)
+    def __init__(self, audio_path: Path, rewind_step: float = 5.0) -> None:
+        self.audio_path = audio_path
+        self.rewind_step = rewind_step
 
-    print()
-    print("Manual timing instructions:")
-    print("  1) Open the mp3 in your preferred player:")
-    print(f"       {mp3_path}")
-    print("  2) Seek to the beginning of the song.")
-    print("  3) When you are READY TO START the song,")
-    print("     press ENTER here at the exact moment you start playback.")
-    print("  4) For each line shown, press ENTER when that line should appear.")
-    print("  5) Type 'q' and press ENTER at any prompt to abort.")
-    print()
+        self._proc: Optional[subprocess.Popen] = None
+        self._player_ffplay = shutil.which("ffplay")
+        self._player_afplay = shutil.which("afplay")
+        self._use_ffplay = self._player_ffplay is not None
+        self._supports_seek = self._use_ffplay
 
-    try:
-        start_input = input("Press ENTER when you start the song (or 'q' to abort): ").strip().lower()
-    except EOFError:
-        start_input = "q"
+        if not self._player_ffplay and not self._player_afplay:
+            log("AUDIO", "Neither ffplay nor afplay found in PATH.", RED)
+            raise SystemExit(1)
 
-    if start_input == "q":
-        raise SystemExit("Manual timing aborted before start.")
+        if self._use_ffplay:
+            log("AUDIO", f"Using ffplay for playback (seek-capable): {self._player_ffplay}", CYAN)
+        else:
+            log("AUDIO", f"Using afplay for playback (no seek; transport limited): {self._player_afplay}", YELLOW)
 
-    t0 = time.perf_counter()
-    rows: list[tuple[int, float, str]] = []
+        # Logical time bookkeeping
+        self._logical_pos = 0.0        # seconds into track
+        self._state = "stopped"        # "stopped", "playing", "paused"
+        self._state_time = 0.0         # monotonic time of last state change
 
-    total = len(lines)
-    print()
-    log("TIMING", f"Starting timing for {total} lines...", CYAN)
-    print()
+    # ---- internal helpers ----
+    def _kill_proc(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            self._proc = None
 
-    for idx, text in lines:
-        print(f"[{idx + 1}/{total}] {text}")
+    def _update_logical_pos_now(self) -> None:
+        """Update logical_pos based on elapsed time while 'playing'."""
+        now = time.monotonic()
+        if self._state == "playing":
+            delta = now - self._state_time
+            if delta > 0:
+                self._logical_pos += delta
+        self._state_time = now
+
+    def _launch_player_at(self, pos: float) -> None:
+        """Start underlying player at logical position `pos`."""
+        self._kill_proc()
+        self._logical_pos = max(0.0, pos)
+        self._state = "playing"
+        self._state_time = time.monotonic()
+
+        if self._use_ffplay:
+            cmd = [
+                self._player_ffplay,
+                "-nodisp",
+                "-autoexit",
+                "-loglevel", "quiet",
+                "-ss", f"{self._logical_pos:.3f}",
+                str(self.audio_path),
+            ]
+        else:
+            # afplay does not support seek; best effort is to restart from 0.
+            # Logical time will still jump to requested pos so timestamps remain meaningful.
+            if self._logical_pos > 0:
+                log("AUDIO", "afplay cannot seek; audio restarts from 0, but timestamps follow logical time.", YELLOW)
+            cmd = [self._player_afplay, str(self.audio_path)]
+
         try:
-            val = input("  Press ENTER at the moment for this line (or 'q' to abort): ").strip().lower()
-        except EOFError:
-            val = "q"
+            self._proc = subprocess.Popen(cmd)
+        except Exception as e:
+            log("AUDIO", f"Failed to start audio player: {e}", RED)
+            raise SystemExit(1)
 
-        if val == "q":
-            raise SystemExit("Manual timing aborted by user.")
+    # ---- public API ----
+    def start(self) -> None:
+        """Start playback from 0.0."""
+        self._launch_player_at(0.0)
 
-        now = time.perf_counter()
-        t = now - t0
-        rows.append((idx, t, text))
-        log("TIMING", f"Line {idx} at {t:.3f}s", GREEN)
-        print()
+    def current_time(self) -> float:
+        """Return current logical song time."""
+        self._update_logical_pos_now()
+        return max(0.0, self._logical_pos)
+
+    def rewind(self) -> None:
+        """Rewind by rewind_step seconds."""
+        if not self._supports_seek:
+            log("AUDIO", "Rewind requested but seek is not supported (afplay-only). Logical time will move, audio restarts.", YELLOW)
+        now = self.current_time()
+        new_pos = max(0.0, now - self.rewind_step)
+        self._launch_player_at(new_pos)
+
+    def fast_forward(self) -> None:
+        """Fast-forward by rewind_step seconds."""
+        if not self._supports_seek:
+            log("AUDIO", "Fast-forward requested but seek is not supported (afplay-only). Logical time will move, audio restarts.", YELLOW)
+        now = self.current_time()
+        new_pos = max(0.0, now + self.rewind_step)
+        self._launch_player_at(new_pos)
+
+    def adjust_step(self, delta: float) -> None:
+        self.rewind_step = max(1.0, min(30.0, self.rewind_step + delta))
+
+    def toggle_pause(self) -> None:
+        """Pause or resume playback and logical time."""
+        if self._state == "playing":
+            # Pause
+            self._update_logical_pos_now()
+            self._kill_proc()
+            self._state = "paused"
+            log("AUDIO", "Paused.", YELLOW)
+        elif self._state == "paused":
+            # Resume
+            log("AUDIO", "Resuming.", GREEN)
+            self._launch_player_at(self._logical_pos)
+        else:
+            # If stopped, treat toggle as start from current pos
+            log("AUDIO", "Starting from current position.", CYAN)
+            self._launch_player_at(self._logical_pos)
+
+    def stop(self) -> None:
+        self._kill_proc()
+        self._update_logical_pos_now()
+        self._state = "stopped"
+
+
+# ─────────────────────────────────────────────
+# Curses UI
+# ─────────────────────────────────────────────
+NOTE_KEY_MAP = {
+    "1": "♪",
+    "2": "♫",
+    "3": "♬",
+    "4": "♩",
+    "5": "♪♫",
+    "6": "♫♬",
+    "7": "♬♩",
+    "8": "♪♩",
+    "9": "♪♬",
+    "0": "♫♪",
+    "-": "♩♬♪",
+    "=": "♫♪♬♩",
+}
+
+
+def curses_main(stdscr, slug: str, lyrics: List[str], audio_path: Path) -> None:
+    curses.curs_set(0)
+    stdscr.nodelay(False)
+    stdscr.keypad(True)
+
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_YELLOW, -1)   # yellow foreground
+    COLOR_Y = curses.color_pair(1)
+
+    # Prepare timing output
+    TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = TIMINGS_DIR / f"{slug}.csv"
+
+    # Events: (time_secs, text)
+    events: List[Tuple[float, str]] = []
+
+    # Event log (console-style) for bottom of screen
+    event_log: List[str] = []
+
+    def add_event(msg: str) -> None:
+        event_log.append(msg)
+        # keep last 5
+        if len(event_log) > 5:
+            del event_log[0]
+
+    # Audio transport
+    transport = AudioTransport(audio_path, rewind_step=5.0)
+
+    # Initial screen
+    stdscr.clear()
+    try:
+        stdscr.addstr(0, 0, f"Mixterioso Timing – {slug}", COLOR_Y | curses.A_BOLD)
+        stdscr.addstr(2, 0, "Controls:", COLOR_Y)
+        stdscr.addstr(3, 2, "ENTER : timestamp current lyric", COLOR_Y)
+        stdscr.addstr(4, 2, "r     : rewind by N seconds", COLOR_Y)
+        stdscr.addstr(5, 2, "+ / - : increase / decrease rewind seconds", COLOR_Y)
+        stdscr.addstr(6, 2, "f     : fast-forward by N seconds", COLOR_Y)
+        stdscr.addstr(7, 2, "p     : play / pause audio + clock", COLOR_Y)
+        stdscr.addstr(8, 2, "1–=   : insert note glyph line at current time", COLOR_Y)
+        stdscr.addstr(9, 2, "s     : skip this lyric (no event)", COLOR_Y)
+        stdscr.addstr(10, 2, "q     : quit and save CSV", COLOR_Y)
+        stdscr.addstr(12, 0, "Press ENTER when ready to start timing + audio playback.", COLOR_Y)
+    except curses.error:
+        pass
+    stdscr.refresh()
+
+    # Wait for user to start
+    while True:
+        ch = stdscr.getch()
+        if ch in (10, 13):  # ENTER
+            break
+
+    # Start audio
+    transport.start()
+    add_event("Timing started; audio playback begun.")
+
+    line_idx = 0
+    num_lines = len(lyrics)
+
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+
+        # Header
+        now = transport.current_time()
+        try:
+            stdscr.addstr(0, 0, f"Mixterioso Timing – {slug}", COLOR_Y | curses.A_BOLD)
+            stdscr.addstr(1, 0, f"Time: {now:7.2f}s   Rewind step: {transport.rewind_step:.1f}s", COLOR_Y)
+            stdscr.addstr(
+                2,
+                0,
+                "[ENTER] stamp  [r] rewind  [+/-] step  [f] fwd  [p] pause  [1–=] notes  [s] skip  [q] quit",
+                COLOR_Y,
+            )
+        except curses.error:
+            pass
+
+        # Lyrics window
+        base_row = 4
+        log_rows = 5
+        window_size = max(3, h - base_row - log_rows - 1)
+        offset = max(0, line_idx - window_size // 2)
+
+        for i in range(window_size):
+            idx = offset + i
+            if idx >= num_lines:
+                break
+            line = lyrics[idx]
+            row = base_row + i
+            prefix = f"{idx:3d}: "
+            text = (prefix + line)[: max(0, w - 1)]
+            try:
+                if idx == line_idx:
+                    stdscr.addstr(row, 0, text, COLOR_Y | curses.A_REVERSE)
+                else:
+                    stdscr.addstr(row, 0, text, COLOR_Y)
+            except curses.error:
+                pass
+
+        # Event log region at bottom
+        log_start = base_row + window_size + 1
+        if log_start < h:
+            try:
+                stdscr.addstr(log_start, 0, "-" * max(0, w - 1), COLOR_Y)
+            except curses.error:
+                pass
+            for i, msg in enumerate(event_log[-(h - log_start - 1) :], start=1):
+                row = log_start + i
+                if row >= h:
+                    break
+                try:
+                    stdscr.addstr(row, 0, msg[: max(0, w - 1)], COLOR_Y)
+                except curses.error:
+                    pass
+
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+
+        # Quit
+        if ch in (ord("q"), ord("Q")):
+            add_event("Quit requested; writing CSV and exiting.")
+            break
+
+        # Rewind
+        if ch in (ord("r"), ord("R")):
+            transport.rewind()
+            now = transport.current_time()
+            add_event(f"Rewind {transport.rewind_step:.1f}s → {now:0.3f}s")
+            continue
+
+        # Adjust rewind step
+        if ch == ord("+"):
+            transport.adjust_step(+1.0)
+            add_event(f"Rewind step increased to {transport.rewind_step:.1f}s")
+            continue
+        if ch == ord("-"):
+            transport.adjust_step(-1.0)
+            add_event(f"Rewind step decreased to {transport.rewind_step:.1f}s")
+            continue
+
+        # Fast-forward
+        if ch in (ord("f"), ord("F")):
+            transport.fast_forward()
+            now = transport.current_time()
+            add_event(f"Fast-forward {transport.rewind_step:.1f}s → {now:0.3f}s")
+            continue
+
+        # Pause / resume
+        if ch in (ord("p"), ord("P")):
+            transport.toggle_pause()
+            now = transport.current_time()
+            add_event(f"Toggle pause/resume at {now:0.3f}s")
+            continue
+
+        # Skip lyric (no event recorded)
+        if ch in (ord("s"), ord("S")):
+            if line_idx < num_lines:
+                add_event(f"Skipped line {line_idx}: {lyrics[line_idx][:40]!r}")
+                line_idx = min(num_lines, line_idx + 1)
+            continue
+
+        # Handle note keys 1–=
+        if 0 <= ch <= 255:
+            ch_char = chr(ch)
+        else:
+            ch_char = ""
+
+        if ch_char in NOTE_KEY_MAP:
+            note_txt = NOTE_KEY_MAP[ch_char]
+            ts = transport.current_time()
+            events.append((ts, note_txt))
+            add_event(f"[NOTE] {note_txt} inserted at {ts:0.3f}s")
+            continue
+
+        # ENTER = stamp current lyric
+        if ch in (10, 13):
+            if line_idx < num_lines:
+                ts = transport.current_time()
+                txt = lyrics[line_idx]
+                events.append((ts, txt))
+                add_event(f"[LINE] {line_idx} stamped at {ts:0.3f}s")
+                line_idx += 1
+            else:
+                add_event("No more lyrics to stamp; ENTER ignored.")
+            continue
+
+        # Ignore unknown keys
+
+    # Stop audio
+    transport.stop()
+
+    # Build final events sorted by time
+    events_sorted = sorted(events, key=lambda x: x[0])
 
     # Write CSV
-    with out_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["line_index", "time_secs", "text"])
-        for idx, t, text in rows:
-            writer.writerow([idx, f"{t:.3f}", text])
+    with out_path.open("w", encoding="utf-8") as f:
+        f.write("line_index,time_secs,text\n")
+        for idx, (ts, text) in enumerate(events_sorted):
+            f.write(f"{idx},{ts:.6f},{text}\n")
 
-    print()
-    log("TIMING", f"Wrote timings CSV: {out_csv}", GREEN)
+    log("CSV", f"Wrote: {out_path}", GREEN)
 
 
 # ─────────────────────────────────────────────
-# MAIN
+# Main
 # ─────────────────────────────────────────────
-def main():
-    log("MODE", "Manual timing (no Whisper, no AI)", CYAN)
+def main() -> None:
+    log("MODE", "Manual timing (curses, strict --slug mode)", CYAN)
+    args = parse_args()
+    slug = resolve_slug(args)
+    lyrics = load_lyrics(slug)
+    audio_path = resolve_audio_path(slug)
 
-    slug = pick_slug()
-    lines = load_lyrics_lines(slug)
-    mp3_path = check_mp3(slug)
-    out_csv = maybe_overwrite_timings(slug)
-
-    manual_timing(slug, lines, mp3_path, out_csv)
-
-    print()
-    print(f"{GREEN}Done!{RESET} Timings written to: {out_csv}")
+    try:
+        curses.wrapper(curses_main, slug, lyrics, audio_path)
+    except KeyboardInterrupt:
+        log("ABORT", "Interrupted by user (Ctrl+C).", YELLOW)
 
 
 if __name__ == "__main__":
