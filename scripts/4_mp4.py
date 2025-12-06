@@ -354,10 +354,11 @@ def compute_default_title_card_lines(slug: str, artist: str, title: str) -> list
 def prompt_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
     """
     Interactively allow a temporary per-render override of the title card.
-    Never modifies meta.json.
+    Fully empty title cards are now allowed (pure black screen).
     """
     default_lines = compute_default_title_card_lines(slug, artist, title)
 
+    # Non-interactive mode → default
     if not sys.stdin.isatty():
         log("TITLE", "Non-interactive mode; using default title card.", CYAN)
         return default_lines
@@ -370,7 +371,7 @@ def prompt_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
     print()
     print("Options:")
     print("  1) Use default")
-    print("  2) Edit title card text manually")
+    print("  2) Edit title card text manually (blank = pure black screen)")
     print()
 
     while True:
@@ -395,10 +396,9 @@ def prompt_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
     while True:
         print()
         print("Edit title card lines (ENTER keeps default).")
-        print("Leave empty lines if desired (blank lines preserved).")
+        print("Blank ALL lines = fully black screen.")
         print()
 
-        # We preserve 5-line structure like the default
         bases = default_lines + ["", "", "", "", ""]
         line1 = edit_line("Line 1", bases[0])
         line2 = edit_line("Line 2", bases[1])
@@ -408,15 +408,13 @@ def prompt_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
 
         lines = [line1, line2, line3, line4, line5]
 
-        # Do not allow fully-empty card
-        if not any(l.strip() for l in lines):
-            print("Title card cannot be completely empty.")
-            continue
-
         print()
         print("Final title card:")
-        for l in lines:
-            print(f"    {l}")
+        if any(l.strip() for l in lines):
+            for l in lines:
+                print(f"    {l}")
+        else:
+            print("    [ FULLY BLANK — BLACK SCREEN ]")
         print()
 
         try:

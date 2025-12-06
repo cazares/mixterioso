@@ -252,19 +252,24 @@ def render_mix(stems: dict, volumes: dict, out_wav: Path):
     labels = []
     inputs = []
 
+    # Each WAV file is a separate input: index = input number.
     for idx, t in enumerate(TRACKS):
         p = stems[t]
         v = float(volumes.get(t, 1.0))
-        in_label  = f"{idx}:a"
+        inputs.append(p)
+
+        # Correct audio stream reference:
+        in_label  = f"{idx}:a:0"     # <-- FIXED (explicit audio stream #0)
         out_label = f"a{idx}"
 
-        inputs.append(p)
         filter_parts.append(f"[{in_label}]volume={v:.3f}[{out_label}]")
         labels.append(f"[{out_label}]")
 
+    # amix all labeled outputs
     amix = "".join(labels) + f"amix=inputs={len(TRACKS)}:normalize=0[mix]"
     filter_complex = ";".join(filter_parts + [amix])
 
+    # Build ffmpeg command
     cmd = ["ffmpeg", "-y"]
     for p in inputs:
         cmd += ["-i", str(p)]
@@ -279,7 +284,6 @@ def render_mix(stems: dict, volumes: dict, out_wav: Path):
     subprocess.run(cmd, check=True)
     log("MIX", f"Wrote {out_wav}", GREEN)
 
-
 # ============================================
 # MAIN
 # ============================================
@@ -288,6 +292,14 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Super simple Demucs 4-stem mixer")
     p.add_argument("--mp3", required=True, help="Original mp3 file")
     p.add_argument("--model", default="htdemucs")
+
+    # NEW FLAGS (Option A)
+    p.add_argument("--no-ui", action="store_true", help="Skip UI and use provided volumes")
+    p.add_argument("--vocals", type=float, help="Volume for vocals (0.0–2.0)")
+    p.add_argument("--bass", type=float, help="Volume for bass (0.0–2.0)")
+    p.add_argument("--drums", type=float, help="Volume for drums (0.0–2.0)")
+    p.add_argument("--other", type=float, help="Volume for other (0.0–2.0)")
+
     args = p.parse_args(argv or sys.argv[1:])
 
     mp3_path = Path(args.mp3).resolve()
@@ -296,8 +308,16 @@ def main(argv=None):
 
     slug = slugify(mp3_path.stem)
 
-    # 1) UI FIRST
-    volumes = mix_ui(slug, args.model)
+    # 1) UI unless --no-ui
+    if args.no_ui:
+        volumes = {t: 1.0 for t in TRACKS}
+        for t in TRACKS:
+            v = getattr(args, t)
+            if v is not None:
+                volumes[t] = max(0.0, min(2.0, float(v)))
+        log("VOLUMES", f"Using CLI volumes: {volumes}", GREEN)
+    else:
+        volumes = mix_ui(slug, args.model)
 
     # 2) Decide stem source
     model_used = choose_stems(slug, args.model)
