@@ -2,10 +2,11 @@
 #!/usr/bin/env python3
 """
 Step 1: Fetch using ONE YouTube query.
-- Metadata-only search (NO downloads, NO format probing)
-- Shows top 12 YouTube results
+- Metadata-only search (flat playlist)
+- Show top 12 results
 - User selects ONE
-- Only then proceeds to real download via legacy script
+- Extract artist/title/slug
+- Delegate download to legacy 1_txt_mp3.py (NO --url arg)
 """
 import argparse, subprocess, json, sys
 from pathlib import Path
@@ -25,7 +26,6 @@ def run():
     parser.add_argument("--query", required=True)
     args = parser.parse_args()
 
-    # 🔑 metadata-only search (flat, no probing)
     cmd = [
         "yt-dlp",
         "ytsearch12:" + args.query,
@@ -35,7 +35,6 @@ def run():
     ]
     data = json.loads(subprocess.check_output(cmd, text=True))
     entries = data.get("entries") or []
-
     if not entries:
         fatal("No YouTube results found.")
 
@@ -59,13 +58,6 @@ def run():
         print("Invalid choice.")
 
     sel = entries[idx-1]
-
-    video_id = sel.get("id")
-    if not video_id:
-        fatal("Selected entry missing video id.")
-
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-
     title = sel.get("title") or args.query
     artist = sel.get("uploader") or "Unknown Artist"
     slug = slugify(f"{artist} {title}")
@@ -77,6 +69,7 @@ def run():
     if not legacy.exists():
         fatal("Original 1_txt_mp3.py not found.")
 
+    # IMPORTANT: legacy script does NOT accept --url
     subprocess.run(
         [
             sys.executable,
@@ -84,7 +77,6 @@ def run():
             "--artist", artist,
             "--title", title,
             "--slug", slug,
-            "--url", video_url,
         ],
         check=True,
     )

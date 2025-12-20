@@ -1,8 +1,13 @@
 
 #!/usr/bin/env python3
-import subprocess, sys, argparse
+import argparse
+import subprocess
+import sys
 from pathlib import Path
 
+# ─────────────────────────────────────────────
+# PATH SETUP
+# ─────────────────────────────────────────────
 THIS_FILE = Path(__file__).resolve()
 SCRIPTS_DIR = THIS_FILE.parent
 REPO_ROOT = SCRIPTS_DIR.parent
@@ -10,51 +15,99 @@ REPO_ROOT = SCRIPTS_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mix_utils import ensure_pipeline_dirs
+from mix_utils import log, ensure_pipeline_dirs
 
 PY = sys.executable
 
-def run():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--query", required=True, help="YouTube search query")
-    args = parser.parse_args()
 
+def run():
     ensure_pipeline_dirs()
 
-    def step(script: str, *extra):
-        p = SCRIPTS_DIR / script
-        if not p.exists():
-            raise FileNotFoundError(p)
-        return [
-            PY,
-            str(p),
-            "--query", args.query,
-            *map(str, extra),
-        ]
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--query", required=True)
+    args = ap.parse_args()
 
-    # Step 1: fetch (blocking)
-    subprocess.run(step("1_fetch.py"), check=True)
-
-    # Step 2: demucs (background)
-    demucs = subprocess.Popen(step("2_stems.py"))
-
-    # Step 3: timing only if no LRC
-    timings = list((REPO_ROOT / "timings").glob("*.lrc"))
-    ran_review = False
-    if not timings:
-        subprocess.run(step("3_timing.py", "--review"), check=True)
-        ran_review = True
-
-    demucs.wait()
-
-    # Step 4: mp4 render
+    # ─────────────────────────────────────────────
+    # Step 1: Fetch (blocking, user interaction OK)
+    # ─────────────────────────────────────────────
     subprocess.run(
-        step("4_mp4.py", "--manual" if ran_review else "--lrc"),
-        check=True
+        [PY, SCRIPTS_DIR / "1_fetch.py", "--query", args.query],
+        check=True,
     )
 
-    # Step 5: upload (background)
-    subprocess.Popen(step("5_upload.py"))
+    # Read slug written by fetch step
+    meta_dir = REPO_ROOT / "meta"
+    meta_files = sorted(meta_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    if not meta_files:
+        raise RuntimeError("No meta JSON produced by fetch step")
+    slug = meta_files[-1].stem
+
+    mp3 = REPO_ROOT / "mp3s" / f"{slug}.mp3"
+    if not mp3.exists():
+        raise FileNotFoundError(mp3)
+
+    # ─────────────────────────────────────────────
+    # Step 2: DEMUCS — BACKGROUND ONLY
+    # ─────────────────────────────────────────────
+    log("PIPE", "Starting Demucs in background")
+    demucs_proc = subprocess.Popen(
+        [
+            PY,
+            SCRIPTS_DIR / "2_stems.py",
+            "--mp3",
+            str(mp3),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # ─────────────────────────────────────────────
+    # Step 3: Timing (FOREGROUND, owns stdin)
+    # ─────────────────────────────────────────────
+    subprocess.run(
+        [
+            PY,
+            SCRIPTS_DIR / "3_timing.py",
+            "--slug",
+            slug,
+            "--auto",
+        ],
+        check=True,
+    )
+
+    # ─────────────────────────────────────────────
+    # Step 4: Wait for Demucs ONLY now
+    # ─────────────────────────────────────────────
+    log("PIPE", "Waiting for Demucs to finish")
+    demucs_proc.wait()
+
+    # ─────────────────────────────────────────────
+    # Step 5: Video (non-interactive)
+    # ─────────────────────────────────────────────
+    subprocess.run(
+        [
+            PY,
+            SCRIPTS_DIR / "4_mp4.py",
+            "--slug",
+            slug,
+        ],
+        check=True,
+    )
+
+    # ─────────────────────────────────────────────
+    # Step 6: Upload (background-safe prompt)
+    # ─────────────────────────────────────────────
+    subprocess.run(
+        [
+            PY,
+            SCRIPTS_DIR / "5_upload.py",
+            "--slug",
+            slug,
+        ],
+        check=True,
+    )
+
 
 if __name__ == "__main__":
     run()
