@@ -51,3 +51,4 @@ gentle*/
 mfa_env/
 !wavs/**
 !corpus/
+*.offset
