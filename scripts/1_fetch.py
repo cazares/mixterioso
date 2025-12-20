@@ -1,41 +1,44 @@
 
 #!/usr/bin/env python3
 import argparse
+import subprocess
 import sys
 from pathlib import Path
 
 THIS_FILE = Path(__file__).resolve()
 SCRIPTS_DIR = THIS_FILE.parent
-REPO_ROOT = SCRIPTS_DIR.parent
 
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from mix_utils import log, slugify
-from yt_search import select_youtube_video
-from lyrics import fetch_lyrics
-
+PY = sys.executable
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--query", required=True)
+    ap.add_argument("--query", required=True, help="Single YouTube search query")
     args = ap.parse_args()
 
-    query = args.query
+    # Very simple heuristic: last word(s) after artist assumed title
+    # For now, pass full query as title; artist unknown is acceptable for adapter
+    query = args.query.strip()
 
-    # 1) YouTube selection + metadata
-    meta = select_youtube_video(query)
-    artist = meta.get("artist") or "Unknown Artist"
-    title = meta.get("title") or query
-    slug = slugify(f"{artist}_{title}")
+    # Try naive split: assume 'Artist Title'
+    parts = query.split()
+    if len(parts) >= 2:
+        artist = " ".join(parts[:-1])
+        title = parts[-1]
+    else:
+        artist = "Unknown Artist"
+        title = query
 
-    log("META", f"{artist} - {title}")
-    log("META", f"Slug: {slug}")
+    slug = f"{artist}_{title}".lower().replace(" ", "_")
 
-    # 2) Lyrics + audio handled internally (existing helpers)
-    fetch_lyrics(artist, title, slug, meta)
+    cmd = [
+        PY,
+        str(SCRIPTS_DIR / "1_txt_mp3.py"),
+        "--artist", artist,
+        "--title", title,
+        "--slug", slug,
+    ]
+
+    subprocess.run(cmd, check=True)
 
 if __name__ == "__main__":
     main()
