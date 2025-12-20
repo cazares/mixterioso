@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+THIS_FILE = Path(__file__).resolve()
+SCRIPTS_DIR = THIS_FILE.parent
+REPO_ROOT = SCRIPTS_DIR.parent
+
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 """
 Minimal YouTube uploader for Mixterioso.
 
