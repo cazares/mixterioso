@@ -34,16 +34,7 @@ META_DIR    = PATHS["meta"]
 TIMINGS_DIR = PATHS["timings"]
 
 # ─────────────────────────────────────────────
-# ENV
-# ─────────────────────────────────────────────
-def load_mm_env() -> str:
-    env_path = ROOT / ".env"
-    if env_path.exists():
-        load_dotenv(env_path)
-    return os.getenv("MUSIXMATCH_API_KEY") or os.getenv("MM_API") or ""
-
-# ─────────────────────────────────────────────
-# NORMALIZATION
+# NORMALIZATION / QUERY VARIANTS
 # ─────────────────────────────────────────────
 def normalize(s: str) -> str:
     s = s.strip().lower()
@@ -55,18 +46,15 @@ def normalize(s: str) -> str:
 def query_variants(artist: str, title: str):
     raw_artist = artist.strip()
     raw_title  = title.strip()
-
     norm_artist = normalize(artist)
     norm_title  = normalize(title)
 
-    variants = []
-    variants.append((raw_artist, raw_title))
-
-    if (raw_artist, raw_title) != (norm_artist, norm_title):
-        variants.append((norm_artist, norm_title))
-
-    variants.append(("", raw_title))
-    variants.append(("", norm_title))
+    variants = [
+        (raw_artist, raw_title),
+        (norm_artist, norm_title),
+        ("", raw_title),
+        ("", norm_title),
+    ]
 
     seen = set()
     out = []
@@ -78,9 +66,159 @@ def query_variants(artist: str, title: str):
     return out
 
 # ─────────────────────────────────────────────
-# MUSIXMATCH (PLAIN LYRICS FALLBACK)
+# LRCLIB SEARCH-FIRST
 # ─────────────────────────────────────────────
+def lrclib_search(artist: str, title: str):
+    url = "https://lrclib.net/api/search"
+    params = {"artist_name": artist, "track_name": title}
+    log("LRCLIB", f"Search params={params}", CYAN)
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        log("LRCLIB", f"Search returned {len(data)} candidates", CYAN)
+        return data
+    except Exception as e:
+        log("LRCLIB", f"Search failed: {e}", YELLOW)
+        return []
+
+def lrclib_fetch(entry: dict):
+    track_id = entry.get("id")
+    if not track_id:
+        return None
+    url = f"https://lrclib.net/api/get/{track_id}"
+    log("LRCLIB", f"Fetching track_id={track_id}", CYAN)
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        lrc = data.get("syncedLyrics")
+        if lrc and "[00:" in lrc:
+            return lrc
+    except Exception as e:
+        log("LRCLIB", f"Fetch failed: {e}", YELLOW)
+    return None
+
+# ─────────────────────────────────────────────
+# NETEASE (MULTI-CANDIDATE)
+# ─────────────────────────────────────────────
+def netease_try(artist: str, title: str):
+    q = quote_plus(f"{artist} {title}".strip())
+    url = f"https://music.163.com/api/search/pc?s={q}&type=1"
+    log("NETEASE", f"Search URL={url}", CYAN)
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log("NETEASE", f"Search failed: {e}", YELLOW)
+        return None
+
+    songs = data.get("result", {}).get("songs", [])
+    log("NETEASE", f"Found {len(songs)} candidates", CYAN)
+
+    for s in songs[:5]:
+        name = s.get("name")
+        artists = ", ".join(a.get("name") for a in s.get("artists", []))
+        sid = s.get("id")
+        log("NETEASE", f"Candidate: {artists} – {name} (id={sid})", CYAN)
+        try:
+            lr = requests.get(
+                f"https://music.163.com/api/song/lyric?id={sid}&lv=1",
+                timeout=10,
+            )
+            lr.raise_for_status()
+            lrc = lr.json().get("lrc", {}).get("lyric")
+            if lrc and "[00:" in lrc:
+                return lrc
+        except Exception:
+            continue
+    return None
+
+# ─────────────────────────────────────────────
+# KUGOU (LRC ONLY – LOW/MID COMPLEXITY)
+# ─────────────────────────────────────────────
+def kugou_try(artist: str, title: str):
+    q = quote_plus(f"{artist} {title}".strip())
+    search_url = f"https://lyrics.kugou.com/search?keyword={q}&ver=1&man=yes&client=pc"
+    log("KUGOU", f"Search URL={search_url}", CYAN)
+    try:
+        r = requests.get(search_url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log("KUGOU", f"Search failed: {e}", YELLOW)
+        return None
+
+    candidates = data.get("candidates", [])
+    log("KUGOU", f"Found {len(candidates)} candidates", CYAN)
+
+    for c in candidates[:5]:
+        lid = c.get("id")
+        acc = c.get("accesskey")
+        if not lid or not acc:
+            continue
+        try:
+            lrc_url = (
+                f"https://lyrics.kugou.com/download?ver=1&client=pc"
+                f"&id={lid}&accesskey={acc}&fmt=lrc"
+            )
+            lr = requests.get(lrc_url, timeout=10)
+            lr.raise_for_status()
+            lrc = lr.json().get("content")
+            if lrc and "[00:" in lrc:
+                return lrc
+        except Exception:
+            continue
+    return None
+
+# ─────────────────────────────────────────────
+# MASTER LRC FETCH
+# ─────────────────────────────────────────────
+def try_fetch_lrc(artist: str, title: str, slug: str):
+    for qa, qt in query_variants(artist, title):
+        log("LRC", f"Query variant → artist='{qa}' title='{qt}'", CYAN)
+
+        # 1) LRCLIB
+        for entry in lrclib_search(qa, qt)[:5]:
+            log("LRCLIB", f"Candidate: {entry.get('artistName')} – {entry.get('trackName')}", CYAN)
+            lrc = lrclib_fetch(entry)
+            if lrc:
+                out = TIMINGS_DIR / f"{slug}.lrc"
+                out.write_text(lrc, encoding="utf-8")
+                log("SUCCESS", f"TIMED LYRICS FOUND via LRCLIB → {out}", GREEN)
+                return "lrclib", out
+
+        # 2) NETEASE
+        lrc = netease_try(qa, qt)
+        if lrc:
+            out = TIMINGS_DIR / f"{slug}.lrc"
+            out.write_text(lrc, encoding="utf-8")
+            log("SUCCESS", f"TIMED LYRICS FOUND via NETEASE → {out}", GREEN)
+            return "netease", out
+
+        # 3) KUGOU
+        lrc = kugou_try(qa, qt)
+        if lrc:
+            out = TIMINGS_DIR / f"{slug}.lrc"
+            out.write_text(lrc, encoding="utf-8")
+            log("SUCCESS", f"TIMED LYRICS FOUND via KUGOU → {out}", GREEN)
+            return "kugou", out
+
+    log("LRC", "All timed-lyrics sources exhausted.", RED)
+    return None, None
+
+# ─────────────────────────────────────────────
+# MUSIXMATCH (PLAIN FALLBACK)
+# ─────────────────────────────────────────────
+def load_mm_env():
+    env_path = ROOT / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+    return os.getenv("MUSIXMATCH_API_KEY") or os.getenv("MM_API") or ""
+
 def musixmatch_search_track(artist: str, title: str, api_key: str) -> dict:
+    url = "https://api.musixmatch.com/ws/1.1/track.search"
     params = {
         "apikey": api_key,
         "f_has_lyrics": 1,
@@ -88,183 +226,75 @@ def musixmatch_search_track(artist: str, title: str, api_key: str) -> dict:
         "q_artist": artist,
         "q_track": title,
     }
-    url = "https://api.musixmatch.com/ws/1.1/track.search"
     try:
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
-        data = r.json()
+        tracks = r.json().get("message", {}).get("body", {}).get("track_list", [])
+        if not tracks:
+            return {}
+        t = tracks[0]["track"]
+        return {"track_id": t.get("track_id")}
     except Exception:
         return {}
-    tracks = data.get("message", {}).get("body", {}).get("track_list", [])
-    if not tracks:
-        return {}
-    t = tracks[0]["track"]
-    return {
-        "track_id": t.get("track_id"),
-        "artist": t.get("artist_name", artist),
-        "title":  t.get("track_name", title),
-    }
 
 def musixmatch_fetch_lyrics(track_id: int, api_key: str) -> str:
     url = "https://api.musixmatch.com/ws/1.1/track.lyrics.get"
-    params = {"track_id": track_id, "apikey": api_key}
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params={"track_id": track_id, "apikey": api_key}, timeout=10)
         r.raise_for_status()
-        data = r.json()
+        lyrics = r.json().get("message", {}).get("body", {}).get("lyrics", {}).get("lyrics_body", "")
+        return lyrics.split("*******")[0].strip()
     except Exception:
         return ""
-    lyrics = data.get("message", {}).get("body", {}).get("lyrics", {}).get("lyrics_body", "")
-    if not lyrics:
-        return ""
-    footer = "******* This Lyrics is NOT for Commercial use *******"
-    return lyrics.split(footer)[0].strip()
-
-# ─────────────────────────────────────────────
-# ROBUST LRC FETCH
-# ─────────────────────────────────────────────
-LRC_SOURCES = [
-    ("lrclib", "https://lrclib.net/api/get?artist_name={artist}&track_name={title}", "json"),
-    ("lyricsify", "https://www.lyricsify.com/{artist}/{title}", "html"),
-    ("lrcget", "https://lrc-get.vercel.app/search?song={artist}+{title}", "html"),
-    ("netease", "https://music.163.com/api/search/pc?s={artist}+{title}&type=1", "netease"),
-]
-
-def try_fetch_lrc(artist: str, title: str):
-    failures = []
-
-    for qa, qt in query_variants(artist, title):
-        log("LRC", f"Query variant → artist='{qa}' title='{qt}'", CYAN)
-
-        enc_artist = quote_plus(qa)
-        enc_title  = quote_plus(qt)
-
-        for name, tmpl, mode in LRC_SOURCES:
-            url = tmpl.format(artist=enc_artist, title=enc_title)
-            log("LRC", f"Trying {name}: {url}", CYAN)
-
-            try:
-                r = requests.get(url, timeout=10)
-                r.raise_for_status()
-            except Exception as e:
-                failures.append((name, f"HTTP error: {e}"))
-                continue
-
-            try:
-                if mode == "json":
-                    data = r.json()
-                    lrc = data.get("syncedLyrics") or data.get("lyrics")
-                    if lrc and "[00:" in lrc:
-                        log("LRC", f"{name} returned synced lyrics", GREEN)
-                        return name, lrc
-
-                elif mode == "html":
-                    matches = re.findall(r'href="([^"]+\.lrc)"', r.text, re.IGNORECASE)
-                    for link in matches[:3]:
-                        try:
-                            rr = requests.get(link, timeout=10)
-                            rr.raise_for_status()
-                            if "[00:" in rr.text:
-                                log("LRC", f"{name} fetched LRC link", GREEN)
-                                return name, rr.text
-                        except Exception:
-                            pass
-
-                elif mode == "netease":
-                    data = r.json()
-                    songs = data.get("result", {}).get("songs", [])
-                    if songs:
-                        sid = songs[0]["id"]
-                        lrc_url = f"https://music.163.com/api/song/lyric?id={sid}&lv=1"
-                        rr = requests.get(lrc_url, timeout=10)
-                        rr.raise_for_status()
-                        lrc = rr.json().get("lrc", {}).get("lyric")
-                        if lrc and "[00:" in lrc:
-                            log("LRC", "NetEase returned synced lyrics", GREEN)
-                            return name, lrc
-
-            except Exception as e:
-                failures.append((name, f"Parse error: {e}"))
-
-    log("LRC", "All LRC sources failed.", RED)
-    for n, r in failures:
-        log("LRC", f"{n}: {r}", YELLOW)
-    return None, None
 
 # ─────────────────────────────────────────────
 # YT-DLP
 # ─────────────────────────────────────────────
-def youtube_download_mp3(artist: str, title: str, slug: str) -> None:
+def youtube_download_mp3(artist: str, title: str, slug: str):
     MP3_DIR.mkdir(parents=True, exist_ok=True)
     query = f"{artist} {title}".strip()
-    out_template = str(MP3_DIR / f"{slug}.%(ext)s")
     subprocess.run(
-        [
-            "yt-dlp",
-            "-x",
-            "--audio-format", "mp3",
-            "-o", out_template,
-            f"ytsearch1:{query}",
-        ],
+        ["yt-dlp", "-x", "--audio-format", "mp3", "-o", str(MP3_DIR / f"{slug}.%(ext)s"), f"ytsearch1:{query}"],
         check=True,
     )
-
-# ─────────────────────────────────────────────
-# ARG PARSE
-# ─────────────────────────────────────────────
-def parse_args():
-    p = argparse.ArgumentParser(description="Step1: TXT + MP3 generation (accent-robust LRC)")
-    p.add_argument("--artist", required=True)
-    p.add_argument("--title", required=True)
-    p.add_argument("--slug", required=True)
-    return p.parse_args()
 
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
-    args = parse_args()
-    artist = args.artist.strip()
-    title  = args.title.strip()
-    slug   = args.slug.strip()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--artist", required=True)
+    ap.add_argument("--title", required=True)
+    ap.add_argument("--slug", required=True)
+    args = ap.parse_args()
 
-    TXT_DIR.mkdir(parents=True, exist_ok=True)
-    MP3_DIR.mkdir(parents=True, exist_ok=True)
-    META_DIR.mkdir(parents=True, exist_ok=True)
-    TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
+    for d in (TXT_DIR, MP3_DIR, META_DIR, TIMINGS_DIR):
+        d.mkdir(parents=True, exist_ok=True)
 
-    lyrics_text = ""
     lyrics_source = "none"
-
-    src, lrc = try_fetch_lrc(artist, title)
-    if lrc:
-        (TIMINGS_DIR / f"{slug}.lrc").write_text(lrc, encoding="utf-8")
+    src, path = try_fetch_lrc(args.artist, args.title, args.slug)
+    if src:
         lyrics_source = f"lrc:{src}"
-        log("LRC", f"Wrote LRC for {slug}", GREEN)
     else:
-        mm_key = load_mm_env()
-        if mm_key:
-            track = musixmatch_search_track(artist, title, mm_key)
-            if track and track.get("track_id"):
-                lyrics_text = musixmatch_fetch_lyrics(track["track_id"], mm_key)
-                if lyrics_text:
+        mm = load_mm_env()
+        if mm:
+            t = musixmatch_search_track(args.artist, args.title, mm)
+            if t.get("track_id"):
+                lyrics = musixmatch_fetch_lyrics(t["track_id"], mm)
+                if lyrics:
+                    (TXT_DIR / f"{args.slug}.txt").write_text(lyrics, encoding="utf-8")
                     lyrics_source = "musixmatch"
 
-    txt_path = TXT_DIR / f"{slug}.txt"
-    txt_path.write_text(lyrics_text, encoding="utf-8")
-    log("TXT", f"Wrote {txt_path}", GREEN)
-
-    youtube_download_mp3(artist, title, slug)
+    youtube_download_mp3(args.artist, args.title, args.slug)
 
     meta = {
-        "slug": slug,
-        "artist": artist,
-        "title": title,
+        "slug": args.slug,
+        "artist": args.artist,
+        "title": args.title,
         "lyrics_source": lyrics_source,
     }
-    meta_path = META_DIR / f"{slug}.json"
-    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
-    log("META", f"Wrote {meta_path}", GREEN)
+    (META_DIR / f"{args.slug}.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    log("META", f"Wrote meta for {args.slug}", GREEN)
 
 if __name__ == "__main__":
     main()
