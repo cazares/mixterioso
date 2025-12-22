@@ -60,6 +60,7 @@ NEXT_LABEL_ALPHA_HEX = GLOBAL_NEXT_ALPHA_HEX
 DEFAULT_UI_FONT_SIZE = 120
 ASS_FONT_MULTIPLIER = 1.5
 
+# 🔒 Fixed render offset (pipeline may still pass --offset)
 LYRICS_OFFSET_SECS = 0.0
 
 MUSIC_NOTE_CHARS = "♪♫♬♩♭♯"
@@ -76,32 +77,6 @@ def slugify(text: str) -> str:
     base = re.sub(r"[^\w\-]+", "", base)
     return base or "song"
 
-def seconds_to_ass_time(sec: float) -> str:
-    if sec < 0:
-        sec = 0.0
-    total_cs = int(round(sec * 100))
-    total_seconds, cs = divmod(max(0, total_cs), 100)
-    h, rem = divmod(total_seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
-
-def rgb_to_bgr(rrggbb: str) -> str:
-    s = (rrggbb or "").strip().lstrip("#").zfill(6)[-6:]
-    return f"{s[4:6]}{s[2:4]}{s[0:2]}"
-
-def is_music_only(text: str) -> bool:
-    if not text:
-        return False
-    stripped = text.strip()
-    if not stripped:
-        return False
-    if any(ch in MUSIC_NOTE_CHARS for ch in stripped):
-        return True
-    if not any(ch.isalnum() for ch in stripped):
-        return True
-    lower = stripped.lower()
-    return any(kw in lower for kw in MUSIC_NOTE_KEYWORDS)
-
 def read_meta(slug: str) -> tuple[str, str]:
     meta_path = META_DIR / f"{slug}.json"
     artist, title = "", slug
@@ -117,58 +92,31 @@ def read_meta(slug: str) -> tuple[str, str]:
 def read_timings(slug: str):
     timing_path = TIMINGS_DIR / f"{slug}.csv"
     if not timing_path.exists():
-        print(f"Timing CSV not found for slug={slug}: {timing_path}")
+        log("TIMINGS", f"Missing timing CSV: {timing_path}", RED)
         sys.exit(1)
+
     rows = []
     with timing_path.open(newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
         header = next(reader, None)
         if header and "time_secs" in header:
             idx_time = header.index("time_secs")
-            idx_text = header.index("text") if "text" in header else None
-            idx_li = header.index("line_index") if "line_index" in header else None
+            idx_text = header.index("text")
             for row in reader:
                 try:
-                    t = float(row[idx_time])
+                    rows.append((float(row[idx_time]), row[idx_text]))
                 except Exception:
-                    continue
-                text = row[idx_text] if idx_text is not None and len(row) > idx_text else ""
-                li = int(row[idx_li]) if idx_li is not None and len(row) > idx_li else 0
-                rows.append((t, text, li))
+                    pass
         else:
             for row in reader:
-                if len(row) < 2:
-                    continue
                 try:
-                    t = float(row[0])
+                    rows.append((float(row[0]), row[1]))
                 except Exception:
-                    continue
-                rows.append((t, row[1], 0))
+                    pass
+
     rows.sort(key=lambda x: x[0])
     log("TIMINGS", f"Loaded {len(rows)} timing rows from {timing_path}", CYAN)
     return rows
-
-def probe_audio_duration(path: Path) -> float:
-    if not path.exists():
-        return 0.0
-    cmd = [
-        "ffprobe","-v","error","-show_entries","format=duration",
-        "-of","default=noprint_wrappers=1:nokey=1",str(path)
-    ]
-    try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-        return float(out.strip())
-    except Exception:
-        return 0.0
-
-def compute_default_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
-    if title and artist:
-        return [title, "", "by", "", artist]
-    if title:
-        return [title]
-    if artist:
-        return [artist]
-    return [slug.replace("_", " ").title()]
 
 def choose_audio(slug: str) -> Path:
     wav = MIXES_DIR / f"{slug}.wav"
@@ -177,67 +125,59 @@ def choose_audio(slug: str) -> Path:
         return wav
     if mp3.exists():
         return mp3
-    print(f"No mixed audio found for {slug}")
+    log("AUDIO", f"No mixed audio found for {slug}", RED)
     sys.exit(1)
-
-def open_path(path: Path) -> None:
-    try:
-        if sys.platform == "darwin":
-            subprocess.run(["open", str(path)])
-        elif sys.platform.startswith("win"):
-            subprocess.run(["start", str(path)], shell=True)
-        else:
-            subprocess.run(["xdg-open", str(path)])
-    except Exception:
-        pass
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Generate karaoke MP4 from slug.")
     p.add_argument("--slug", required=True)
-    p.add_argument("--font-name", type=str, default="Helvetica")
+    p.add_argument("--font-name", default="Helvetica")
+    p.add_argument(
+        "--offset",
+        type=float,
+        default=0.0,
+        help="Accepted for pipeline compatibility (ignored; fixed offset used).",
+    )
     return p.parse_args(argv)
 
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
     slug = slugify(args.slug)
 
-    ui_font_size = 120
+    if args.offset != 0.0:
+        log(
+            "OFFSET",
+            f"Ignoring CLI --offset {args.offset:.2f}; using fixed {LYRICS_OFFSET_SECS:.2f}",
+            YELLOW,
+        )
+    else:
+        log("OFFSET", f"Using fixed LYRICS_OFFSET_SECS={LYRICS_OFFSET_SECS:.2f}", CYAN)
+
+    ui_font_size = DEFAULT_UI_FONT_SIZE
     ass_font_size = int(ui_font_size * ASS_FONT_MULTIPLIER)
-    log("FONT", f"Using UI font size {ui_font_size} (ASS Fontsize={ass_font_size})", CYAN)
+    log("FONT", f"UI font size {ui_font_size} → ASS {ass_font_size}", CYAN)
 
     audio_path = choose_audio(slug)
-    audio_duration = probe_audio_duration(audio_path)
-
     artist, title = read_meta(slug)
-    timings = read_timings(slug)
+    _ = read_timings(slug)
 
-    title_card_lines = compute_default_title_card_lines(slug, artist, title)
-
-    # ASS + MP4 generation logic assumed unchanged upstream
-
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_mp4 = OUTPUT_DIR / f"{slug}.mp4"
+
     cmd = [
-        "ffmpeg","-y","-f","lavfi","-i",
-        f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30:d={max(audio_duration,1.0)}",
-        "-i",str(audio_path),
-        "-c:v","libx264","-c:a","aac","-shortest",
-        str(out_mp4)
+        "ffmpeg",
+        "-y",
+        "-f", "lavfi",
+        "-i", f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30",
+        "-i", str(audio_path),
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-shortest",
+        str(out_mp4),
     ]
+
     subprocess.run(cmd, check=True)
-
-    log("MP4", f"Generation complete: {out_mp4}", GREEN)
-
-    print("Open options: 1=dir  2=MP4  3=both  0=none")
-    try:
-        choice = input("Choice [0–3, default=2]: ").strip()
-    except EOFError:
-        choice = ""
-    if choice in ("", "2"):
-        open_path(out_mp4)
-    elif choice == "1":
-        open_path(OUTPUT_DIR)
-    elif choice == "3":
-        open_path(OUTPUT_DIR); open_path(out_mp4)
+    log("MP4", f"Wrote {out_mp4}", GREEN)
 
 if __name__ == "__main__":
     main()
