@@ -1,45 +1,98 @@
-
 #!/usr/bin/env python3
 import argparse
 import subprocess
 import sys
 from pathlib import Path
 
+from yt_dlp import YoutubeDL
+
+# ─────────────────────────────────────────────
+# Paths
+# ─────────────────────────────────────────────
 THIS_FILE = Path(__file__).resolve()
 SCRIPTS_DIR = THIS_FILE.parent
+REPO_ROOT = SCRIPTS_DIR.parent
 
-PY = sys.executable
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
+from mix_utils import log
+
+# ─────────────────────────────────────────────
+# YouTube search + picker
+# ─────────────────────────────────────────────
+def search_youtube(query, limit=12):
+    ydl_opts = {
+        "quiet": True,
+        "extract_flat": True,
+        "skip_download": True,
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        result = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+        return result.get("entries", [])
+
+
+def pick(items):
+    print("\nSelect YouTube source:\n")
+    for i, item in enumerate(items, 1):
+        title = item.get("title", "Unknown title")
+        dur = item.get("duration")
+
+        if isinstance(dur, (int, float)):
+            total = int(dur)
+            mm = total // 60
+            ss = total % 60
+            dur_str = f"{mm}:{ss:02d}"
+        else:
+            dur_str = "?:??"
+
+        print(f" {i:2d}) {title} ({dur_str})")
+
+    print()
+    choice = input(f"Choose 1–{len(items)}: ").strip()
+    idx = int(choice) - 1
+    return items[idx]
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--query", required=True, help="Single YouTube search query")
+    ap.add_argument("--query", required=True)
     args = ap.parse_args()
 
-    # Very simple heuristic: last word(s) after artist assumed title
-    # For now, pass full query as title; artist unknown is acceptable for adapter
-    query = args.query.strip()
+    items = search_youtube(args.query)
+    if not items:
+        raise RuntimeError("No YouTube results found")
 
-    # Try naive split: assume 'Artist Title'
-    parts = query.split()
-    if len(parts) >= 2:
-        artist = " ".join(parts[:-1])
-        title = parts[-1]
-    else:
-        artist = "Unknown Artist"
-        title = query
+    picked = pick(items)
+    url = picked.get("url") or picked.get("webpage_url")
 
-    slug = f"{artist}_{title}".lower().replace(" ", "_")
+    if not url:
+        raise RuntimeError("Selected item has no URL")
 
-    cmd = [
-        PY,
-        str(SCRIPTS_DIR / "1_txt_mp3.py"),
-        "--artist", artist,
-        "--title", title,
-        "--slug", slug,
-    ]
+    # Hand off to Step 1 downloader
+    subprocess.run(
+        [
+            sys.executable,
+            SCRIPTS_DIR / "1_txt_mp3.py",
+            "--artist",
+            "UNKNOWN",
+            "--title",
+            picked.get("title", "UNKNOWN"),
+            "--slug",
+            picked.get("id", "unknown"),
+            "--url",
+            url,
+        ],
+        check=True,
+    )
 
-    subprocess.run(cmd, check=True)
 
 if __name__ == "__main__":
     main()
+
 # end of 1_fetch.py

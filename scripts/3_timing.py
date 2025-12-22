@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 import sys
 from pathlib import Path
+import os
+
+# Force real TTY for curses input
+tty = open("/dev/tty")
+os.dup2(tty.fileno(), sys.stdin.fileno())
 
 THIS_FILE = Path(__file__).resolve()
 SCRIPTS_DIR = THIS_FILE.parent
