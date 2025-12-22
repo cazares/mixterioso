@@ -160,6 +160,27 @@ def main():
     # Download audio
     youtube_download_mp3(artist, title, slug)
 
+    # ─────────────────────────────────────────────
+    # NEW: Attempt timing CSV fetch (non-fatal)
+    # ─────────────────────────────────────────────
+    fetch_timings_script = ROOT / "scripts" / "fetch_timing_csv.py"
+    if fetch_timings_script.exists():
+        try:
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(fetch_timings_script),
+                    artist,
+                    title,
+                    slug,
+                ],
+                check=False,
+            )
+        except Exception:
+            log("TIMINGS", "Timing fetch failed → continuing.", YELLOW)
+    else:
+        log("TIMINGS", "fetch_timing_csv.py not found → skipping.", YELLOW)
+
     # Write META
     meta = {
         "slug": slug,
