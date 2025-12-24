@@ -52,3 +52,4 @@ mfa_env/
 !wavs/**
 !corpus/
 *.lrc
+*.json3
