@@ -232,16 +232,9 @@ def prompt_for_offset() -> float:
     log("OFFSET", "MP4 render timing offset", WHITE)
     print("  Positive → lyrics later / delayed")
     print("  Negative → lyrics earlier")
-    print("  Default = –1.50s")
+    print("  Default = 0.0s")
     print("")
-    raw = input("Offset seconds [default=-1.50]: ").strip()
-    if not raw:
-        return -1.50
-    try:
-        return float(raw)
-    except Exception:
-        log("OFFSET", "Invalid input; using -1.50s", YELLOW)
-        return -1.50
+    return 0.0
 
 def run_step4(slug: str) -> None:
     offset = prompt_for_offset()

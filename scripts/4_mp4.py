@@ -132,7 +132,7 @@ ASS_FONT_MULTIPLIER = 1.5  # multiple of UI font size to get ASS fontsize
 # Global lyrics timing offset in seconds. Positive = delay, negative = earlier.
 # This is applied uniformly to all lyric timestamps at render time so you can
 # nudge the whole subtitle track without re-running timing.
-LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "-1.5") or "-1.5")
+LYRICS_OFFSET_SECS = float(os.getenv("KARAOKE_OFFSET_SECS", "0.0") or "0.0")
 # If you prefer hardcoded only, comment the line above and do e.g.:
 # LYRICS_OFFSET_SECS = -0.35  # shift lyrics 350 ms earlier
 
@@ -374,57 +374,7 @@ def prompt_title_card_lines(slug: str, artist: str, title: str) -> list[str]:
     print("  2) Edit title card text manually (blank = pure black screen)")
     print()
 
-    while True:
-        try:
-            choice = input("Choose [1/2, ENTER=1]: ").strip()
-        except EOFError:
-            choice = ""
-
-        if choice in ("", "1"):
-            return default_lines
-        if choice == "2":
-            break
-        print("Please choose 1 or 2.")
-
-    def edit_line(label: str, current: str) -> str:
-        try:
-            raw = input(f"{label} [{current}]: ").strip()
-        except EOFError:
-            raw = ""
-        return current if raw == "" else raw
-
-    while True:
-        print()
-        print("Edit title card lines (ENTER keeps default).")
-        print("Blank ALL lines = fully black screen.")
-        print()
-
-        bases = default_lines + ["", "", "", "", ""]
-        line1 = edit_line("Line 1", bases[0])
-        line2 = edit_line("Line 2", bases[1])
-        line3 = edit_line("Line 3", bases[2])
-        line4 = edit_line("Line 4", bases[3])
-        line5 = edit_line("Line 5", bases[4])
-
-        lines = [line1, line2, line3, line4, line5]
-
-        print()
-        print("Final title card:")
-        if any(l.strip() for l in lines):
-            for l in lines:
-                print(f"    {l}")
-        else:
-            print("    [ FULLY BLANK — BLACK SCREEN ]")
-        print()
-
-        try:
-            ok = input("Use this title card? [Y/n]: ").strip().lower()
-        except EOFError:
-            ok = "y"
-
-        if ok in ("", "y", "yes"):
-            log("TITLE", "Using custom title card override.", GREEN)
-            return lines
+    return default_lines
 
 def build_ass(
     slug: str,
@@ -691,9 +641,9 @@ def parse_args(argv=None):
         help="Subtitle font name. Default Helvetica.",
     )
     p.add_argument(
-        "--offset",
+    "--offset",
         type=str,
-        default="-1.5",
+        default="0.0",
         help="Offset in seconds",
     )
     return p.parse_args(argv)
@@ -701,40 +651,19 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
+
+    global LYRICS_OFFSET_SECS
+    if args.offset is not None:
+        LYRICS_OFFSET_SECS = float(args.offset)
+
     slug = slugify(args.slug)
 
-    default_font_size = DEFAULT_UI_FONT_SIZE
     font_size_value = args.font_size
-
     if font_size_value is None:
-        if sys.stdin.isatty():
-            try:
-                resp = input(
-                    f"Subtitle font size [20–200, default {default_font_size}]: "
-                ).strip()
-            except EOFError:
-                resp = ""
-            if not resp:
-                font_size_value = default_font_size
-            else:
-                try:
-                    v = int(resp)
-                    if 20 <= v <= 200:
-                        font_size_value = v
-                    else:
-                        print(
-                            f"Value {v} out of range; using default {default_font_size}"
-                        )
-                        font_size_value = default_font_size
-                except ValueError:
-                    print(
-                        f"Invalid integer; using default font size {default_font_size}"
-                    )
-                    font_size_value = default_font_size
-        else:
-            font_size_value = default_font_size
+        font_size_value = DEFAULT_UI_FONT_SIZE
 
     ui_font_size = max(20, min(200, font_size_value))
+
     ass_font_size = int(ui_font_size * ASS_FONT_MULTIPLIER)
     log(
         "FONT",
@@ -803,27 +732,7 @@ def main(argv=None):
 
     print()
     print(f"{BOLD}{BLUE}MP4 generation complete:{RESET} {out_mp4}")
-    print("What would you like to open?")
-    print("  1 = output directory")
-    print("  2 = MP4 file")
-    print("  3 = both (dir then MP4)")
-    print("  0 = none")
-
-    try:
-        choice = input("Choice [0–3]: ").strip()
-    except EOFError:
-        choice = "0"
-
-    if choice == "1":
-        open_path(OUTPUT_DIR)
-    elif choice == "2":
-        open_path(out_mp4)
-    elif choice == "3":
-        open_path(OUTPUT_DIR)
-        open_path(out_mp4)
-    else:
-        log("OPEN", "No open action selected.", YELLOW)
-
+    open_path(OUTPUT_DIR)
 
 if __name__ == "__main__":
     main()
