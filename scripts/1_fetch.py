@@ -1,93 +1,116 @@
 #!/usr/bin/env python3
-import sys, subprocess, os, json, argparse
+import sys
 from pathlib import Path
-import requests
-from dotenv import load_dotenv
 
+# ─────────────────────────────────────────────
+# Bootstrap import path (repo root)
+# ─────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from mix_utils import PATHS, log, GREEN, YELLOW, RED
+"""
+Step1 orchestrator: fetch all assets needed before stems/timing/video.
 
-TXT_DIR = PATHS["txt"]
-MP3_DIR = PATHS["mp3"]
-META_DIR = PATHS["meta"]
-TIMINGS_DIR = PATHS["timings"]
+Outputs:
+- txts/<slug>.txt
+- mp3s/<slug>.mp3
+- timings/<slug>.lrc
+- timings/<slug>.<lang>.vtt
+"""
 
-def fetch_lrc(artist, title, slug):
-    out = TIMINGS_DIR / f"{slug}.lrc"
-    if out.exists():
-        return
-    try:
-        r = requests.get(
-            "https://lrclib.net/api/get",
-            params={"artist_name": artist, "track_name": title},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return
-        data = r.json()
-        lrc = data.get("syncedLyrics") or ""
-        if lrc.strip():
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(lrc.strip(), encoding="utf-8")
-            log("LRC", f"Wrote {out}", GREEN)
-    except Exception:
-        pass
+import argparse
+import json
+import subprocess
+import time
+from pathlib import Path
+import re
 
-def fetch_captions(slug, url):
-    out = TIMINGS_DIR / f"{slug}.vtt"
-    if out.exists():
-        return
-    cmd = [
-        "yt-dlp",
-        "--skip-download",
-        "--write-auto-sub",
-        "--sub-lang", "en",
-        "--sub-format", "vtt",
-        "-o", str(out.with_suffix("")),
-        url,
-    ]
-    try:
-        subprocess.run(cmd, check=True)
-        if out.exists():
-            log("CAPTION", f"Wrote {out}", GREEN)
-    except Exception:
-        pass
+def _slugify_title(title: str) -> str:
+    s = (title or "").strip().lower()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^\w]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "song"
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--artist", required=True)
-    ap.add_argument("--title", required=True)
-    ap.add_argument("--slug", required=True)
-    ap.add_argument("--youtube-url", required=False)
-    args = ap.parse_args()
+def parse_query(q: str) -> tuple[str, str]:
+    q = (q or "").strip().strip('"').strip("'").strip()
+    q_norm = q.replace("—", "-").replace("–", "-")
+    if " - " in q_norm:
+        a, t = q_norm.split(" - ", 1)
+    elif "-" in q_norm:
+        a, t = q_norm.split("-", 1)
+    elif ":" in q_norm:
+        a, t = q_norm.split(":", 1)
+    else:
+        return ("", q)
+    return (a.strip(), t.strip())
 
-    artist, title, slug = args.artist, args.title, args.slug
+def _run(tag: str, cmd: list[str]) -> int:
+    t0 = time.perf_counter()
+    p = subprocess.run(cmd)
+    dt = time.perf_counter() - t0
+    print(f"[{tag}] exit={p.returncode} dt={dt:.2f}s")
+    return p.returncode
 
-    TXT_DIR.mkdir(parents=True, exist_ok=True)
-    MP3_DIR.mkdir(parents=True, exist_ok=True)
-    META_DIR.mkdir(parents=True, exist_ok=True)
-    TIMINGS_DIR.mkdir(parents=True, exist_ok=True)
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Step1: fetch lyrics/audio/LRC/captions")
+    ap.add_argument("--query", help='Convenience: "Artist - Title"')
+    ap.add_argument("--artist", help="Artist name")
+    ap.add_argument("--title", help="Song title")
+    ap.add_argument("--slug", help="Slug (defaults to slugified title)")
+    ap.add_argument("--no-audio", action="store_true")
+    ap.add_argument("--no-txt", action="store_true")
+    ap.add_argument("--no-lrc", action="store_true")
+    ap.add_argument("--no-captions", action="store_true")
+    return ap.parse_args(argv)
 
-    (TXT_DIR / f"{slug}.txt").write_text("", encoding="utf-8")
+def main(argv=None):
+    args = parse_args(argv)
 
-    subprocess.run(
-        ["yt-dlp", "-x", "--audio-format", "mp3",
-         "-o", str(MP3_DIR / f"{slug}.%(ext)s"),
-         f"ytsearch1:{artist} {title}"],
-        check=True,
-    )
+    artist = (args.artist or "").strip()
+    title = (args.title or "").strip()
 
-    meta = {"artist": artist, "title": title, "slug": slug}
-    if args.youtube_url:
-        meta["youtube_url"] = args.youtube_url
+    if args.query:
+        qa, qt = parse_query(args.query)
+        if not artist:
+            artist = qa
+        if not title:
+            title = qt
 
-    (META_DIR / f"{slug}.json").write_text(json.dumps(meta, indent=2))
+    if not title:
+        raise SystemExit("Step1 requires --title or --query")
 
-    fetch_lrc(artist, title, slug)
-    if args.youtube_url:
-        fetch_captions(slug, args.youtube_url)
+    slug = (args.slug or "").strip() or _slugify_title(title)
+
+    scripts_dir = Path(__file__).resolve().parent
+    py = sys.executable
+
+    t_start = time.perf_counter()
+
+    if not args.no_audio:
+        rc = _run("audio", [py, str(scripts_dir/"1_fetch_audio_mp3.py"), "--artist", artist, "--title", title, "--slug", slug])
+        if rc != 0:
+            raise SystemExit(rc)
+
+    if not args.no_txt:
+        rc = _run("txt", [py, str(scripts_dir/"1_fetch_lyrics_txt.py"), "--artist", artist, "--title", title, "--slug", slug])
+        if rc != 0:
+            print("[txt] failed (continuing)")
+
+    if not args.no_lrc:
+        rc = _run("lrc", [py, str(scripts_dir/"1_fetch_lyrics_lrc.py"), "--artist", artist, "--title", title, "--slug", slug])
+        if rc != 0:
+            print("[lrc] failed (continuing)")
+
+    if not args.no_captions:
+        rc = _run("captions", [py, str(scripts_dir/"1_fetch_captions_vtt.py"), "--artist", artist, "--title", title, "--slug", slug])
+        if rc != 0:
+            print("[captions] failed (continuing)")
+
+    dt = time.perf_counter() - t_start
+    print(f"[SUMMARY] Step1 completed in {dt:.2f}s")
+    print(json.dumps({"type": "result", "slug": slug}, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()
