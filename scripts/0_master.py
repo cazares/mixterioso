@@ -4,10 +4,10 @@
 
 Major rules:
 - NO free-form slug/query at startup.
-- Step1 (1_txt_mp3.py) is the ONLY place a NEW slug is created.
+- Step1 (1_fetch.py) is the ONLY place a NEW slug is created.
 - For existing songs (when Step1 is not run), user picks a slug from a filtered list.
 - Slug is constant for Steps 2–5 once chosen/created.
-- Offset is only asked at Step4, default = –1.50 seconds.
+- Offset is only asked at Step4, default = 0.0 seconds.
 """
 
 import subprocess
@@ -16,9 +16,6 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set
 
-# ==========================================================
-# COLORS / LOGGING
-# ==========================================================
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
 CYAN   = "\033[36m"
@@ -31,11 +28,8 @@ BLUE   = "\033[34m"
 def log(section: str, msg: str, color: str = CYAN) -> None:
     print(f"{color}[{section}]{RESET} {msg}")
 
-# ==========================================================
-# PATHS / SLUGIFY
-# ==========================================================
 try:
-    from mix_utils import PATHS, slugify  # type: ignore
+    from mix_utils import PATHS, slugify
 except Exception:
     BASE_DIR = Path(__file__).resolve().parent.parent
     PATHS = {
@@ -63,9 +57,6 @@ TIMINGS_DIR  = PATHS["timings"]
 OUTPUT_DIR   = PATHS["output"]
 PYTHON_BIN   = sys.executable
 
-# ==========================================================
-# SLUG DISCOVERY
-# ==========================================================
 def _stems_from_dir(d: Path, exts: Sequence[str]) -> Set[str]:
     out: Set[str] = set()
     if d.exists():
@@ -84,9 +75,6 @@ def collect_existing_slugs() -> List[str]:
     slugs |= _stems_from_dir(OUTPUT_DIR, [".mp4", ".mkv"])
     return sorted(slugs)
 
-# ==========================================================
-# PIPELINE STATUS
-# ==========================================================
 def step1_ready(slug: str) -> bool:
     return (TXT_DIR / f"{slug}.txt").exists() and (MP3_DIR / f"{slug}.mp3").exists()
 
@@ -128,9 +116,6 @@ def print_status(slug: str) -> None:
     print(f"  5 upload  : {st[5]}")
     print("")
 
-# ==========================================================
-# EXISTING SONG SELECTION (NO NEW SONG CREATION HERE)
-# ==========================================================
 def choose_existing_slug(existing_slugs: List[str]) -> str:
     if not existing_slugs:
         log("SLUG", "No existing songs found; Step1 is required to create a new one.", RED)
@@ -169,19 +154,9 @@ def choose_existing_slug(existing_slugs: List[str]) -> str:
 
         log("SLUG", "Invalid selection, please try again.", YELLOW)
 
-# ==========================================================
-# STEP1 — INTERACTIVE CREATION OF NEW SONG
-# ==========================================================
 def run_step1_interactive() -> Optional[str]:
-    """
-    LKGV behavior:
-    - Prompt user for Artist + Title
-    - Compute slug
-    - Run 1_txt_mp3.py with --artist --title --slug
-    """
-
     print("")
-    log("STEP1", "Creating NEW song (TXT + MP3)", WHITE)
+    log("STEP1", "Creating NEW song (lyrics + audio)", WHITE)
 
     artist = input("  Artist: ").strip()
     title  = input("  Title : ").strip()
@@ -194,7 +169,7 @@ def run_step1_interactive() -> Optional[str]:
     print(f"  Slug   : {slug}")
 
     cmd = [
-        str(SCRIPTS_DIR / "1_txt_mp3.py"),
+        str(SCRIPTS_DIR / "1_fetch.py"),
         "--artist", artist,
         "--title", title,
         "--slug", slug,
@@ -202,13 +177,11 @@ def run_step1_interactive() -> Optional[str]:
 
     rc = run_subprocess(1, cmd)
     if rc != 0:
+        log("STEP1", "Fetch failed.", RED)
         return None
 
     return slug
 
-# ==========================================================
-# STEP EXECUTION HELPERS
-# ==========================================================
 def run_subprocess(step: int, args: Sequence[str]) -> int:
     cmd = [PYTHON_BIN] + list(args)
     log(f"STEP{step}", " ".join(str(x) for x in cmd), GREEN)
@@ -227,25 +200,12 @@ def run_step2(slug: str) -> None:
 def run_step3(slug: str) -> None:
     run_subprocess(3, [str(SCRIPTS_DIR / "3_timing.py"), "--slug", slug])
 
-def prompt_for_offset() -> float:
-    print("")
-    log("OFFSET", "MP4 render timing offset", WHITE)
-    print("  Positive → lyrics later / delayed")
-    print("  Negative → lyrics earlier")
-    print("  Default = 0.0s")
-    print("")
-    return 0.0
-
 def run_step4(slug: str) -> None:
-    offset = prompt_for_offset()
-    run_subprocess(4, [str(SCRIPTS_DIR / "4_mp4.py"), "--slug", slug, "--offset", str(offset)])
+    run_subprocess(4, [str(SCRIPTS_DIR / "4_mp4.py"), "--slug", slug, "--offset", "0.0"])
 
 def run_step5(slug: str) -> None:
     run_subprocess(5, [str(SCRIPTS_DIR / "5_upload.py"), "--slug", slug])
 
-# ==========================================================
-# MAIN
-# ==========================================================
 def normalize_steps(raw: str) -> List[int]:
     raw = raw.strip()
     if not raw or raw == "0":
@@ -268,10 +228,10 @@ def main() -> None:
     log("SONGS", f"{len(existing_slugs)} existing song(s) detected.", WHITE)
     print("")
     print("Available Steps:")
-    print("  1) TXT/MP3      – Fetch lyrics + download MP3 (creates/updates slug)")
+    print("  1) FETCH        – Lyrics + Audio (creates slug)")
     print("  2) STEMS        – Demucs stem extraction + mix")
-    print("  3) TIMING       – Manual lyric timing (curses)")
-    print("  4) MP4 RENDER   – Create karaoke video (offset applied here)")
+    print("  3) TIMING       – Manual lyric timing")
+    print("  4) MP4 RENDER   – Create karaoke video")
     print("  5) UPLOAD       – YouTube uploader")
     print("")
     raw = input("Select steps to run (e.g. 1345; 0=none): ").strip()
@@ -285,13 +245,11 @@ def main() -> None:
 
     pipeline_slug: Optional[str] = None
 
-    # If Step1 is NOT requested, choose existing slug
     if 1 not in steps:
         pipeline_slug = choose_existing_slug(existing_slugs)
         print("")
         print_status(pipeline_slug)
 
-    # Execute steps
     for step in steps:
         if step == 1:
             slug = run_step1_interactive()
@@ -301,29 +259,13 @@ def main() -> None:
             pipeline_slug = slug
             print("")
             print_status(pipeline_slug)
-
         elif step == 2:
-            if not pipeline_slug:
-                log("STEP2", "No slug available. Step1 or existing selection required.", RED)
-                return
             run_step2(pipeline_slug)
-
         elif step == 3:
-            if not pipeline_slug:
-                log("STEP3", "No slug available. Step1 or existing selection required.", RED)
-                return
             run_step3(pipeline_slug)
-
         elif step == 4:
-            if not pipeline_slug:
-                log("STEP4", "No slug available. Step1 or existing selection required.", RED)
-                return
             run_step4(pipeline_slug)
-
         elif step == 5:
-            if not pipeline_slug:
-                log("STEP5", "No slug available. Step1 or existing selection required.", RED)
-                return
             run_step5(pipeline_slug)
 
     log("MAIN", "Pipeline finished.", GREEN)
