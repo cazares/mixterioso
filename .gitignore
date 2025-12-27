@@ -51,3 +51,6 @@ gentle*/
 mfa_env/
 !wavs/**
 !corpus/
+*.lrc
+*.json3
+*.offset
