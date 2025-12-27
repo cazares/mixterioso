@@ -13,6 +13,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import subprocess
 import re
 import sys
 from pathlib import Path
@@ -73,7 +74,12 @@ def main(argv=None) -> int:
     else:
         offset = 1.0 if s3_source == "lrc" else 0.0
 
-    step4_build(paths, slug=slug, offset=offset, flags=flags)
+    # step4_build removed; render via 4_mp4.py
+    render_cmd = [sys.executable, '4_mp4.py', '--slug', slug, '--offset', str(offset)]
+    subprocess.run(render_cmd, check=True)
+
+    # legacy call disabled
+    # step4_build(paths, slug=slug, offset=offset, flags=flags)
 
     log("MAIN", "Done", color="\033[32m")
     return 0
