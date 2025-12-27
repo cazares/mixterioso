@@ -212,10 +212,15 @@ def is_music_only(text: str) -> bool:
 
 
 def read_meta(slug: str) -> tuple[str, str]:
-    meta_path = META_DIR / f"{slug}.json"
-    artist = ""
+    meta_path = None
+    cand1 = META_DIR / f"{slug}.step1.json"
+    cand2 = META_DIR / f"{slug}.json"
+    if cand1.exists():
+        meta_path = cand1
+    elif cand2.exists():
+        meta_path = cand2artist = ""
     title = slug
-    if meta_path.exists():
+    if meta_path and meta_path.exists():
         try:
             data = json.loads(meta_path.read_text(encoding="utf-8"))
             artist = data.get("artist") or ""
@@ -223,7 +228,6 @@ def read_meta(slug: str) -> tuple[str, str]:
         except Exception as e:
             log("META", f"Failed to read meta {meta_path}: {e}", YELLOW)
     return artist, title
-
 
 def read_timings(slug: str):
     """
