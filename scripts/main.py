@@ -137,7 +137,7 @@ def main():
         # Default offset rule (locked):
         # - If LRC exists (and appears valid): +1.0s
         # - Otherwise (e.g., VTT): 0.0s
-        offset = 1.0 if lrc_looks_valid(lrc_path) else 0.0
+        offset = -0.5 if lrc_looks_valid(lrc_path) else 0.0
 
     if args.confirm_offset:
         # If we do NOT have a saved offset yet, try to auto-suggest a good starting offset
