@@ -5,11 +5,12 @@ import sys
 from pathlib import Path
 import re
 
-from .common import IOFlags, Paths, log, slugify
+from .common import IOFlags, Paths, log, slugify, YELLOW
 from .offset_tuner import tune_offset
 from .step1_fetch import step1_fetch
 from .step2_split import step2_split
 from .step3_sync import step3_sync
+from .auto_offset import suggest_initial_offset
 
 # ─────────────────────────────────────────────
 # Helpers
@@ -45,6 +46,21 @@ def resolve_renderer(scripts_dir: Path) -> Path:
         return p2
     raise RuntimeError(f"Renderer not found. Tried: {p1} and {p2}")
 
+
+
+
+def read_saved_offset(paths: Paths, slug: str) -> float | None:
+    """Read timings/<slug>.offset if it exists and contains a float."""
+    p = paths.timings / f"{slug}.offset"
+    if not p.exists():
+        return None
+    try:
+        raw = p.read_text(encoding="utf-8", errors="ignore").strip()
+        if not raw:
+            return None
+        return float(raw)
+    except Exception:
+        return None
 
 # ─────────────────────────────────────────────
 # Main
@@ -111,9 +127,35 @@ def main():
     # - If LRC exists (and appears valid): +1.0s
     # - Otherwise (e.g., VTT): 0.0s
     lrc_path = paths.timings / f"{slug}.lrc"
-    offset = 1.0 if lrc_looks_valid(lrc_path) else 0.0
+
+    # Prefer previously locked offset (timings/<slug>.offset) for both interactive and non-interactive runs.
+    saved = read_saved_offset(paths, slug)
+    if saved is not None:
+        offset = saved
+        log("OFFSET", f"Using saved offset: {offset:+.2f}s")
+    else:
+        # Default offset rule (locked):
+        # - If LRC exists (and appears valid): +1.0s
+        # - Otherwise (e.g., VTT): 0.0s
+        offset = 1.0 if lrc_looks_valid(lrc_path) else 0.0
 
     if args.confirm_offset:
+        # If we do NOT have a saved offset yet, try to auto-suggest a good starting offset
+        # using a very small Whisper-based audio slice. This never auto-locks; it only
+        # chooses the initial offset presented to the human.
+        if saved is None:
+            try:
+                suggested = suggest_initial_offset(
+                    paths=paths,
+                    slug=slug,
+                    base_offset=offset,
+                    flags=flags,
+                )
+                if suggested is not None:
+                    offset = suggested
+            except Exception as e:
+                log("AUTO_OFFSET", f"Skipped: {e}", YELLOW)
+
         offset = tune_offset(
             slug=slug,
             base_offset=offset,
@@ -121,7 +163,6 @@ def main():
             timings_dir=paths.timings,
             renderer_path=renderer,
         )
-
     # Step 4: render (reuse 4_mp4.py unchanged)
     render_cmd = [
         sys.executable,
