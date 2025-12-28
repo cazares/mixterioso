@@ -158,6 +158,11 @@ def main():
     p.add_argument("--confirm-offset", action="store_true", help="Interactively confirm lyric offset")
     p.add_argument("--force", "-f", action="store_true", help="Overwrite without prompts")
     p.add_argument("--dry-run", action="store_true", help="No writes (best-effort)")
+    p.add_argument("--mix-mode", choices=["full", "stems"], default="full", help="Audio mixing: full copies MP3; stems runs Demucs and mixes stems")
+    p.add_argument("--vocals", type=float, default=100.0, help="Vocals level percent (100=unchanged, 0=mute)")
+    p.add_argument("--bass", type=float, default=100.0, help="Bass level percent (100=unchanged, 0=mute)")
+    p.add_argument("--drums", type=float, default=100.0, help="Drums level percent (100=unchanged, 0=mute)")
+    p.add_argument("--other", type=float, default=100.0, help="Other level percent (100=unchanged, 0=mute)")
     args = p.parse_args()
 
     scripts_dir = Path(__file__).resolve().parent
@@ -190,20 +195,20 @@ def main():
     # Step 2: split/mix
     # NOTE: step2_split requires explicit mix args. Locked v1.x behavior:
     # default mode "full" copies mp3s/<slug>.mp3 to mixes/<slug>.mp3.
-    mix_mode = "full"
-    vocals_db = 0.0
-    bass_db = 0.0
-    drums_db = 0.0
-    other_db = 0.0
+    mix_mode = args.mix_mode
+    vocals = args.vocals
+    bass = args.bass
+    drums = args.drums
+    other = args.other
 
     step2_split(
         paths,
         slug=slug,
         mix_mode=mix_mode,
-        vocals_db=vocals_db,
-        bass_db=bass_db,
-        drums_db=drums_db,
-        other_db=other_db,
+        vocals=vocals,
+        bass=bass,
+        drums=drums,
+        other=other,
         flags=flags,
     )
 

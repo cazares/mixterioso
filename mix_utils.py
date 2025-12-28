@@ -14,16 +14,20 @@ import subprocess
 import time
 from pathlib import Path
 
+from scripts.common import (
 # ─────────────────────────────────────────────
 # COLORS
 # ─────────────────────────────────────────────
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-CYAN   = "\033[36m"
-GREEN  = "\033[32m"
-YELLOW = "\033[33m"
-RED    = "\033[31m"
-BLUE   = "\033[34m"
+    RESET,
+    CYAN,
+    GREEN,
+    YELLOW,
+    RED,
+    BLUE,
+    WHITE,
+    BOLD,
+    DEFAULT_DEMUCS_MODEL
+)
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -165,7 +169,6 @@ def inspect_stems(stem_path: Path, tracks=("vocals","bass","drums","other")):
 # ─────────────────────────────────────────────
 # RUN DEMUCS
 # ─────────────────────────────────────────────
-DEFAULT_DEMUCS_MODEL = "htdemucs"
 
 def run_demucs(mp3_path: Path, model: str = DEFAULT_DEMUCS_MODEL):
     cmd = ["demucs", "-n", model, str(mp3_path)]

@@ -81,8 +81,8 @@ NEXT_LABEL_LEFT_MARGIN_PX = DIVIDER_LEFT_MARGIN_PX + NEXT_LABEL_TOP_MARGIN_PX
 
 # Fade timing (milliseconds) applied to each lyric change.
 # Only used for the main lyric line and the preview ("next line") text.
-FADE_IN_MS = 50
-FADE_OUT_MS = 50
+FADE_IN_MS = 0
+FADE_OUT_MS = 0
 
 # =============================================================================
 # COLOR AND OPACITY CONSTANTS
@@ -708,7 +708,7 @@ def main(argv=None):
         "-f",
         "lavfi",
         "-i",
-        f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=30:d={max(audio_duration, 1.0)}",
+        f"color=c=black:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:r=15:d={max(audio_duration, 1.0)}",
         "-i",
         str(audio_path),
         "-vf",
@@ -716,9 +716,9 @@ def main(argv=None):
         "-c:v",
         "libx264",
         "-preset",
-        "medium",
+        "ultrafast",
         "-crf",
-        "18",
+        "23",
         "-c:a",
         "aac",
         "-b:a",
