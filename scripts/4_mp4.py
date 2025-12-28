@@ -24,9 +24,8 @@ TIMINGS_DIR = BASE_DIR / "timings"
 OUTPUT_DIR = BASE_DIR / "output"
 META_DIR = BASE_DIR / "meta"
 
-VIDEO_WIDTH = 1920
-VIDEO_HEIGHT = 1080
-
+VIDEO_WIDTH = 1280
+VIDEO_HEIGHT = 720
 # =============================================================================
 # LAYOUT CONSTANTS
 # =============================================================================
@@ -127,7 +126,7 @@ NEXT_LABEL_ALPHA_HEX = GLOBAL_NEXT_ALPHA_HEX  # semi-transparent label
 
 # Base UI font size in "points" (converted to ASS by a multiplier).
 DEFAULT_UI_FONT_SIZE = 120
-ASS_FONT_MULTIPLIER = 1.5  # multiple of UI font size to get ASS fontsize
+ASS_FONT_MULTIPLIER = 1.5 * 0.67  # multiple of UI font size to get ASS fontsize
 
 # Global lyrics timing offset in seconds. Positive = delay, negative = earlier.
 # This is applied uniformly to all lyric timestamps at render time so you can

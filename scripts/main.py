@@ -4,8 +4,9 @@ import subprocess
 import sys
 from pathlib import Path
 import re
+import time
 
-from .common import IOFlags, Paths, log, slugify
+from .common import IOFlags, Paths, log, slugify, YELLOW
 from .offset_tuner import tune_offset
 from .step1_fetch import step1_fetch
 from .step2_split import step2_split
@@ -46,10 +47,28 @@ def resolve_renderer(scripts_dir: Path) -> Path:
     raise RuntimeError(f"Renderer not found. Tried: {p1} and {p2}")
 
 
+
+
+def read_saved_offset(paths: Paths, slug: str) -> float | None:
+    """Read timings/<slug>.offset if it exists and contains a float."""
+    p = paths.timings / f"{slug}.offset"
+    if not p.exists():
+        return None
+    try:
+        raw = p.read_text(encoding="utf-8", errors="ignore").strip()
+        if not raw:
+            return None
+        return float(raw)
+    except Exception:
+        return None
+
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
 def main():
+    t0 = time.perf_counter()
+    log('', f"[TIMER] Start")
+
     p = argparse.ArgumentParser(description="Mixterioso single-entry pipeline")
     p.add_argument("--query", required=True, help='Format: "Artist - Title"')
     p.add_argument("--confirm-offset", action="store_true", help="Interactively confirm lyric offset")
@@ -111,7 +130,17 @@ def main():
     # - If LRC exists (and appears valid): +1.0s
     # - Otherwise (e.g., VTT): 0.0s
     lrc_path = paths.timings / f"{slug}.lrc"
-    offset = 1.0 if lrc_looks_valid(lrc_path) else 0.0
+
+    # Prefer previously locked offset (timings/<slug>.offset) for both interactive and non-interactive runs.
+    saved = read_saved_offset(paths, slug)
+    if saved is not None:
+        offset = saved
+        log("OFFSET", f"Using saved offset: {offset:+.2f}s")
+    else:
+        # Default offset rule (locked):
+        # - If LRC exists (and appears valid): +1.0s
+        # - Otherwise (e.g., VTT): 0.0s
+        offset = 0.0
 
     if args.confirm_offset:
         offset = tune_offset(
@@ -133,6 +162,11 @@ def main():
     ]
     log("RENDER", " ".join(render_cmd))
     subprocess.run(render_cmd, check=True)
+
+    t1 = time.perf_counter()
+    elapsed = t1 - t0
+    log('', f"[TIMER] End")
+    log('', f"[TIMER] Elapsed: {elapsed:.3f}s ({elapsed/60.0:.2f}m)")
 
     return 0
 
