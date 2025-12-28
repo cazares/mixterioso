@@ -26,7 +26,6 @@ from .common import (
     WHITE,
     GREEN,
     YELLOW,
-    DEFAULT_DEMUCS_MODEL
 )
 
 
@@ -108,8 +107,8 @@ def _ensure_demucs_stems(paths: Paths, slug: str, src_mp3: Path, flags: IOFlags)
     Expected layout (Demucs default):
       separated/DEFAULT_DEMUCS_MODEL/<slug>/{vocals,bass,drums,other}.wav
     """
-    model = DEFAULT_DEMUCS_MODEL
-    stem_dir = paths.separated / model / slug
+    model = "mdx_extra_q"
+    stem_dir = paths.separated / "mdx_extra_q" / slug
 
     have_all = all((stem_dir / f"{name}.wav").exists() for name in ("vocals", "bass", "drums", "other"))
     if have_all and not flags.force:
@@ -122,7 +121,7 @@ def _ensure_demucs_stems(paths: Paths, slug: str, src_mp3: Path, flags: IOFlags)
     cmd = [
         "demucs",
         "-n",
-        model,
+        "mdx_extra_q",
         "-o",
         str(paths.separated),
         str(src_mp3),
@@ -155,7 +154,7 @@ def _mix_stems_to_wav(
     drums_pct: float,
     other_pct: float,
     out_wav: Path,
-    flags: IOFlags,
+    flags: IOFlags
 ) -> None:
     if not have_exe("ffmpeg"):
         raise RuntimeError("ffmpeg not found on PATH (required for stems mixing)")
