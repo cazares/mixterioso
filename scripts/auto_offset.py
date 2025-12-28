@@ -33,19 +33,19 @@ from typing import List, Optional, Tuple
 from .common import IOFlags, Paths, log, YELLOW, BLUE
 
 DEFAULT_MODEL = os.environ.get("MIXTERIOSO_WHISPER_MODEL", "tiny")
-DEFAULT_READ_LEAD_SECS = float(os.environ.get("MIXTERIOSO_READ_LEAD_SECS", "0.75"))
+DEFAULT_READ_LEAD_SECS = float(os.environ.get("MIXTERIOSO_READ_LEAD_SECS", "0"))
 
 # Slice sizing: keep small, but tolerate a few seconds of initial drift.
-PRE_ROLL_SECS = 8.0
-POST_ROLL_SECS = 12.0
-SLICE_MAX_SECS = 20.0
+PRE_ROLL_SECS = 10.0
+POST_ROLL_SECS = 16.0
+SLICE_MAX_SECS = 30.0
 
 # Use first line + 1–2 more as confidence only.
-MAX_LINE_ATTEMPTS = 3
+MAX_LINE_ATTEMPTS = 60
 
 # Match requirements: we only need to confidently align the first lyric border.
-MIN_MATCH_RATIO = 0.55
-
+MIN_MATCH_RATIO = 0.05
+MIN_OVERLAP_RATIO = 0.0
 
 @dataclass
 class Match:
@@ -69,9 +69,53 @@ def _tokenize(s: str) -> List[str]:
     n = _norm(s)
     return [t for t in n.split(" ") if t]
 
+# Common stop-words (small, pragmatic set) used to reduce false token hits.
+# Keep this lightweight: we only need to avoid matching on 'the', 'and', etc.
+_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "had", "has", "have",
+    "he", "her", "hers", "him", "his", "i", "if", "in", "into", "is", "it", "its", "just", "me",
+    "my", "no", "not", "of", "on", "or", "our", "ours", "she", "so", "that", "the", "their",
+    "them", "then", "there", "these", "they", "this", "those", "to", "too", "up", "us", "was",
+    "we", "were", "what", "when", "where", "who", "why", "will", "with", "you", "your", "yours",
+
+    # Spanish
+    "al", "algo", "algunas", "algunos", "ante", "antes", "aqui", "asi", "aun", "aunque", "bien",
+    "como", "con", "contra", "cual", "cuando", "de", "del", "desde", "donde", "dos", "el", "ella",
+    "ellas", "ellos", "en", "entre", "era", "erais", "eran", "eras", "eres", "es", "esa", "esas",
+    "ese", "eso", "esos", "esta", "estaba", "estais", "estamos", "estan", "estar", "estas", "este",
+    "esto", "estos", "estoy", "fin", "fue", "fueron", "fui", "ha", "hace", "hacia", "han", "hasta",
+    "hay", "la", "las", "le", "les", "lo", "los", "mas", "me", "mi", "mis", "mucho", "muy", "ni",
+    "nos", "nuestra", "nuestro", "o", "os", "otra", "otros", "para", "pero", "por", "porque", "que",
+    "quien", "se", "sin", "sobre", "su", "sus", "tambien", "te", "tiene", "tu", "tus", "un", "una",
+    "uno", "unos", "y", "ya",
+}
+
+
+def _filter_tokens(tokens: List[str]) -> List[str]:
+    # Drop short tokens and stop-words; keep numbers (e.g., '18').
+    out: List[str] = []
+    for t in tokens:
+        if not t:
+            continue
+        if t in _STOPWORDS:
+            continue
+        if len(t) < 3 and not t.isdigit():
+            continue
+        out.append(t)
+    return out
+
+
+def _focus_tokens(text: str, *, max_tokens: int = 12) -> List[str]:
+    # Prefer meaningful (non-stopword) tokens; fall back to raw tokens if needed.
+    toks = _tokenize(text)[:max_tokens * 2]
+    filt = _filter_tokens(toks)
+    if len(filt) >= 2:
+        return filt[:max_tokens]
+    return toks[:max_tokens]
+
 
 def _pick_audio(paths: Paths, slug: str) -> Path:
-    for p in [paths.mixes / f"{slug}.wav", paths.mixes / f"{slug}.mp3", paths.mp3s / f"{slug}.mp3"]:
+    for p in [paths.mp3s / f"{slug}.mp3", paths.mixes / f"{slug}.mp3", paths.mixes / f"{slug}.wav"]:
         if p.exists():
             return p
     raise FileNotFoundError(f"No audio found for slug={slug} (expected mixes/ or mp3s/)")
@@ -190,8 +234,8 @@ def _best_word_sequence_match(lyric_tokens: List[str], words: List[Tuple[str, fl
     if not lyric_tokens or not words:
         return 0.0, 0.0
 
-    # Use first 4 tokens as anchor.
-    anchor = lyric_tokens[:4]
+    # Use a small meaningful anchor (avoid stop-words like 'the', 'and').
+    anchor = _filter_tokens(lyric_tokens)[:4] or lyric_tokens[:4]
     if not anchor:
         return 0.0, 0.0
 
@@ -207,7 +251,7 @@ def _best_word_sequence_match(lyric_tokens: List[str], words: List[Tuple[str, fl
         matched = 1
         for k in range(1, len(anchor)):
             found = False
-            for j in range(pos + 1, min(pos + 10, len(words))):
+            for j in range(pos + 1, min(pos + 25, len(words))):
                 if words[j][0] == anchor[k]:
                     pos = j
                     matched += 1
@@ -233,7 +277,7 @@ def _best_token_hit(lyric_tokens: List[str], words: List[Tuple[str, float]]) -> 
     if not lyric_tokens or not words:
         return 0.0, 0.0
 
-    targets = set(lyric_tokens[:6])
+    targets = set(_filter_tokens(lyric_tokens)[:8] or lyric_tokens[:6])
     if not targets:
         return 0.0, 0.0
 
@@ -262,6 +306,28 @@ def _fallback_text_ratio(lyric_text: str, transcript_text: str) -> float:
     return len(lset & tset) / float(len(lset))
 
 
+
+def _overlap_ratio(lyric_text: str, transcript_text: str, words: List[Tuple[str, float]]) -> float:
+    """Token overlap ratio, but focused on meaningful early lyric tokens.
+
+    Uses both segment text and word tokens to avoid false zeros when one of them is sparse.
+    """
+    focus = set(_focus_tokens(lyric_text))
+    if not focus:
+        return 0.0
+
+    trans = set()
+    try:
+        trans |= set(_tokenize(transcript_text))
+    except Exception:
+        pass
+    try:
+        trans |= set(w for (w, _t) in (words or []))
+    except Exception:
+        pass
+    if not trans:
+        return 0.0
+    return len(focus & trans) / float(len(focus))
 def suggest_initial_offset(
     *,
     paths: Paths,
@@ -294,6 +360,7 @@ def suggest_initial_offset(
         return None
 
     audio_path = _pick_audio(paths, slug)
+    log("AUTO_OFFSET", f"Using audio for transcription: {audio_path}", BLUE)
 
     # Slice cache directory
     slice_cache_dir = paths.cache / "auto_offset_slices"
@@ -336,8 +403,8 @@ def suggest_initial_offset(
         lyric_tokens = _tokenize(lyric_text)
         seq_score, seq_t_rel = _best_word_sequence_match(lyric_tokens, words)
         hit_score, hit_t_rel = _best_token_hit(lyric_tokens, words)
-        overlap_score = _fallback_text_ratio(lyric_text, transcript_text)
-        
+        overlap_score = _overlap_ratio(lyric_text, transcript_text, words)
+
         # Pick the best timestamped match (sequence match preferred), gated by overlap to avoid false hits.
         score = 0.0
         t_rel = 0.0
@@ -346,9 +413,13 @@ def suggest_initial_offset(
         else:
             score, t_rel = hit_score, hit_t_rel
         
-        if score < MIN_MATCH_RATIO or overlap_score < 0.20:
+        if False and score < MIN_MATCH_RATIO:
             log("AUTO_OFFSET", f"Line {line_index}: no confident match (score={score:.2f}, overlap={overlap_score:.2f})", YELLOW)
             continue
+        # Gate weaker matches with a small overlap requirement to reduce false hits.
+        # if score < 0.85 and overlap_score < MIN_OVERLAP_RATIO:
+        #     log("AUTO_OFFSET", f"Line {line_index}: low overlap (score={score:.2f}, overlap={overlap_score:.2f})", YELLOW)
+        #     continue
         
         detected_abs = start + t_rel
         # perceptual lead: show lyrics slightly earlier than vocal start

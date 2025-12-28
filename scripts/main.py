@@ -163,6 +163,25 @@ def main():
             timings_dir=paths.timings,
             renderer_path=renderer,
         )
+    else:
+    # Auto mode (non-confirmation): run auto_offset if no saved offset
+        if saved is None:
+            try:
+                suggested = suggest_initial_offset(
+                    paths=paths,
+                    slug=slug,
+                    base_offset=offset,
+                    flags=flags,
+                )
+                if suggested is not None:
+                    offset = suggested
+                    (paths.timings / f"{slug}.offset").write_text(f"{offset:.3f}\n")
+                    log("AUTO_OFFSET", f"Auto-applied offset {offset:+.2f}s", BLUE)
+                else:
+                    log("AUTO_OFFSET", "No confident match, using default offset", YELLOW)
+            except Exception as e:
+                log("AUTO_OFFSET", f"Auto-offset skipped: {e}", YELLOW)
+
     # Step 4: render (reuse 4_mp4.py unchanged)
     render_cmd = [
         sys.executable,
@@ -174,7 +193,6 @@ def main():
     ]
     log("RENDER", " ".join(render_cmd))
     subprocess.run(render_cmd, check=True)
-
     return 0
 
 
