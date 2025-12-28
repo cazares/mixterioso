@@ -5,12 +5,14 @@ import sys
 from pathlib import Path
 import re
 import time
+import csv
 
-from .common import IOFlags, Paths, log, slugify, YELLOW
+from .common import IOFlags, Paths, log, slugify, YELLOW, WHITE, write_text
 from .offset_tuner import tune_offset
 from .step1_fetch import step1_fetch
 from .step2_split import step2_split
 from .step3_sync import step3_sync
+from .first_word_time import estimate_first_word_time
 
 # ─────────────────────────────────────────────
 # Helpers
@@ -47,6 +49,88 @@ def resolve_renderer(scripts_dir: Path) -> Path:
     raise RuntimeError(f"Renderer not found. Tried: {p1} and {p2}")
 
 
+
+
+
+def _read_first_time_secs_from_csv(csv_path: Path) -> float | None:
+    """Read the first (earliest) time_secs from a canonical timings CSV."""
+    if not csv_path.exists():
+        return None
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row:
+                    continue
+                raw = (row.get("time_secs") or "").strip()
+                if not raw:
+                    continue
+                return float(raw)
+    except Exception:
+        return None
+    return None
+
+
+def _pick_audio_for_first_word(paths: Paths, slug: str) -> Path | None:
+    """Prefer mixes/<slug>.mp3 (pipeline invariant); fall back to mp3s/<slug>.mp3."""
+    for p in [
+        paths.mixes / f"{slug}.mp3",
+        paths.mixes / f"{slug}.wav",
+        paths.mp3s / f"{slug}.mp3",
+    ]:
+        if p.exists():
+            return p
+    return None
+
+
+def _maybe_autoshift_offset_from_first_word(paths: Paths, slug: str, flags: IOFlags) -> None:
+    """
+    If timings and audio exist, compute an approximate first-word time.
+    If the first lyric line time is 'off' vs computed time, write timings/<slug>.offset
+    as a global shift (applies to all lyric lines at render time).
+
+    Safety:
+    - If timings/<slug>.offset already exists: do not overwrite unless --force is used
+    - Skip entirely on --dry-run (avoid heavy compute)
+    """
+    if flags.dry_run:
+        log("FIRSTWORD", "[dry-run] Skipping first-word compute", WHITE)
+        return
+
+    offset_path = paths.timings / f"{slug}.offset"
+    if offset_path.exists() and not flags.force:
+        # Respect user-tuned or previously locked offsets
+        log("FIRSTWORD", f"Offset exists; skipping auto-shift (use --force to overwrite): {offset_path}", WHITE)
+        return
+
+    csv_path = paths.timings / f"{slug}.csv"
+    first_line_t = _read_first_time_secs_from_csv(csv_path)
+    if first_line_t is None:
+        log("FIRSTWORD", f"No timings CSV first-line time found; skipping: {csv_path}", WHITE)
+        return
+
+    audio_path = _pick_audio_for_first_word(paths, slug)
+    if audio_path is None:
+        log("FIRSTWORD", f"No audio found for first-word compute; skipping (expected mixes/ or mp3s/)", WHITE)
+        return
+
+    res = estimate_first_word_time(str(audio_path), language=None, verbose=False)
+    if res is None:
+        log("FIRSTWORD", "No first-word time detected; skipping auto-shift", WHITE)
+        return
+
+    computed_t = float(res.first_word_time_secs)
+    delta = computed_t - float(first_line_t)
+
+    # Treat small differences as noise (first-word estimate is intentionally rough)
+    THRESH = 0.75
+    if abs(delta) < THRESH:
+        log("FIRSTWORD", f"First line looks OK (csv={first_line_t:.3f}s, first_word={computed_t:.3f}s, delta={delta:+.3f}s). No shift.", WHITE)
+        return
+
+    # Write the global offset shift
+    log("FIRSTWORD", f"Auto-shifting lyrics (TRUSTING first-word): csv_first_line={first_line_t:.3f}s, first_word={computed_t:.3f}s, delta={delta:+.3f}s -> {offset_path}", WHITE)
+    write_text(offset_path, f"{delta:.3f}\n", flags, label="offset_auto")
 
 
 def read_saved_offset(paths: Paths, slug: str) -> float | None:
@@ -124,7 +208,9 @@ def main():
     )
 
     # Step 3: sync (build timings CSV from LRC or VTT)
-    step3_sync(paths, slug=slug, flags=flags)
+    sync_source = step3_sync(paths, slug=slug, flags=flags)
+
+    _maybe_autoshift_offset_from_first_word(paths, slug, flags)
 
     # Default offset rule (locked):
     # - If LRC exists (and appears valid): +1.0s
