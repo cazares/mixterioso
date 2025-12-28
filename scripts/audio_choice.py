@@ -4,12 +4,27 @@
 
 import os
 from pathlib import Path
-import librosa
+import subprocess
 
 ROOT = Path(__file__).resolve().parent.parent
 MP3_DIR = ROOT / "mp3s"
 OUTPUT_DIR = ROOT / "output"
 
+
+def _ffprobe_duration_secs(path: Path) -> float:
+    """Return media duration in seconds using ffprobe (requires ffmpeg)."""
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
+        return float(out) if out else 0.0
+    except Exception:
+        return 0.0
 
 def choose_audio_source(slug: str):
     """Return (mp3_path, mp4_path) and pick preferred audio automatically."""
@@ -24,13 +39,10 @@ def choose_audio_source(slug: str):
         return None, None
 
     mp3_dur = mp4_dur = 0.0
-    try:
-        if mp3_exists:
-            mp3_dur = librosa.get_duration(path=mp3_path)
-        if mp4_exists:
-            mp4_dur = librosa.get_duration(path=mp4_path)
-    except Exception:
-        pass
+    if mp3_exists:
+        mp3_dur = _ffprobe_duration_secs(mp3_path)
+    if mp4_exists:
+        mp4_dur = _ffprobe_duration_secs(mp4_path)
 
     diff = abs(mp3_dur - mp4_dur)
     if mp4_exists and (diff < 0.5):
