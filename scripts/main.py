@@ -4,13 +4,13 @@ import subprocess
 import sys
 from pathlib import Path
 import re
+import time
 
 from .common import IOFlags, Paths, log, slugify, YELLOW
 from .offset_tuner import tune_offset
 from .step1_fetch import step1_fetch
 from .step2_split import step2_split
 from .step3_sync import step3_sync
-from .auto_offset import suggest_initial_offset
 
 # ─────────────────────────────────────────────
 # Helpers
@@ -66,6 +66,9 @@ def read_saved_offset(paths: Paths, slug: str) -> float | None:
 # Main
 # ─────────────────────────────────────────────
 def main():
+    t0 = time.perf_counter()
+    log('', f"[TIMER] Start")
+
     p = argparse.ArgumentParser(description="Mixterioso single-entry pipeline")
     p.add_argument("--query", required=True, help='Format: "Artist - Title"')
     p.add_argument("--confirm-offset", action="store_true", help="Interactively confirm lyric offset")
@@ -137,25 +140,9 @@ def main():
         # Default offset rule (locked):
         # - If LRC exists (and appears valid): +1.0s
         # - Otherwise (e.g., VTT): 0.0s
-        offset = -0.5 if lrc_looks_valid(lrc_path) else 0.0
+        offset = 0.0
 
     if args.confirm_offset:
-        # If we do NOT have a saved offset yet, try to auto-suggest a good starting offset
-        # using a very small Whisper-based audio slice. This never auto-locks; it only
-        # chooses the initial offset presented to the human.
-        if saved is None:
-            try:
-                suggested = suggest_initial_offset(
-                    paths=paths,
-                    slug=slug,
-                    base_offset=offset,
-                    flags=flags,
-                )
-                if suggested is not None:
-                    offset = suggested
-            except Exception as e:
-                log("AUTO_OFFSET", f"Skipped: {e}", YELLOW)
-
         offset = tune_offset(
             slug=slug,
             base_offset=offset,
@@ -163,24 +150,6 @@ def main():
             timings_dir=paths.timings,
             renderer_path=renderer,
         )
-    else:
-    # Auto mode (non-confirmation): run auto_offset if no saved offset
-        if saved is None:
-            try:
-                suggested = suggest_initial_offset(
-                    paths=paths,
-                    slug=slug,
-                    base_offset=offset,
-                    flags=flags,
-                )
-                if suggested is not None:
-                    offset = suggested
-                    (paths.timings / f"{slug}.offset").write_text(f"{offset:.3f}\n")
-                    log("AUTO_OFFSET", f"Auto-applied offset {offset:+.2f}s", BLUE)
-                else:
-                    log("AUTO_OFFSET", "No confident match, using default offset", YELLOW)
-            except Exception as e:
-                log("AUTO_OFFSET", f"Auto-offset skipped: {e}", YELLOW)
 
     # Step 4: render (reuse 4_mp4.py unchanged)
     render_cmd = [
@@ -193,6 +162,12 @@ def main():
     ]
     log("RENDER", " ".join(render_cmd))
     subprocess.run(render_cmd, check=True)
+
+    t1 = time.perf_counter()
+    elapsed = t1 - t0
+    log('', f"[TIMER] End")
+    log('', f"[TIMER] Elapsed: {elapsed:.3f}s ({elapsed/60.0:.2f}m)")
+
     return 0
 
 
