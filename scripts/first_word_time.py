@@ -23,7 +23,6 @@ Notes:
 import argparse
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Tuple, List
 
 import numpy as np
@@ -208,21 +207,16 @@ def _looks_like_real_speech(seg, w) -> bool:
     no_speech_prob = getattr(seg, "no_speech_prob", None)
     wprob = getattr(w, "probability", None)
 
-    # Model thinks there's no speech
     if no_speech_prob is not None and no_speech_prob > 0.60:
         return False
 
-    # Very poor decode
     if avg_logprob is not None and avg_logprob < -1.20:
         return False
 
-    # Low word confidence (when available)
     if wprob is not None and wprob < 0.25:
         return False
 
     word = (getattr(w, "word", "") or "").strip()
-
-    # Reject punctuation-ish tokens / 1-char artifacts
     if len(word) <= 1:
         return False
 
@@ -274,9 +268,9 @@ def estimate_first_word_time(
 
         segments, _info = model.transcribe(
             clip,
-            language=language,             # set to "en"/"es" to skip autodetect
-            beam_size=1,                   # greedy (fast)
-            vad_filter=False,              # already trimmed
+            language=language,
+            beam_size=1,
+            vad_filter=False,
             word_timestamps=True,
             condition_on_previous_text=False,
             temperature=0.0,
