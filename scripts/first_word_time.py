@@ -2,21 +2,24 @@
 """
 Estimate the time (seconds) of the very first *word* in a song with minimal Whisper compute.
 
-Goal: minimize compute time (Whisper used as little as possible).
+Key point: WebRTC VAD is trained for *speech*, and can completely miss *singing*.
+So this script uses an "auto" detector:
+  1) Try WebRTC VAD (fast, good when vocals are speech-like)
+  2) If VAD yields no candidates, fall back to a singing-friendly ENERGY detector
+     (band-limited amplitude envelope + threshold + sustained-run)
 
-Fast strategy:
-1) Decode to 16 kHz mono PCM and run aggressive WebRTC VAD + RMS gating to find a short list
-   of candidate "first speech-ish" times.
-2) Run faster-whisper on ONLY a few tiny windows (default: 3 windows x 8s) around those candidates.
-3) Reject likely hallucinations using no_speech_prob / avg_logprob / word probability heuristics.
-4) Return the timestamp of the earliest accepted first word (roughly).
+Then run faster-whisper on ONLY a few tiny windows (default: 3 windows x 8s) around candidates
+and reject hallucinations using no_speech_prob / avg_logprob / word probability heuristics.
 
 Requirements:
   - ffmpeg installed and on PATH
-  - pip3 install faster-whisper webrtcvad numpy
+  - pip3 install faster-whisper numpy webrtcvad
+
+Usage example:
+  python3 scripts/first_word_time.py --audio mp3s/the_zephyr_song.mp3 --language en --max-scan-secs 300 --verbose
 
 Notes:
-  - Best results if you run this on a vocals stem (e.g., Demucs vocals), but it works on mixes too.
+  - Best results if you run this on a vocals stem, but it works on mixes too.
   - This returns a *rough* first-word time, not sample-accurate alignment.
 """
 
@@ -29,12 +32,8 @@ import numpy as np
 
 try:
     import webrtcvad
-except Exception as e:
-    raise SystemExit(
-        "Missing dependency webrtcvad. Install with:\n"
-        "  pip3 install webrtcvad\n"
-        f"Original error: {e}"
-    )
+except Exception:
+    webrtcvad = None
 
 try:
     from faster_whisper import WhisperModel
@@ -56,14 +55,14 @@ class FirstWordResult:
 def _ffmpeg_decode_s16le_16k_mono(audio_path: str, bandpass: bool = True) -> np.ndarray:
     """
     Decode audio to mono 16kHz int16 PCM using ffmpeg.
-    Optionally band-pass filter to help VAD focus on voice-ish frequencies.
+    Optionally band-pass filter to help detectors focus on voice-ish frequencies.
     Returns float32 samples in [-1, 1].
     """
     af = []
     if bandpass:
-        # Speech-ish band (helps VAD ignore sub-bass + very high cymbals)
-        af.append("highpass=f=120")
-        af.append("lowpass=f=4000")
+        # For singing/voice detection, keep a slightly wider band than strict speech.
+        af.append("highpass=f=80")
+        af.append("lowpass=f=6000")
     af_str = ",".join(af) if af else "anull"
 
     cmd = [
@@ -89,20 +88,16 @@ def _find_voiced_candidates_webrtcvad(
     *,
     frame_ms: int = 30,
     vad_mode: int = 3,
-    min_consecutive_voiced_frames: int = 14,
-    max_scan_secs: float = 180.0,
-    max_candidates: int = 8,
-    rms_gate_db_above_median: float = 4.0,
+    min_consecutive_voiced_frames: int = 12,
+    max_scan_secs: float = 300.0,
+    max_candidates: int = 6,
 ) -> List[float]:
     """
-    Return a small list of candidate "first voice-ish" times.
-
-    Uses:
-    - Aggressive WebRTC VAD (mode 3)
-    - RMS gating relative to the median RMS within the scan region
-
-    Output times are in seconds since start of the track.
+    Candidate detector using WebRTC VAD (speech-trained). May miss singing.
     """
+    if webrtcvad is None:
+        return []
+
     if frame_ms not in (10, 20, 30):
         raise ValueError("frame_ms must be 10, 20, or 30")
 
@@ -112,33 +107,22 @@ def _find_voiced_candidates_webrtcvad(
     max_samples = int(min(len(audio_16k), max_scan_secs * sr))
 
     pcm16 = (np.clip(audio_16k[:max_samples], -1.0, 1.0) * 32767.0).astype(np.int16)
+    raw = pcm16.tobytes()
 
     n_frames = (len(pcm16) - frame_len) // frame_len + 1
     if n_frames <= 0:
         return []
 
-    # Per-frame RMS
-    rms = np.empty(n_frames, dtype=np.float32)
-    for fi in range(n_frames):
-        start = fi * frame_len
-        frame = pcm16[start : start + frame_len].astype(np.float32) / 32768.0
-        rms[fi] = float(np.sqrt(np.mean(frame * frame) + 1e-12))
-
-    med = float(np.median(rms))
-    gate = med * (10 ** (rms_gate_db_above_median / 20.0))
-
-    raw = pcm16.tobytes()
     candidates: List[float] = []
-
     voiced_run = 0
     in_region = False
     region_start_fi = 0
 
     for fi in range(n_frames):
         start = fi * frame_len
-        frame_bytes = raw[start * 2 : (start + frame_len) * 2]  # int16 -> 2 bytes each
+        frame_bytes = raw[start * 2 : (start + frame_len) * 2]
 
-        is_voiced = vad.is_speech(frame_bytes, sr) and (rms[fi] >= gate)
+        is_voiced = vad.is_speech(frame_bytes, sr)
 
         if is_voiced:
             if not in_region:
@@ -149,7 +133,6 @@ def _find_voiced_candidates_webrtcvad(
                 voiced_run += 1
 
             if voiced_run == min_consecutive_voiced_frames:
-                # Candidate at region start (earliest)
                 t = region_start_fi * (frame_ms / 1000.0)
                 candidates.append(t)
                 if len(candidates) >= max_candidates:
@@ -161,10 +144,90 @@ def _find_voiced_candidates_webrtcvad(
     return candidates
 
 
+def _moving_average(x: np.ndarray, win: int) -> np.ndarray:
+    if win <= 1:
+        return x
+    # pad to keep same length
+    pad = win // 2
+    xpad = np.pad(x, (pad, pad), mode="edge")
+    kernel = np.ones(win, dtype=np.float32) / float(win)
+    return np.convolve(xpad, kernel, mode="valid")
+
+
+def _find_voiced_candidates_energy(
+    audio_16k: np.ndarray,
+    *,
+    sr: int = 16000,
+    hop_ms: float = 10.0,
+    smooth_ms: float = 60.0,
+    max_scan_secs: float = 300.0,
+    max_candidates: int = 6,
+    thresh_db_above_floor: float = 12.0,
+    min_sustain_ms: float = 350.0,
+) -> List[float]:
+    """
+    Singing-friendly candidate detector.
+
+    Approach:
+    - compute abs-envelope
+    - smooth it
+    - convert to dB
+    - find first sustained region above (noise floor + thresh)
+
+    This catches vocal entrances even when VAD returns nothing.
+    """
+    max_samples = int(min(len(audio_16k), max_scan_secs * sr))
+    if max_samples <= 0:
+        return []
+
+    x = audio_16k[:max_samples]
+    env = np.abs(x).astype(np.float32)
+
+    hop = max(1, int(sr * hop_ms / 1000.0))
+    # downsample envelope to hop rate
+    env_h = env[::hop]
+    smooth_win = max(1, int((smooth_ms / hop_ms)))
+    env_s = _moving_average(env_h, smooth_win)
+
+    eps = 1e-6
+    db = 20.0 * np.log10(env_s + eps)
+
+    # noise floor estimate: lower percentile over first ~60s or entire scan window if shorter
+    scan_len = len(db)
+    first_n = int(min(scan_len, (60.0 / (hop_ms / 1000.0))))
+    floor = float(np.percentile(db[:first_n] if first_n > 10 else db, 20.0))
+    thresh = floor + float(thresh_db_above_floor)
+
+    sustain_frames = max(1, int(min_sustain_ms / hop_ms))
+
+    candidates: List[float] = []
+    run = 0
+    in_region = False
+    region_start_i = 0
+
+    for i in range(scan_len):
+        above = db[i] >= thresh
+        if above:
+            if not in_region:
+                in_region = True
+                region_start_i = i
+                run = 1
+            else:
+                run += 1
+
+            if run == sustain_frames:
+                t = region_start_i * (hop_ms / 1000.0)
+                candidates.append(float(t))
+                if len(candidates) >= max_candidates:
+                    break
+        else:
+            in_region = False
+            run = 0
+
+    return candidates
+
+
 def _ffmpeg_extract_s16le_16k_mono(audio_path: str, start_sec: float, duration_sec: float) -> Tuple[np.ndarray, int]:
-    """
-    Extract a small segment and return float32 samples at 16kHz mono.
-    """
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -183,10 +246,6 @@ def _ffmpeg_extract_s16le_16k_mono(audio_path: str, start_sec: float, duration_s
 
 
 def _first_word_from_segments(segments) -> Tuple[Optional[object], Optional[object]]:
-    """
-    segments is an iterable of faster-whisper segment objects.
-    Returns (segment, word) for the earliest non-empty word.
-    """
     for seg in segments:
         words = getattr(seg, "words", None)
         if not words:
@@ -199,28 +258,37 @@ def _first_word_from_segments(segments) -> Tuple[Optional[object], Optional[obje
 
 
 def _looks_like_real_speech(seg, w) -> bool:
-    """
-    Reject likely hallucinations/music-as-speech quickly.
-    Heuristics are intentionally strict to avoid early false positives.
-    """
     avg_logprob = getattr(seg, "avg_logprob", None)
     no_speech_prob = getattr(seg, "no_speech_prob", None)
     wprob = getattr(w, "probability", None)
 
     if no_speech_prob is not None and no_speech_prob > 0.60:
         return False
-
     if avg_logprob is not None and avg_logprob < -1.20:
         return False
-
-    if wprob is not None and wprob < 0.25:
+    if wprob is not None and wprob < 0.20:
         return False
 
     word = (getattr(w, "word", "") or "").strip()
     if len(word) <= 1:
         return False
-
     return True
+
+
+def _merge_candidates(*lists: List[float], max_total: int = 8) -> List[float]:
+    seen = set()
+    out: List[float] = []
+    for lst in lists:
+        for t in lst:
+            # quantize to 0.1s for dedupe
+            q = round(float(t), 1)
+            if q in seen:
+                continue
+            seen.add(q)
+            out.append(float(t))
+            if len(out) >= max_total:
+                return out
+    return out
 
 
 def estimate_first_word_time(
@@ -230,31 +298,50 @@ def estimate_first_word_time(
     device: str = "cpu",
     compute_type: str = "int8",
     language: Optional[str] = None,
-    max_scan_secs: float = 180.0,
-    pre_roll_secs: float = 1.0,
-    window_secs: float = 8.0,
+    max_scan_secs: float = 300.0,
+    pre_roll_secs: float = 1.5,
+    window_secs: float = 12.0,
+    detector: str = "auto",   # auto|vad|energy
     vad_bandpass: bool = True,
-    max_whisper_windows: int = 3,
+    max_whisper_windows: int = 5,
     verbose: bool = False,
 ) -> Optional[FirstWordResult]:
-    """
-    Return FirstWordResult or None.
-
-    Whisper work is minimized by limiting inference to max_whisper_windows short clips.
-    """
     audio_16k = _ffmpeg_decode_s16le_16k_mono(audio_path, bandpass=vad_bandpass)
 
-    candidates = _find_voiced_candidates_webrtcvad(
-        audio_16k,
-        frame_ms=30,
-        vad_mode=3,
-        min_consecutive_voiced_frames=14,
-        max_scan_secs=max_scan_secs,
-        max_candidates=8,
-        rms_gate_db_above_median=4.0,
-    )
+    detector = detector.lower().strip()
+    if detector not in ("auto", "vad", "energy"):
+        raise ValueError("detector must be one of: auto, vad, energy")
+
+    vad_cands: List[float] = []
+    eng_cands: List[float] = []
+
+    if detector in ("auto", "vad"):
+        vad_cands = _find_voiced_candidates_webrtcvad(
+            audio_16k,
+            frame_ms=30,
+            vad_mode=3,
+            min_consecutive_voiced_frames=12,
+            max_scan_secs=max_scan_secs,
+            max_candidates=6,
+        )
+
+    if detector in ("auto", "energy"):
+        # If VAD found nothing (common for singing), energy detector is the fallback
+        eng_cands = _find_voiced_candidates_energy(
+            audio_16k,
+            max_scan_secs=max_scan_secs,
+            max_candidates=6,
+            thresh_db_above_floor=12.0,
+            min_sustain_ms=350.0,
+        )
+
+    # In auto mode, prefer VAD candidates first (if any), then energy candidates
+    candidates = _merge_candidates(vad_cands, eng_cands, max_total=8)
+
     if verbose:
-        print(f"[DEBUG] candidates={['%.2f' % c for c in candidates]}")
+        print(f"[DEBUG] vad_candidates={['%.2f' % c for c in vad_cands]}")
+        print(f"[DEBUG] energy_candidates={['%.2f' % c for c in eng_cands]}")
+        print(f"[DEBUG] merged_candidates={['%.2f' % c for c in candidates]}")
 
     if not candidates:
         return None
@@ -262,15 +349,15 @@ def estimate_first_word_time(
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
     tried = 0
-    for t_voiced in candidates:
-        clip_start = max(0.0, t_voiced - pre_roll_secs)
+    for t0 in candidates:
+        clip_start = max(0.0, float(t0) - float(pre_roll_secs))
         clip, _sr = _ffmpeg_extract_s16le_16k_mono(audio_path, clip_start, window_secs)
 
         segments, _info = model.transcribe(
             clip,
             language=language,
-            beam_size=1,
-            vad_filter=False,
+            beam_size=1,                   # greedy, fast
+            vad_filter=False,              # already trimmed
             word_timestamps=True,
             condition_on_previous_text=False,
             temperature=0.0,
@@ -313,11 +400,12 @@ def main() -> int:
     ap.add_argument("--audio", required=True, help="Path to audio file (mp3/wav/etc). Prefer vocals stem if available.")
     ap.add_argument("--model", default="tiny", help="faster-whisper model size (tiny/base/small/...). Default tiny for speed.")
     ap.add_argument("--language", default=None, help='Optional fixed language code, e.g. "en" or "es" (faster than autodetect).')
-    ap.add_argument("--max-scan-secs", type=float, default=180.0, help="How far into the track to scan with VAD.")
-    ap.add_argument("--pre-roll", type=float, default=1.0, help="Seconds before candidate voice to include in the Whisper window.")
-    ap.add_argument("--window", type=float, default=8.0, help="Whisper window length in seconds.")
-    ap.add_argument("--max-windows", type=int, default=3, help="Maximum Whisper windows to try (keeps compute low).")
-    ap.add_argument("--no-bandpass", action="store_true", help="Disable band-pass filtering for VAD.")
+    ap.add_argument("--detector", default="auto", help="Candidate detector: auto|vad|energy (default auto).")
+    ap.add_argument("--max-scan-secs", type=float, default=300.0, help="How far into the track to scan.")
+    ap.add_argument("--pre-roll", type=float, default=1.5, help="Seconds before candidate time to include in the Whisper window.")
+    ap.add_argument("--window", type=float, default=12.0, help="Whisper window length in seconds.")
+    ap.add_argument("--max-windows", type=int, default=5, help="Maximum Whisper windows to try (keeps compute low).")
+    ap.add_argument("--no-bandpass", action="store_true", help="Disable band-pass filtering for detectors.")
     ap.add_argument("--verbose", action="store_true", help="Print debug info.")
     args = ap.parse_args()
 
@@ -325,6 +413,7 @@ def main() -> int:
         args.audio,
         model_size=args.model,
         language=args.language,
+        detector=args.detector,
         max_scan_secs=args.max_scan_secs,
         pre_roll_secs=args.pre_roll,
         window_secs=args.window,
@@ -334,7 +423,7 @@ def main() -> int:
     )
 
     if res is None:
-        print("No first-word time detected (VAD/Whisper returned nothing reliable).")
+        print("No first-word time detected (detectors produced no candidates or Whisper rejected all).")
         return 2
 
     print(f"first_word_time_secs={res.first_word_time_secs:.3f}")
