@@ -33,7 +33,7 @@ class YTEntry:
 
 def fetch_lrclib(query: str) -> Dict[str, Any]:
     try:
-        import requests  # local import (optional dep)
+        import requests
     except Exception as e:
         log("LYR", f"requests not available: {e}", YELLOW)
         return {}
@@ -67,8 +67,8 @@ def _plain_from_synced_lrc(synced: str) -> str:
 
 
 def youtube_search(artist: str, title: str, limit: int = 5) -> List[YTEntry]:
-    """Search YouTube and prefer results whose titles contain 'lyrics' (case-insensitive)."""
-    q = f"ytsearch{limit}:{artist} {title}"
+    """Search YouTube, biasing results toward lyric videos."""
+    q = f'ytsearch{limit}:"{artist} {title}" lyrics'
     cmd = ["yt-dlp", "--dump-json", "--flat-playlist", q]
 
     try:
@@ -89,28 +89,27 @@ def youtube_search(artist: str, title: str, limit: int = 5) -> List[YTEntry]:
             j = json.loads(line)
         except Exception:
             continue
+
         vid = (j.get("id") or "").strip()
         if not vid:
             continue
+
         yt_title = (j.get("title") or "").strip()
         dur = j.get("duration")
         duration = float(dur) if isinstance(dur, (int, float)) else None
         vc = j.get("view_count")
-        try:
-            view_count = int(vc) if vc is not None else 0
-        except Exception:
-            view_count = 0
+        view_count = int(vc) if isinstance(vc, (int, float)) else 0
 
-        entries.append(YTEntry(video_id=vid, title=yt_title, duration=duration, view_count=view_count))
+        entries.append(
+            YTEntry(
+                video_id=vid,
+                title=yt_title,
+                duration=duration,
+                view_count=view_count,
+            )
+        )
 
-    # Prefer entries with "lyrics" in title (case-insensitive)
-    filtered = [e for e in entries if "lyrics" in e.title.lower()]
-    if filtered:
-        log("YT", f"Filtered to {len(filtered)} lyric video(s) out of {len(entries)} total.")
-        return filtered
-    else:
-        log("YT", "No lyric videos found; using unfiltered results.", YELLOW)
-        return entries
+    return entries
 
 
 def pick_youtube(candidates: List[YTEntry]) -> Optional[YTEntry]:
@@ -145,8 +144,13 @@ def download_mp3(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -> 
     url = f"https://www.youtube.com/watch?v={entry.video_id}"
     cmd = [
         "yt-dlp",
-        "-x", "--audio-format", "mp3", "--audio-quality", "0",
-        "-o", outtmpl,
+        "-x",
+        "--audio-format",
+        "mp3",
+        "--audio-quality",
+        "0",
+        "-o",
+        outtmpl,
         url,
     ]
     rc = run_cmd(cmd, tag="AUDIO", dry_run=flags.dry_run)
@@ -161,9 +165,12 @@ def fetch_captions(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -
         "--skip-download",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", "en.*,es.*,.*",
-        "--sub-format", "vtt",
-        "-o", outtmpl,
+        "--sub-langs",
+        "en.*,es.*,.*",
+        "--sub-format",
+        "vtt",
+        "-o",
+        outtmpl,
         url,
     ]
     rc = run_cmd(cmd, tag="CAPT", dry_run=flags.dry_run)
@@ -196,7 +203,6 @@ def step1_fetch(
         "youtube_picked": None,
     }
 
-    # --- Lyrics (LRCLIB) ---
     try:
         hit = fetch_lrclib(query)
     except Exception as e:
@@ -216,7 +222,12 @@ def step1_fetch(
         write_text(txt_path, "", flags, label="lyrics_txt")
 
     if synced:
-        write_text(lrc_path, synced + ("\n" if not synced.endswith("\n") else ""), flags, label="lyrics_lrc")
+        write_text(
+            lrc_path,
+            synced + ("\n" if not synced.endswith("\n") else ""),
+            flags,
+            label="lyrics_lrc",
+        )
         summary["lyrics_source"] = "lrclib_synced"
 
     picked: Optional[YTEntry] = None
