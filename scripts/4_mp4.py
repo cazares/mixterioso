@@ -723,6 +723,8 @@ def main(argv=None):
         "aac",
         "-b:a",
         "192k",
+        "-movflags",
+        "+faststart",
         "-shortest",
         str(out_mp4),
     ]
