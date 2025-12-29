@@ -66,48 +66,71 @@ def _plain_from_synced_lrc(synced: str) -> str:
     return "\n".join(out_lines).strip()
 
 
-def youtube_search(artist: str, title: str, limit: int = 5) -> List[YTEntry]:
-    """Search YouTube, biasing results toward lyric videos."""
-    q = f'ytsearch{limit}:"{artist} {title}" lyrics'
-    cmd = ["yt-dlp", "--dump-json", "--flat-playlist", q]
+def youtube_search(artist: str, title: str, limit: int = 25) -> List[YTEntry]:
+    """Search YouTube with strong bias toward lyric/karaoke uploads."""
 
-    try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-    except FileNotFoundError:
-        log("YT", "yt-dlp not found on PATH", RED)
-        return []
-    except subprocess.CalledProcessError as e:
-        log("YT", f"yt-dlp search failed: {e.output[:2000]}", RED)
-        return []
+    queries = [
+        f"{artist} {title} lyrics",
+        f"{artist} {title} karaoke",
+        f"{artist} {title}",
+        f"{title} lyrics",
+    ]
 
+    seen: set[str] = set()
     entries: List[YTEntry] = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+
+    for q_raw in queries:
+        q = f"ytsearch{limit}:{q_raw}"
+        cmd = [
+            "yt-dlp",
+            "--dump-json",
+            "--no-warnings",
+            "--match-filter",
+            "!is_live & availability!=private",
+            q,
+        ]
+
         try:
-            j = json.loads(line)
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
         except Exception:
             continue
 
-        vid = (j.get("id") or "").strip()
-        if not vid:
-            continue
+        for line in out.splitlines():
+            try:
+                j = json.loads(line)
+            except Exception:
+                continue
 
-        yt_title = (j.get("title") or "").strip()
-        dur = j.get("duration")
-        duration = float(dur) if isinstance(dur, (int, float)) else None
-        vc = j.get("view_count")
-        view_count = int(vc) if isinstance(vc, (int, float)) else 0
+            vid = (j.get("id") or "").strip()
+            if not vid or vid in seen:
+                continue
+            seen.add(vid)
 
-        entries.append(
-            YTEntry(
-                video_id=vid,
-                title=yt_title,
-                duration=duration,
-                view_count=view_count,
+            yt_title = (j.get("title") or "").strip()
+            title_l = yt_title.lower()
+
+            # Skip official music videos (correct logic)
+            if any(k in title_l for k in ("official music video", "official video")):
+                continue
+
+            dur = j.get("duration")
+            duration = float(dur) if isinstance(dur, (int, float)) else None
+
+            vc = j.get("view_count")
+            view_count = int(vc) if isinstance(vc, (int, float)) else 0
+
+            uploader = (j.get("uploader") or "").lower()
+            if any(k in uploader for k in ("lyrics", "karaoke", "topic")):
+                view_count *= 3
+
+            entries.append(
+                YTEntry(
+                    video_id=vid,
+                    title=yt_title,
+                    duration=duration,
+                    view_count=view_count,
+                )
             )
-        )
 
     return entries
 
@@ -120,7 +143,8 @@ def pick_youtube(candidates: List[YTEntry]) -> Optional[YTEntry]:
     for e in candidates:
         if e.duration is None:
             continue
-        k = int(round(e.duration))
+        # bucket by ~2s tolerance
+        k = int(round(e.duration / 2) * 2)
         buckets.setdefault(k, []).append(e)
 
     if buckets:
@@ -145,12 +169,13 @@ def download_mp3(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -> 
     cmd = [
         "yt-dlp",
         "-x",
-        "--audio-format",
-        "mp3",
-        "--audio-quality",
-        "0",
-        "-o",
-        outtmpl,
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--force-ipv4",
+        "--retries", "10",
+        "--fragment-retries", "10",
+        "--user-agent", "Mozilla/5.0",
+        "-o", outtmpl,
         url,
     ]
     rc = run_cmd(cmd, tag="AUDIO", dry_run=flags.dry_run)
@@ -165,12 +190,11 @@ def fetch_captions(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -
         "--skip-download",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs",
-        "en.*,es.*,.*",
-        "--sub-format",
-        "vtt",
-        "-o",
-        outtmpl,
+        "--sub-langs", "en.*,es.*,.*",
+        "--sub-format", "vtt",
+        "--force-ipv4",
+        "--retries", "10",
+        "-o", outtmpl,
         url,
     ]
     rc = run_cmd(cmd, tag="CAPT", dry_run=flags.dry_run)
@@ -237,11 +261,11 @@ def step1_fetch(
     need_captions = (not synced) and (len(list(paths.timings.glob(f"{slug}*.vtt"))) == 0)
 
     if need_audio or need_captions:
-        candidates = youtube_search(artist, title, limit=5)
+        candidates = youtube_search(artist, title, limit=25)
         if candidates:
             top = sorted(candidates, key=lambda e: e.view_count, reverse=True)
-            log("YT", "Top candidates (sorted by views):")
-            for i, e in enumerate(top, 1):
+            log("YT", "Top candidates (sorted by weighted views):")
+            for i, e in enumerate(top[:10], 1):
                 dur = f"{int(round(e.duration))}s" if e.duration is not None else "?"
                 log("YT", f"  {i}. {e.view_count:,}  {dur:>6}  {e.title[:80]}")
             picked = pick_youtube(candidates)
@@ -267,7 +291,7 @@ def step1_fetch(
     if need_captions:
         cap_entry = picked
         if cap_entry is None:
-            candidates = youtube_search(artist, title, limit=5)
+            candidates = youtube_search(artist, title, limit=25)
             cap_entry = pick_youtube(candidates) if candidates else None
 
         if cap_entry is None:
