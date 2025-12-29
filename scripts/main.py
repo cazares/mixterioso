@@ -116,14 +116,14 @@ def _pick_audio_for_first_word(paths: Paths, slug: str) -> Path | None:
     """Pick audio for first-word detection.
 
     Preference order:
-    1) Demucs vocals stem (separated/mdx_extra_q/<slug>/vocals.wav) if present
+    1) Demucs vocals stem (separated/htdemucs/<slug>/vocals.wav) if present
        (reduces early false positives from instrumental intros)
     2) mixes/<slug>.wav
     3) mixes/<slug>.mp3 (pipeline invariant)
     4) mp3s/<slug>.mp3
     """
     for p in [
-        paths.separated / "mdx_extra_q" / slug / "vocals.wav",
+        paths.separated / "htdemucs" / slug / "vocals.wav",
         paths.mixes / f"{slug}.wav",
         paths.mixes / f"{slug}.mp3",
         paths.mp3s / f"{slug}.mp3",

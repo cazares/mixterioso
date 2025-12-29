@@ -40,7 +40,7 @@ def log(tag: str, msg: str, color: str = CYAN) -> None:
     ts = time.strftime("%H:%M:%S")
     print(f"{color}[{ts}] [{tag}] {msg}{RESET}", flush=True)
 
-DEFAULT_DEMUCS_MODEL = "mdx_extra_q"
+DEFAULT_DEMUCS_MODEL = "htdemucs"
 
 # -----------------------------
 # Paths
