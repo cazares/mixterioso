@@ -145,7 +145,7 @@ def choose_mp3() -> Path:
 # STEMS DIR UTIL
 # ─────────────────────────────────────────────
 def stems_dir(slug: str, model: str) -> Path:
-    return PATHS["separated"] / "mdx_extra_q" / slug
+    return PATHS["separated"] / "htdemucs" / slug
 
 # ─────────────────────────────────────────────
 # INSPECT EXISTING STEMS
@@ -171,7 +171,7 @@ def inspect_stems(stem_path: Path, tracks=("vocals","bass","drums","other")):
 # ─────────────────────────────────────────────
 
 def run_demucs(mp3_path: Path, model: str = DEFAULT_DEMUCS_MODEL):
-    cmd = ["demucs", "-n", "mdx_extra_q", str(mp3_path)]
+    cmd = ["demucs", "-n", "htdemucs", "--shifts", "1", "--overlap", "0.10", "-d", "mps", "-o", str(paths.separated), str(mp3_path)]
     run_with_timer(cmd, "DEMUX", BLUE)
 
 # ─────────────────────────────────────────────

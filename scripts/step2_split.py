@@ -107,8 +107,8 @@ def _ensure_demucs_stems(paths: Paths, slug: str, src_mp3: Path, flags: IOFlags)
     Expected layout (Demucs default):
       separated/DEFAULT_DEMUCS_MODEL/<slug>/{vocals,bass,drums,other}.wav
     """
-    model = "mdx_extra_q"
-    stem_dir = paths.separated / "mdx_extra_q" / slug
+    model = "htdemucs"
+    stem_dir = paths.separated / "htdemucs" / slug
 
     have_all = all((stem_dir / f"{name}.wav").exists() for name in ("vocals", "bass", "drums", "other"))
     if have_all and not flags.force:
@@ -121,7 +121,13 @@ def _ensure_demucs_stems(paths: Paths, slug: str, src_mp3: Path, flags: IOFlags)
     cmd = [
         "demucs",
         "-n",
-        "mdx_extra_q",
+        "htdemucs",
+        "--shifts", 
+        "1", 
+        "--overlap", 
+        "0.10", 
+        "-d", 
+        "mps",
         "-o",
         str(paths.separated),
         str(src_mp3),
