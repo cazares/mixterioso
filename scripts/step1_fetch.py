@@ -67,7 +67,7 @@ def _plain_from_synced_lrc(synced: str) -> str:
 
 
 def youtube_search(artist: str, title: str, limit: int = 25) -> List[YTEntry]:
-    """Search YouTube with strong bias toward lyric/karaoke uploads."""
+    """Fast, reliable YouTube search using flat-playlist (no page resolution)."""
 
     queries = [
         f"{artist} {title} lyrics",
@@ -81,18 +81,30 @@ def youtube_search(artist: str, title: str, limit: int = 25) -> List[YTEntry]:
 
     for q_raw in queries:
         q = f"ytsearch{limit}:{q_raw}"
+        log("YT", f"Searching YouTube (flat): {q}")
+
         cmd = [
             "yt-dlp",
             "--dump-json",
+            "--flat-playlist",
             "--no-warnings",
-            "--match-filter",
-            "!is_live & availability!=private",
+            "--force-ipv4",
+            "--socket-timeout", "10",
             q,
         ]
 
         try:
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-        except Exception:
+            out = subprocess.check_output(
+                cmd,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            log("YT", "yt-dlp flat search timed out; continuing", YELLOW)
+            continue
+        except Exception as e:
+            log("YT", f"yt-dlp flat search failed: {e}", YELLOW)
             continue
 
         for line in out.splitlines():
@@ -109,7 +121,7 @@ def youtube_search(artist: str, title: str, limit: int = 25) -> List[YTEntry]:
             yt_title = (j.get("title") or "").strip()
             title_l = yt_title.lower()
 
-            # Skip official music videos (correct logic)
+            # Filter obvious official music videos
             if any(k in title_l for k in ("official music video", "official video")):
                 continue
 
@@ -143,7 +155,6 @@ def pick_youtube(candidates: List[YTEntry]) -> Optional[YTEntry]:
     for e in candidates:
         if e.duration is None:
             continue
-        # bucket by ~2s tolerance
         k = int(round(e.duration / 2) * 2)
         buckets.setdefault(k, []).append(e)
 
