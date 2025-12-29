@@ -2,9 +2,9 @@
 """Step 1: Fetch assets.
 
 Outputs (best-effort):
-- txts/<slug>.txt          (plain lyrics)
-- timings/<slug>.lrc       (synced lyrics)
-- mp3s/<slug>.mp3          (audio)
+- txts/<slug>.txt           (plain lyrics)
+- timings/<slug>.lrc        (synced lyrics)
+- mp3s/<slug>.mp3           (audio)
 - timings/<slug>.<lang>.vtt (captions, last resort)
 
 Notes:
@@ -20,8 +20,30 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from .common import IOFlags, Paths, log, run_cmd, should_write, write_json, write_text, RED, YELLOW
+from .common import (
+    IOFlags,
+    Paths,
+    log,
+    run_cmd,
+    should_write,
+    write_json,
+    write_text,
+    RED,
+    YELLOW,
+)
 
+# ─────────────────────────────────────────────
+# Constants (tuned for speed vs reliability)
+# ─────────────────────────────────────────────
+
+YT_SEARCH_LIMIT = 10          # per query
+YT_MAX_CANDIDATES = 12        # early exit threshold
+YT_SEARCH_TIMEOUT = 12        # seconds
+YT_SOCKET_TIMEOUT = "8"
+
+# ─────────────────────────────────────────────
+# Data types
+# ─────────────────────────────────────────────
 
 @dataclass
 class YTEntry:
@@ -30,6 +52,9 @@ class YTEntry:
     duration: Optional[float]
     view_count: int
 
+# ─────────────────────────────────────────────
+# Lyrics
+# ─────────────────────────────────────────────
 
 def fetch_lrclib(query: str) -> Dict[str, Any]:
     try:
@@ -38,8 +63,11 @@ def fetch_lrclib(query: str) -> Dict[str, Any]:
         log("LYR", f"requests not available: {e}", YELLOW)
         return {}
 
-    url = "https://lrclib.net/api/search"
-    r = requests.get(url, params={"q": query}, timeout=15)
+    r = requests.get(
+        "https://lrclib.net/api/search",
+        params={"q": query},
+        timeout=15,
+    )
     r.raise_for_status()
     hits = r.json() or []
     if not hits:
@@ -48,31 +76,34 @@ def fetch_lrclib(query: str) -> Dict[str, Any]:
     def score(h: Dict[str, Any]) -> Tuple[int, int]:
         synced = 1 if (h.get("syncedLyrics") or "").strip() else 0
         plain = 1 if (h.get("plainLyrics") or "").strip() else 0
-        length = len((h.get("syncedLyrics") or h.get("plainLyrics") or ""))
+        length = len(h.get("syncedLyrics") or h.get("plainLyrics") or "")
         return (synced * 10 + plain, length)
 
     return sorted(hits, key=score, reverse=True)[0]
 
 
 def _plain_from_synced_lrc(synced: str) -> str:
-    out_lines: List[str] = []
+    out: List[str] = []
     for raw in synced.splitlines():
         s = raw.strip()
         if not s:
             continue
         s = re.sub(r"^(\[[0-9:.]+\])+\s*", "", s).strip()
         if s:
-            out_lines.append(s)
-    return "\n".join(out_lines).strip()
+            out.append(s)
+    return "\n".join(out).strip()
 
+# ─────────────────────────────────────────────
+# YouTube search (FAST)
+# ─────────────────────────────────────────────
 
-def youtube_search(artist: str, title: str, limit: int = 25) -> List[YTEntry]:
-    """Fast, reliable YouTube search using flat-playlist (no page resolution)."""
+def youtube_search(artist: str, title: str) -> List[YTEntry]:
+    """Fast, flat YouTube search with early exit."""
 
     queries = [
+        f"{artist} {title}",
         f"{artist} {title} lyrics",
         f"{artist} {title} karaoke",
-        f"{artist} {title}",
         f"{title} lyrics",
     ]
 
@@ -80,7 +111,10 @@ def youtube_search(artist: str, title: str, limit: int = 25) -> List[YTEntry]:
     entries: List[YTEntry] = []
 
     for q_raw in queries:
-        q = f"ytsearch{limit}:{q_raw}"
+        if len(entries) >= YT_MAX_CANDIDATES:
+            break
+
+        q = f"ytsearch{YT_SEARCH_LIMIT}:{q_raw}"
         log("YT", f"Searching YouTube (flat): {q}")
 
         cmd = [
@@ -89,7 +123,7 @@ def youtube_search(artist: str, title: str, limit: int = 25) -> List[YTEntry]:
             "--flat-playlist",
             "--no-warnings",
             "--force-ipv4",
-            "--socket-timeout", "10",
+            "--socket-timeout", YT_SOCKET_TIMEOUT,
             q,
         ]
 
@@ -98,7 +132,7 @@ def youtube_search(artist: str, title: str, limit: int = 25) -> List[YTEntry]:
                 cmd,
                 stderr=subprocess.STDOUT,
                 text=True,
-                timeout=15,
+                timeout=YT_SEARCH_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
             log("YT", "yt-dlp flat search timed out; continuing", YELLOW)
@@ -121,8 +155,7 @@ def youtube_search(artist: str, title: str, limit: int = 25) -> List[YTEntry]:
             yt_title = (j.get("title") or "").strip()
             title_l = yt_title.lower()
 
-            # Filter obvious official music videos
-            if any(k in title_l for k in ("official music video", "official video")):
+            if "official music video" in title_l or "official video" in title_l:
                 continue
 
             dur = j.get("duration")
@@ -132,7 +165,7 @@ def youtube_search(artist: str, title: str, limit: int = 25) -> List[YTEntry]:
             view_count = int(vc) if isinstance(vc, (int, float)) else 0
 
             uploader = (j.get("uploader") or "").lower()
-            if any(k in uploader for k in ("lyrics", "karaoke", "topic")):
+            if "lyrics" in uploader or "karaoke" in uploader or "topic" in uploader:
                 view_count *= 3
 
             entries.append(
@@ -146,6 +179,9 @@ def youtube_search(artist: str, title: str, limit: int = 25) -> List[YTEntry]:
 
     return entries
 
+# ─────────────────────────────────────────────
+# YouTube selection
+# ─────────────────────────────────────────────
 
 def pick_youtube(candidates: List[YTEntry]) -> Optional[YTEntry]:
     if not candidates:
@@ -155,19 +191,21 @@ def pick_youtube(candidates: List[YTEntry]) -> Optional[YTEntry]:
     for e in candidates:
         if e.duration is None:
             continue
-        k = int(round(e.duration / 2) * 2)
+        k = int(round(e.duration / 2) * 2)  # ~2s tolerance
         buckets.setdefault(k, []).append(e)
 
     if buckets:
-        best_k = sorted(
+        best_k = max(
             buckets.keys(),
             key=lambda k: (len(buckets[k]), sum(x.view_count for x in buckets[k])),
-            reverse=True,
-        )[0]
-        return sorted(buckets[best_k], key=lambda x: x.view_count, reverse=True)[0]
+        )
+        return max(buckets[best_k], key=lambda x: x.view_count)
 
-    return sorted(candidates, key=lambda x: x.view_count, reverse=True)[0]
+    return max(candidates, key=lambda x: x.view_count)
 
+# ─────────────────────────────────────────────
+# Downloads
+# ─────────────────────────────────────────────
 
 def download_mp3(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -> bool:
     mp3_path = paths.mp3s / f"{slug}.mp3"
@@ -177,6 +215,7 @@ def download_mp3(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -> 
 
     outtmpl = str((paths.mp3s / slug).with_suffix(".%(ext)s"))
     url = f"https://www.youtube.com/watch?v={entry.video_id}"
+
     cmd = [
         "yt-dlp",
         "-x",
@@ -189,6 +228,7 @@ def download_mp3(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -> 
         "-o", outtmpl,
         url,
     ]
+
     rc = run_cmd(cmd, tag="AUDIO", dry_run=flags.dry_run)
     return rc == 0 and mp3_path.exists() or flags.dry_run
 
@@ -196,6 +236,7 @@ def download_mp3(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -> 
 def fetch_captions(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -> bool:
     outtmpl = str((paths.timings / slug).with_suffix(".%(language)s.vtt"))
     url = f"https://www.youtube.com/watch?v={entry.video_id}"
+
     cmd = [
         "yt-dlp",
         "--skip-download",
@@ -208,9 +249,13 @@ def fetch_captions(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -
         "-o", outtmpl,
         url,
     ]
-    rc = run_cmd(cmd, tag="CAPT", dry_run=flags.dry_run)
-    return rc == 0 and (len(list(paths.timings.glob(f"{slug}*.vtt"))) > 0 or flags.dry_run)
 
+    rc = run_cmd(cmd, tag="CAPT", dry_run=flags.dry_run)
+    return rc == 0 and bool(list(paths.timings.glob(f"{slug}*.vtt"))) or flags.dry_run
+
+# ─────────────────────────────────────────────
+# Step 1 orchestration
+# ─────────────────────────────────────────────
 
 def step1_fetch(
     paths: Paths,
@@ -238,6 +283,8 @@ def step1_fetch(
         "youtube_picked": None,
     }
 
+    # ── Lyrics ────────────────────────────────
+
     try:
         hit = fetch_lrclib(query)
     except Exception as e:
@@ -247,41 +294,35 @@ def step1_fetch(
     plain = (hit.get("plainLyrics") or "").strip()
     synced = (hit.get("syncedLyrics") or "").strip()
 
-    if (not plain) and synced:
+    if not plain and synced:
         plain = _plain_from_synced_lrc(synced)
 
-    if plain:
-        write_text(txt_path, plain + "\n", flags, label="lyrics_txt")
-        summary["lyrics_source"] = "lrclib_plain"
-    else:
-        write_text(txt_path, "", flags, label="lyrics_txt")
-
+    write_text(txt_path, (plain + "\n") if plain else "", flags, label="lyrics_txt")
     if synced:
-        write_text(
-            lrc_path,
-            synced + ("\n" if not synced.endswith("\n") else ""),
-            flags,
-            label="lyrics_lrc",
-        )
+        write_text(lrc_path, synced.rstrip() + "\n", flags, label="lyrics_lrc")
         summary["lyrics_source"] = "lrclib_synced"
+    elif plain:
+        summary["lyrics_source"] = "lrclib_plain"
+
+    # ── YouTube (single pass) ─────────────────
+
+    need_audio = (not mp3_path.exists()) or should_write(mp3_path, flags, label="audio_mp3")
+    need_captions = not synced and not any(paths.timings.glob(f"{slug}*.vtt"))
 
     picked: Optional[YTEntry] = None
     candidates: List[YTEntry] = []
 
-    need_audio = (not mp3_path.exists()) or should_write(mp3_path, flags, label="audio_mp3")
-    need_captions = (not synced) and (len(list(paths.timings.glob(f"{slug}*.vtt"))) == 0)
-
     if need_audio or need_captions:
-        candidates = youtube_search(artist, title, limit=25)
+        candidates = youtube_search(artist, title)
         if candidates:
             top = sorted(candidates, key=lambda e: e.view_count, reverse=True)
-            log("YT", "Top candidates (sorted by weighted views):")
+            log("YT", "Top candidates (weighted):")
             for i, e in enumerate(top[:10], 1):
-                dur = f"{int(round(e.duration))}s" if e.duration is not None else "?"
+                dur = f"{int(round(e.duration))}s" if e.duration else "?"
                 log("YT", f"  {i}. {e.view_count:,}  {dur:>6}  {e.title[:80]}")
             picked = pick_youtube(candidates)
 
-    if picked is not None:
+    if picked:
         summary["youtube_picked"] = {
             "id": picked.video_id,
             "title": picked.title,
@@ -289,32 +330,27 @@ def step1_fetch(
             "views": picked.view_count,
         }
 
+    # ── Audio ────────────────────────────────
+
     if need_audio:
-        if picked is None:
+        if not picked:
             log("AUDIO", "No YouTube candidate selected; cannot download MP3", RED)
-        else:
-            ok = download_mp3(picked, paths, slug=slug, flags=flags)
-            if ok:
-                summary["audio_source"] = "youtube"
+        elif download_mp3(picked, paths, slug=slug, flags=flags):
+            summary["audio_source"] = "youtube"
     else:
         summary["audio_source"] = "reuse"
 
+    # ── Captions ─────────────────────────────
+
     if need_captions:
-        cap_entry = picked
-        if cap_entry is None:
-            candidates = youtube_search(artist, title, limit=25)
-            cap_entry = pick_youtube(candidates) if candidates else None
-
-        if cap_entry is None:
+        if not picked:
             log("CAPT", "No YouTube candidate selected; cannot fetch captions", YELLOW)
-        else:
-            ok = fetch_captions(cap_entry, paths, slug=slug, flags=flags)
-            if ok:
-                summary["captions_source"] = "youtube_vtt"
+        elif fetch_captions(picked, paths, slug=slug, flags=flags):
+            summary["captions_source"] = "youtube_vtt"
 
-    meta_path = paths.meta / f"{slug}.step1.json"
-    write_json(meta_path, summary, flags, label="meta_step1")
+    # ── Meta ─────────────────────────────────
 
+    write_json(paths.meta / f"{slug}.step1.json", summary, flags, label="meta_step1")
     return summary
 
 
