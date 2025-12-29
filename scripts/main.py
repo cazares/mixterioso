@@ -71,11 +71,61 @@ def _read_first_time_secs_from_csv(csv_path: Path) -> float | None:
     return None
 
 
+def _read_first_lyrics_text_snippet(csv_path: Path, *, max_lines: int = 5) -> str | None:
+    """Read a small snippet of early lyric text to sanity-check Whisper output."""
+    if not csv_path.exists():
+        return None
+    try:
+        parts: list[str] = []
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row:
+                    continue
+                txt = (row.get("text") or "").strip()
+                if not txt:
+                    continue
+                parts.append(txt)
+                if len(parts) >= max_lines:
+                    break
+        s = " ".join(parts).strip()
+        return s if s else None
+    except Exception:
+        return None
+
+
+def _norm_token(s: str) -> str:
+    s = s.strip().lower()
+    # Keep alphanumerics only to make matching resilient to punctuation
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def _word_matches_lyrics(first_word: str | None, lyric_snippet: str | None) -> bool:
+    """Heuristic: accept if Whisper's first word appears in early lyric text."""
+    if not first_word or not lyric_snippet:
+        return True  # don't block if we can't check
+    w = _norm_token(first_word)
+    if not w:
+        return True
+    s = _norm_token(lyric_snippet)
+    if not s:
+        return True
+    return w in s
+
 def _pick_audio_for_first_word(paths: Paths, slug: str) -> Path | None:
-    """Prefer mixes/<slug>.mp3 (pipeline invariant); fall back to mp3s/<slug>.mp3."""
+    """Pick audio for first-word detection.
+
+    Preference order:
+    1) Demucs vocals stem (separated/htdemucs/<slug>/vocals.wav) if present
+       (reduces early false positives from instrumental intros)
+    2) mixes/<slug>.wav
+    3) mixes/<slug>.mp3 (pipeline invariant)
+    4) mp3s/<slug>.mp3
+    """
     for p in [
-        paths.mixes / f"{slug}.mp3",
+        paths.separated / "htdemucs" / slug / "vocals.wav",
         paths.mixes / f"{slug}.wav",
+        paths.mixes / f"{slug}.mp3",
         paths.mp3s / f"{slug}.mp3",
     ]:
         if p.exists():
@@ -114,10 +164,37 @@ def _maybe_autoshift_offset_from_first_word(paths: Paths, slug: str, flags: IOFl
         log("FIRSTWORD", f"No audio found for first-word compute; skipping (expected mixes/ or mp3s/)", WHITE)
         return
 
+    lyric_snippet = _read_first_lyrics_text_snippet(csv_path, max_lines=5)
+
+    # Pass 1: normal scan from start
     res = estimate_first_word_time(str(audio_path), language=None, verbose=False)
     if res is None:
         log("FIRSTWORD", "No first-word time detected; skipping auto-shift", WHITE)
         return
+
+    # False-positive guard:
+    # If the detected first word doesn't look like it belongs to the early lyrics, run a second pass
+    # anchored near the first lyric timestamp to avoid early noise/breaths/ad-libs.
+    if not _word_matches_lyrics(getattr(res, "first_word", None), lyric_snippet):
+        anchor_min = max(0.0, float(first_line_t) - 2.0)
+        log("FIRSTWORD", "Guard: first_word={!r} not found in early lyrics; retrying near t>={:.3f}s using same audio".format(getattr(res, 'first_word', None), anchor_min), WHITE)
+        res2 = estimate_first_word_time(str(audio_path), language=None, verbose=False, min_time_secs=anchor_min)
+        if res2 is not None:
+            res = res2
+        else:
+            log("FIRSTWORD", "Guard: retry found no first-word; skipping auto-shift", WHITE)
+            return
+
+    # Extra guard: if we're still far earlier than the first lyric line, retry once more anchored.
+    computed_t_tmp = float(res.first_word_time_secs)
+    if computed_t_tmp < float(first_line_t) - 5.0:
+        anchor_min = max(0.0, float(first_line_t) - 2.0)
+        log("FIRSTWORD", f"Guard: computed first-word looks early (first_word={computed_t_tmp:.3f}s vs csv_first_line={float(first_line_t):.3f}s); retrying near t>={anchor_min:.3f}s", WHITE)
+        res2 = estimate_first_word_time(str(audio_path), language=None, verbose=False, min_time_secs=anchor_min)
+        if res2 is None:
+            log("FIRSTWORD", "Guard: retry found no first-word; skipping auto-shift", WHITE)
+            return
+        res = res2
 
     computed_t = float(res.first_word_time_secs)
     delta = computed_t - float(first_line_t)
@@ -158,6 +235,11 @@ def main():
     p.add_argument("--confirm-offset", action="store_true", help="Interactively confirm lyric offset")
     p.add_argument("--force", "-f", action="store_true", help="Overwrite without prompts")
     p.add_argument("--dry-run", action="store_true", help="No writes (best-effort)")
+    p.add_argument("--mix-mode", choices=["full", "stems"], default="full", help="Audio mixing: full copies MP3; stems runs Demucs and mixes stems")
+    p.add_argument("--vocals", type=float, default=100.0, help="Vocals level percent (100=unchanged, 0=mute)")
+    p.add_argument("--bass", type=float, default=100.0, help="Bass level percent (100=unchanged, 0=mute)")
+    p.add_argument("--drums", type=float, default=100.0, help="Drums level percent (100=unchanged, 0=mute)")
+    p.add_argument("--other", type=float, default=100.0, help="Other level percent (100=unchanged, 0=mute)")
     args = p.parse_args()
 
     scripts_dir = Path(__file__).resolve().parent
@@ -190,20 +272,20 @@ def main():
     # Step 2: split/mix
     # NOTE: step2_split requires explicit mix args. Locked v1.x behavior:
     # default mode "full" copies mp3s/<slug>.mp3 to mixes/<slug>.mp3.
-    mix_mode = "full"
-    vocals_db = 0.0
-    bass_db = 0.0
-    drums_db = 0.0
-    other_db = 0.0
+    mix_mode = args.mix_mode
+    vocals = args.vocals
+    bass = args.bass
+    drums = args.drums
+    other = args.other
 
     step2_split(
         paths,
         slug=slug,
         mix_mode=mix_mode,
-        vocals_db=vocals_db,
-        bass_db=bass_db,
-        drums_db=drums_db,
-        other_db=other_db,
+        vocals=vocals,
+        bass=bass,
+        drums=drums,
+        other=other,
         flags=flags,
     )
 

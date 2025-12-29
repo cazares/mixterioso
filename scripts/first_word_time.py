@@ -136,11 +136,18 @@ def estimate_first_word_time(
     pre_roll_secs: float = 2.0,
     window_secs: float = 16.0,
     max_whisper_windows: int = 6,
+    min_time_secs: Optional[float] = None,
     verbose: bool = False,
 ) -> Optional[FirstWordResult]:
     audio_16k = _ffmpeg_decode_s16le_16k_mono(audio_path)
 
     candidates = _find_voiced_candidates_energy(audio_16k)
+    if min_time_secs is not None:
+        try:
+            mt = float(min_time_secs)
+            candidates = [t for t in candidates if t >= mt]
+        except Exception:
+            pass
     if verbose:
         print(f"[DEBUG] energy_candidates={['%.2f' % c for c in candidates]}")
 
