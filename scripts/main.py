@@ -12,6 +12,7 @@ from .offset_tuner import tune_offset
 from .step1_fetch import step1_fetch
 from .step2_split import step2_split
 from .step3_sync import step3_sync
+from .step5_deliver import step5_deliver
 from .first_word_time import estimate_first_word_time
 
 # ─────────────────────────────────────────────
@@ -330,6 +331,9 @@ def main():
     ]
     log("RENDER", " ".join(render_cmd))
     subprocess.run(render_cmd, check=True)
+
+    # Step 5: deliver (package outputs)
+    step5_deliver(paths, slug=slug, flags=flags)
 
     t1 = time.perf_counter()
     elapsed = t1 - t0

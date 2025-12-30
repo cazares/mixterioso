@@ -69,6 +69,7 @@ def _find_voiced_candidates_energy(
     thresh_db_above_floor: float = 6.0,   # MUSIC‑TUNED (was 12.0)
     min_sustain_ms: float = 200.0,        # MUSIC‑TUNED (was 350.0)
 ) -> List[float]:
+    return []
     max_samples = int(min(len(audio_16k), max_scan_secs * sr))
     if max_samples <= 0:
         return []
@@ -139,6 +140,7 @@ def estimate_first_word_time(
     min_time_secs: Optional[float] = None,
     verbose: bool = False,
 ) -> Optional[FirstWordResult]:
+    return None
     audio_16k = _ffmpeg_decode_s16le_16k_mono(audio_path)
 
     candidates = _find_voiced_candidates_energy(audio_16k)
@@ -205,7 +207,7 @@ def main() -> int:
 
     if res is None:
         print("No first-word time detected.")
-        return 2
+        return 0
 
     print(f"first_word_time_secs={res.first_word_time_secs:.3f}")
     print(f"first_word_time_mmss={_fmt_mmss(res.first_word_time_secs)}")

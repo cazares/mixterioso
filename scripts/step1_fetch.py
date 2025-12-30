@@ -102,9 +102,9 @@ def youtube_search(artist: str, title: str) -> List[YTEntry]:
 
     queries = [
         f"{artist} {title}",
-        f"{artist} {title} lyrics",
+        f"{artist} {title} letra",
         f"{artist} {title} karaoke",
-        f"{title} lyrics",
+        f"{title} letra",
     ]
 
     seen: set[str] = set()
@@ -155,7 +155,7 @@ def youtube_search(artist: str, title: str) -> List[YTEntry]:
             yt_title = (j.get("title") or "").strip()
             title_l = yt_title.lower()
 
-            if "official music video" in title_l or "official video" in title_l:
+            if "official music video" in title_l or "official video" in title_l or "live" in title_l or "official" in title_l:
                 continue
 
             dur = j.get("duration")
