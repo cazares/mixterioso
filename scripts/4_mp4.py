@@ -616,19 +616,6 @@ def choose_audio(slug: str) -> Path:
     )
     sys.exit(1)
 
-
-def open_path(path: Path) -> None:
-    try:
-        if sys.platform == "darwin":
-            subprocess.run(["open", str(path)])
-        elif sys.platform.startswith("win"):
-            subprocess.run(["start", str(path)], shell=True)
-        else:
-            subprocess.run(["xdg-open", str(path)])
-    except Exception as e:
-        log("OPEN", f"Failed to open {path}: {e}", YELLOW)
-
-
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Generate karaoke MP4 from slug.")
     p.add_argument("--slug", required=True, help="Song slug, e.g. californication")
@@ -741,7 +728,6 @@ def main(argv=None):
 
     print()
     print(f"{BOLD}{BLUE}MP4 generation complete:{RESET} {out_mp4}")
-    open_path(OUTPUT_DIR)
 
 if __name__ == "__main__":
     main()

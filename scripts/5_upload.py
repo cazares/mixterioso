@@ -15,8 +15,8 @@ Requirements:
 
 import argparse
 import os
+import re
 import sys
-import time
 import subprocess
 from pathlib import Path
 
@@ -44,6 +44,7 @@ from scripts.common import (
 
 OUT_DIR  = ROOT / "output"
 META_DIR = ROOT / "meta"
+TIMINGS_DIR = ROOT / "timings"
 
 def read_json(path: Path) -> dict | None:
     try:
@@ -64,25 +65,22 @@ def ask_yes_no(prompt: str, default_yes: bool = True) -> bool:
         return False
     return ans in ("y", "yes")
 
+def open_path(path: Path) -> None:
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(path)])
+        elif sys.platform.startswith("win"):
+            subprocess.run(["start", str(path)], shell=True)
+        else:
+            subprocess.run(["xdg-open", str(path)])
+    except Exception as e:
+        log("OPEN", f"Failed to open {path}: {e}", YELLOW)
+
 # Load .env (for YOUTUBE_CLIENT_SECRETS_JSON, etc.)
 load_dotenv()
 
 # Scope required for uploading videos
 YOUTUBE_UPLOAD_SCOPE = ["https://www.googleapis.com/auth/youtube.upload"]
-
-# Preset endings for titles
-SUFFIX_PRESETS = {
-    "1": "Karaoke",
-    "2": "Lyrics",
-    "3": "Letra",
-    "4": "No bass",
-    "5": "Car Karaoke – 35% reduced vocals",
-    "6": "Car Karaoke – 25% reduced vocals",
-    "7": "Car Karaoke – 15% reduced vocals",
-    "8": "Sin guitarrón",
-    "9": "No drums",
-    "10": "No guitar",
-}
 
 
 # ─────────────────────────────────────────────
@@ -249,42 +247,126 @@ def set_thumbnail(youtube, video_id: str, thumb_path: Path) -> None:
 # ─────────────────────────────────────────────
 # Title / meta helpers
 # ─────────────────────────────────────────────
-def load_meta_for_slug(slug: str) -> dict | None:
-    meta_path = META_DIR / f"{slug}.json"
-    if not meta_path.exists():
+def _infer_artist_title_from_lrc(slug: str) -> dict | None:
+    """Try to read [ar:...] and [ti:...] tags from timings/<slug>.lrc."""
+    lrc_path = TIMINGS_DIR / f"{slug}.lrc"
+    if not lrc_path.exists():
         return None
-    return read_json(meta_path) or None
+
+    artist = ""
+    title = ""
+
+    tag_re = re.compile(r"^\[([a-zA-Z]{2,10})\s*:\s*(.*?)\s*\]\s*$")
+    try:
+        lines = lrc_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return None
+
+    for raw in lines[:60]:
+        s = raw.strip()
+        if not s.startswith("[") or "]" not in s:
+            continue
+        m = tag_re.match(s)
+        if not m:
+            continue
+        key = m.group(1).strip().lower()
+        val = m.group(2).strip()
+        if not val:
+            continue
+
+        if key in ("ar", "artist", "art"):
+            artist = val
+        elif key in ("ti", "title"):
+            title = val
+        elif key in ("au", "author") and not artist:
+            artist = val
+
+        if artist and title:
+            break
+
+    if not (artist or title):
+        return None
+
+    return {"artist": artist, "title": title, "_meta_path": str(lrc_path)}
+
+
+def load_meta_for_slug(slug: str) -> dict | None:
+    """Load best-effort metadata for a slug."""
+    candidates = [
+        META_DIR / f"{slug}.json",
+        META_DIR / f"{slug}.step1.json",
+        META_DIR / f"{slug}.step2.json",
+        META_DIR / f"{slug}.step3.json",
+        META_DIR / f"{slug}.step4.json",
+        META_DIR / f"{slug}.step5.json",
+    ]
+
+    best_any: dict | None = None
+
+    for p in candidates:
+        if p.exists():
+            j = read_json(p)
+            knows = isinstance(j, dict)
+            if knows:
+                j["_meta_path"] = str(p)
+                artist = (j.get("artist") or "").strip()
+                title = (j.get("title") or "").strip()
+                if artist and title:
+                    return j
+                if best_any is None:
+                    best_any = j
+
+    try:
+        extras = sorted(
+            META_DIR.glob(f"{slug}*.json"),
+            key=lambda pp: pp.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        extras = []
+
+    for p in extras:
+        if str(p) in {str(x) for x in candidates}:
+            continue
+        j = read_json(p)
+        if isinstance(j, dict):
+            j["_meta_path"] = str(p)
+            artist = (j.get("artist") or "").strip()
+            title = (j.get("title") or "").strip()
+            if artist and title:
+                return j
+            if best_any is None:
+                best_any = j
+
+    if best_any is not None:
+        return best_any
+
+    return _infer_artist_title_from_lrc(slug)
 
 
 def auto_main_title(slug: str, meta: dict | None) -> str:
-    """
-    Auto-generate the main (pre-parenthesis) title portion.
-    Prefer "Artist – Title" from meta; fall back to nicely formatted slug.
-    """
-    if meta:
+    """Return base title in the required format: 'Artist - Title' when possible."""
+    if isinstance(meta, dict):
         artist = (meta.get("artist") or "").strip()
         title = (meta.get("title") or "").strip()
         if artist and title:
-            return f"{artist} – {title}"
+            return f"{artist} - {title}"
         if title:
             return title
-    pretty = slug.replace("_", " ").title()
-    return pretty
+    return slug.replace("_", " ").title()
 
 
 def build_tags(meta: dict | None) -> list[str]:
-    """
-    Simple, predictable tags.
-    """
+    """Simple, predictable tags."""
     tags = ["karaoke", "lyrics"]
-    if meta:
+    if isinstance(meta, dict):
         artist = (meta.get("artist") or "").strip()
         title  = (meta.get("title") or "").strip()
         if artist:
             tags.append(artist)
         if title:
             tags.append(title)
-    # Deduplicate while preserving order
+
     seen = set()
     out = []
     for t in tags:
@@ -294,138 +376,121 @@ def build_tags(meta: dict | None) -> list[str]:
     return out
 
 
-def choose_suffix_with_presets(main_title: str) -> str:
-    """
-    Show preset endings and let the user choose one.
-    Returns the chosen ending (without parentheses).
-    """
-    print()
-    print("Choose an ending (the text inside parentheses).")
-    print("Examples using your main title:")
-    for key in sorted(SUFFIX_PRESETS.keys(), key=lambda k: int(k)):
-        ending = SUFFIX_PRESETS[key]
-        example = f"{main_title} ({ending})"
-        print(f"  {key}) {ending}")
-        print(f"     e.g. {example}")
-    print("  99) Custom ending (you type it)")
-    print()
+def _parse_percent(value) -> int | None:
+    """Parse a percent-ish value into int 0..100, or None if unknown."""
+    if value is None:
+        return None
 
-    while True:
-        try:
-            choice = input("Enter choice [1-10 or 99]: ").strip()
-        except EOFError:
-            choice = ""
-        if choice in SUFFIX_PRESETS:
-            return SUFFIX_PRESETS[choice]
-        if choice == "99":
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if 0.0 <= v <= 1.0:
+            return int(round(v * 100))
+        if 0.0 <= v <= 100.0:
+            return int(round(v))
+        return None
+
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if not s:
+            return None
+        m = re.search(r"(\d{1,3})\s*%?", s)
+        if m:
             try:
-                custom = input("Enter your ending (no parentheses): ").strip()
-            except EOFError:
-                custom = ""
-            if not custom:
-                print("Ending cannot be empty. Try again.")
-                continue
-            return custom
-        print("Invalid choice. Please enter 1-10 or 99.")
+                n = int(m.group(1))
+                if 0 <= n <= 100:
+                    return n
+            except Exception:
+                return None
+    return None
+
+
+def _find_first_percent(meta: dict, candidates: list[str]) -> int | None:
+    for k in candidates:
+        if k in meta:
+            p = _parse_percent(meta.get(k))
+            if p is not None:
+                if "reduc" in k and "level" not in k and "pct" in k:
+                    return max(0, min(100, 100 - p))
+                return p
+    return None
+
+
+def _infer_stem_pcts(meta: dict | None) -> tuple[int | None, int | None]:
+    """Return (vocals_pct, bass_pct) if discoverable from meta."""
+    if not isinstance(meta, dict):
+        return (None, None)
+
+    vocals_keys = [
+        "vocals_pct", "vocals_percent", "vocals_percentage",
+        "vocals_level_pct", "vocals_level", "vocals_volume",
+        "vocals_gain_pct", "vocals_mix_pct",
+        "reduced_vocals_pct", "vocals_reduction_pct", "reduce_vocals_pct",
+    ]
+
+    bass_keys = [
+        "bass_pct", "bass_percent", "bass_percentage",
+        "bass_level_pct", "bass_level", "bass_volume",
+        "bass_gain_pct", "bass_mix_pct",
+        "reduced_bass_pct", "bass_reduction_pct", "reduce_bass_pct",
+    ]
+
+    vocals_pct = _find_first_percent(meta, vocals_keys)
+    bass_pct = _find_first_percent(meta, bass_keys)
+
+    for container_key in ("stems", "stem_levels", "mix", "levels"):
+        container = meta.get(container_key)
+        if isinstance(container, dict):
+            if vocals_pct is None:
+                vocals_pct = _find_first_percent(container, vocals_keys + ["vocals"])
+            if bass_pct is None:
+                bass_pct = _find_first_percent(container, bass_keys + ["bass"])
+
+    return (vocals_pct, bass_pct)
+
+
+def suggest_ending_from_stems(meta: dict | None) -> str | None:
+    """Build an ending like: '35% Vocals, No Bass' or 'Karaoke'."""
+    vocals_pct, bass_pct = _infer_stem_pcts(meta)
+
+    parts: list[str] = []
+
+    if vocals_pct is not None:
+        if vocals_pct == 0:
+            parts.append("Karaoke")
+        else:
+            parts.append(f"{vocals_pct}% Vocals")
+
+    if bass_pct is not None:
+        if bass_pct == 0:
+            parts.append("No Bass")
+
+    if not parts:
+        return None
+    return ", ".join(parts)
 
 
 def choose_title(slug: str, meta: dict | None) -> str:
-    """
-    Full title builder with four modes:
+    main_title = auto_main_title(slug, meta)
+    suggested = suggest_ending_from_stems(meta)
 
-    1) Auto main title + preset ending
-    2) Auto main title + custom ending
-    3) Custom main title + preset ending
-    4) Full custom title (replace everything)
-    """
-    auto_main = auto_main_title(slug, meta)
+    print()
+    print(f"Base title: {main_title}")
+    if suggested:
+        print(f"Suggested ending: {suggested}")
+    print()
 
     while True:
-        print()
-        print("Title builder options (examples use your auto main title):")
-        print(f"  Auto main title: {auto_main}")
-        print()
-        print("  1) Auto main title + preset ending")
-        print(f"       e.g. {auto_main} (Karaoke)")
-        print("  2) Auto main title + custom ending")
-        print(f"       e.g. {auto_main} (My special version)")
-        print("  3) Custom main title + preset ending")
-        print("       e.g. Mujer Hilandera – Live Remix (Lyrics)")
-        print("  4) Full custom title (replace everything)")
-        print("       e.g. Mujer Hilandera – Karaoke Version – 2025 HD")
-        print()
-
         try:
-            mode = input("Choose how to build the YouTube title [1-4]: ").strip()
+            ending = input("Custom ending: ").strip()
         except EOFError:
-            mode = ""
-
-        if mode not in ("1", "2", "3", "4"):
-            print("Invalid choice. Please enter 1, 2, 3, or 4.")
+            ending = ""
+        if not ending:
+            print("Ending cannot be empty. Try again.")
             continue
-
-        # Mode 1: auto main + preset ending
-        if mode == "1":
-            main_title = auto_main
-            ending = choose_suffix_with_presets(main_title)
-            full_title = f"{main_title} ({ending})"
-
-        # Mode 2: auto main + custom ending (no presets)
-        elif mode == "2":
-            main_title = auto_main
-            print()
-            print(f"Auto main title: {main_title}")
-            print("Now type the ending yourself (no parentheses).")
-            print(f"Example final title: {main_title} (Your ending here)")
-            print()
-            try:
-                ending = input("Ending: ").strip()
-            except EOFError:
-                ending = ""
-            if not ending:
-                print("Ending cannot be empty. Let's start over.")
-                continue
-            full_title = f"{main_title} ({ending})"
-
-        # Mode 3: custom main title + preset ending
-        elif mode == "3":
-            print()
-            print("Type your main title (everything before parentheses).")
-            print(f"Example using presets later: My Song Title (Karaoke)")
-            print()
-            try:
-                main_title = input("Main title: ").strip()
-            except EOFError:
-                main_title = ""
-            if not main_title:
-                print("Main title cannot be empty. Let's start over.")
-                continue
-            ending = choose_suffix_with_presets(main_title)
-            full_title = f"{main_title} ({ending})"
-
-        # Mode 4: full custom title
-        else:  # mode == "4"
-            print()
-            print("Full custom title mode.")
-            print("You will type the entire YouTube title exactly as it should appear.")
-            print("Nothing will be added or changed automatically.")
-            print(f"Auto main title example (for reference only): {auto_main}")
-            print()
-            try:
-                full_title = input("Enter full YouTube title: ").strip()
-            except EOFError:
-                full_title = ""
-            if not full_title:
-                print("Title cannot be empty. Let's start over.")
-                continue
-
-        print()
-        print("Resulting title will be:")
-        print(f"  {full_title}")
-        print()
-        if ask_yes_no("Use this title?", default_yes=True):
-            return full_title
-        print("Okay, let's choose again.")
+        return f"{main_title} ({ending})"
 
 
 # ─────────────────────────────────────────────
@@ -442,38 +507,49 @@ def parse_args(argv=None):
     p.add_argument(
         "--privacy",
         choices=["public", "unlisted", "private"],
-        default="private",
-        help="Privacy status for the video (default: private).",
+        default="unlisted",
+        help="Privacy status for the video (default: unlisted).",
     )
 
     return p.parse_args(argv)
+
+
+def _resolve_video_path(slug: str) -> Path:
+    direct = OUT_DIR / f"{slug}.mp4"
+    if direct.exists():
+        return direct
+
+    matches = sorted(OUT_DIR.glob(f"{slug}*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if matches:
+        log("VIDEO", f"MP4 not found at {direct}; using newest match: {matches[0]}", YELLOW)
+        return matches[0]
+
+    return direct
 
 
 def main(argv=None):
     args = parse_args(argv or sys.argv[1:])
     slug = slugify(args.slug)
 
-    # Resolve paths
-    video_path = OUT_DIR / f"{slug}.mp4"
+    if args.privacy != "unlisted":
+        log("PRIV", f"Ignoring --privacy '{args.privacy}' (forcing unlisted)", YELLOW)
+        args.privacy = "unlisted"
+
+    video_path = _resolve_video_path(slug)
     if not video_path.exists():
         log("ERROR", f"MP4 file not found: {video_path}", RED)
         sys.exit(1)
 
     meta = load_meta_for_slug(slug)
     if meta:
-        log("META", f"Loaded meta for '{slug}'", CYAN)
+        src = meta.get("_meta_path") if isinstance(meta, dict) else None
+        log("META", f"Loaded meta for '{slug}'" + (f" ({src})" if src else ""), CYAN)
     else:
         log("META", f"No meta JSON found for '{slug}'", YELLOW)
 
-    # Title selection flow
     title = choose_title(slug, meta)
 
-    # Description: optional one-liner
-    print()
-    try:
-        description = input("Enter description (optional, ENTER for empty): ").strip()
-    except EOFError:
-        description = ""
+    description = ""
 
     tags = build_tags(meta)
 
@@ -490,12 +566,10 @@ def main(argv=None):
         log("ABORT", "User cancelled upload.", YELLOW)
         sys.exit(0)
 
-    # OAuth + API client
     secrets_path = load_secrets_path()
     creds = get_credentials(secrets_path)
     youtube = build("youtube", "v3", credentials=creds)
 
-    # Upload video
     video_id = upload_video(
         youtube,
         video_path,
@@ -506,7 +580,6 @@ def main(argv=None):
         privacy=args.privacy,
     )
 
-    # Thumbnail: auto from 0.5s
     thumb_path = video_path.with_suffix(".jpg")
     try:
         extract_thumbnail(video_path, thumb_path, time_sec=0.5)
@@ -515,6 +588,8 @@ def main(argv=None):
         log("THUMB", f"Thumbnail failed: {e}", YELLOW)
 
     log("DONE", f"Video available at: https://youtube.com/watch?v={video_id}", GREEN)
+
+    open_path(OUT_DIR)
 
 
 if __name__ == "__main__":
