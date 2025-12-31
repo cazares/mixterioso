@@ -7,12 +7,11 @@ import re
 import time
 import csv
 
-from .common import IOFlags, Paths, log, slugify, YELLOW, WHITE, write_text
+from .common import IOFlags, Paths, log, slugify, YELLOW, WHITE, RED, write_text
 from .offset_tuner import tune_offset
 from .step1_fetch import step1_fetch
 from .step2_split import step2_split
 from .step3_sync import step3_sync
-from .step5_deliver import step5_deliver
 from .first_word_time import estimate_first_word_time
 
 # ─────────────────────────────────────────────
@@ -21,10 +20,11 @@ from .first_word_time import estimate_first_word_time
 def parse_query(q: str) -> tuple[str, str]:
     """Parse required query format: 'Artist - Title'."""
     if " - " not in q:
-        raise ValueError('Query must be in the form "Artist - Title"')
+        # Freeform queries are allowed; Step 1 will resolve artist/title from YouTube metadata.
+        return ("", q.strip())
     artist, title = [s.strip() for s in q.split(" - ", 1)]
-    if not artist or not title:
-        raise ValueError('Query must be in the form "Artist - Title"')
+    if not title:
+        raise ValueError('Query must not be empty')
     return artist, title
 
 
@@ -250,27 +250,31 @@ def main():
 
     log("MAIN", f"query={args.query}")
 
-    artist, title = parse_query(args.query)
-    slug = slugify(title)
+    paths = Paths.from_scripts_dir(scripts_dir)
+    paths.ensure()
+
+    # Step 1: resolve YouTube -> fetch LRC + MP3 (cached + parallel)
+    step1_res = step1_fetch(
+        paths,
+        query=args.query,
+        flags=flags,
+    )
+
+    summary = getattr(step1_res, "summary", {}) or {}
+    artist = summary.get("artist") or ""
+    title = summary.get("title") or ""
+    slug = summary.get("slug") or ""
+
+    if not slug:
+        log("MAIN", f"Step 1 failed: {summary.get('error') or summary.get('errors') or 'unknown_error'}", RED)
+        return 1
 
     log("MAIN", f"artist={artist}")
     log("MAIN", f"title={title}")
     log("MAIN", f"slug={slug}")
 
-    paths = Paths.from_scripts_dir(scripts_dir)
-    paths.ensure()
-
-    # Step 1: fetch (lyrics + audio + (optional) captions/lrc)
-    step1_fetch(
-        paths,
-        query=args.query,
-        artist=artist,
-        title=title,
-        slug=slug,
-        flags=flags,
-    )
-
     log_elapsed('Step 1 (Fetch) End', t0)
+
 
     # Step 2: split/mix
     # NOTE: step2_split requires explicit mix args. Locked v1.x behavior:
@@ -290,6 +294,7 @@ def main():
         drums=drums,
         other=other,
         flags=flags,
+        demucs_proc=getattr(step1_res, 'demucs_proc', None),
     )
 
     log_elapsed('Step 2 (Split) End', t0)
@@ -340,8 +345,13 @@ def main():
 
     log_elapsed('Step 4 (MP4 Gen) End', t0)
 
-    # Step 5: deliver (package outputs)
-    step5_deliver(paths, slug=slug, flags=flags)
+    # Step 5: deliver (package outputs) — optional
+    try:
+        from .step5_deliver import step5_deliver  # type: ignore
+    except Exception as e:
+        log("DELIVER", f"step5_deliver not available; skipping ({e})", YELLOW)
+    else:
+        step5_deliver(paths, slug=slug, flags=flags)
 
     log_elapsed('Pipeline End', t0)
     return 0

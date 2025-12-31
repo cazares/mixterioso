@@ -14,6 +14,9 @@ Stem levels are expressed as PERCENTAGES, not dB:
 
 from __future__ import annotations
 
+import subprocess
+from typing import Optional
+
 from pathlib import Path
 
 from .common import (
@@ -100,7 +103,7 @@ def _encode_mp3_from_wav(src_wav: Path, out_mp3: Path, flags: IOFlags) -> None:
         raise RuntimeError(f"Failed to produce {out_mp3}")
 
 
-def _ensure_demucs_stems(paths: Paths, slug: str, src_mp3: Path, flags: IOFlags) -> Path:
+def _ensure_demucs_stems(paths: Paths, slug: str, src_mp3: Path, flags: IOFlags, demucs_proc: Optional[subprocess.Popen] = None) -> Path:
     """
     Ensure Demucs stems exist and return the stem directory containing vocals/bass/drums/other WAVs.
 
@@ -114,6 +117,15 @@ def _ensure_demucs_stems(paths: Paths, slug: str, src_mp3: Path, flags: IOFlags)
     if have_all and not flags.force:
         log("SPLIT", f"Using existing stems: {stem_dir}", GREEN)
         return stem_dir
+
+    # If Demucs was already started earlier in the pipeline, wait for it instead of re-running.
+    if (not have_all) and demucs_proc is not None and demucs_proc.poll() is None:
+        log("SPLIT", "Waiting for pre-started Demucs to finish...", WHITE)
+        demucs_proc.wait()
+        have_all = all((stem_dir / f"{name}.wav").exists() for name in ("vocals", "bass", "drums", "other"))
+        if have_all:
+            log("SPLIT", f"Using stems produced by async Demucs: {stem_dir}", GREEN)
+            return stem_dir
 
     if not have_exe("demucs"):
         raise RuntimeError("demucs not found on PATH (required for --mix-mode stems or stem level overrides)")
@@ -221,6 +233,7 @@ def step2_split(
     drums: float,
     other: float,
     flags: IOFlags,
+    demucs_proc: Optional[subprocess.Popen] = None,
 ) -> None:
     """
     Produce mixes/<slug>.mp3 and mixes/<slug>.wav.
@@ -283,7 +296,7 @@ def step2_split(
         return
 
     # stems mode
-    stem_dir = _ensure_demucs_stems(paths, slug, src_mp3, flags)
+    stem_dir = _ensure_demucs_stems(paths, slug, src_mp3, flags, demucs_proc=demucs_proc)
 
     vocals_wav = stem_dir / "vocals.wav"
     bass_wav = stem_dir / "bass.wav"
