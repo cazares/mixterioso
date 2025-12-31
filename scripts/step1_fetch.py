@@ -93,19 +93,77 @@ def _plain_from_synced_lrc(synced: str) -> str:
             out.append(s)
     return "\n".join(out).strip()
 
+
+def detect_lang_en_es(text: str) -> str:
+    """Heuristic language detector: returns "en" or "es" (only these two)."""
+    t = (text or "").lower()
+    if not t.strip():
+        return "en"
+
+    # Strong Spanish signals
+    spanish_chars = sum(t.count(ch) for ch in "áéíóúüñ¿¡")
+    if spanish_chars >= 2:
+        return "es"
+
+    # Tokenize (keep accents)
+    tokens = re.findall(r"[a-záéíóúüñ]+", t)
+    if not tokens:
+        return "en"
+
+    en_sw = {
+        "the","and","or","of","to","in","on","for","with","without","as",
+        "i","you","he","she","we","they","me","my","your","our","their",
+        "is","are","was","were","be","been","being",
+        "do","does","did","dont","can't","cant","won't","wont","not","no","yes","but",
+        "because","when","where","what","how",
+        "this","that","these","those","it","im","i've","ive","i'll","ill","you're","youre","we're","were","isn't","isnt","aren't","arent",
+        "love","know","just","all","so",
+    }
+
+    es_sw = {
+        "el","la","los","las","un","una","unos","unas",
+        "y","o","de","del","que","en","por","para","con","sin","como",
+        "yo","tu","tú","usted","ustedes","nosotros","vosotros","ellos","ellas",
+        "mi","mis","te","se","lo","le","me","pero","si","sí","ya","no",
+        "porque","cuando","donde","dónde","qué","como","cómo","mas","más","muy","tambien","también",
+        "ser","estar","soy","eres","es","somos","son","estoy","esta","está","estan","están",
+        "amor","saber","solo","sólo","todo","toda","todos","todas",
+    }
+
+    en_hits = sum(1 for w in tokens if w in en_sw)
+    es_hits = sum(1 for w in tokens if w in es_sw)
+
+    es_score = es_hits + (1 if "¿" in t or "¡" in t else 0) + min(spanish_chars, 5)
+    en_score = en_hits
+
+    return "es" if es_score >= en_score else "en"
+
 # ─────────────────────────────────────────────
 # YouTube search (FAST)
 # ─────────────────────────────────────────────
 
-def youtube_search(artist: str, title: str) -> List[YTEntry]:
+def youtube_search(artist: str, title: str, *, lang_hint: Optional[str] = None) -> List[YTEntry]:
     """Fast, flat YouTube search with early exit."""
 
-    queries = [
-        f"{artist} {title}",
-        f"{artist} {title} letra",
-        f"{artist} {title} karaoke",
-        f"{title} letra",
-    ]
+    # Prefer language-specific intent first, but keep both in the pool
+    if lang_hint == "es":
+        queries = [
+            f"{artist} {title} letra",
+            f"{title} letra",
+            f"{artist} {title} karaoke",
+            f"{artist} {title} lyrics",
+            f"{title} lyrics",
+            f"{artist} {title}",
+        ]
+    else:  # default to English
+        queries = [
+            f"{artist} {title} lyrics",
+            f"{title} lyrics",
+            f"{artist} {title} karaoke",
+            f"{artist} {title} letra",
+            f"{title} letra",
+            f"{artist} {title}",
+        ]
 
     seen: set[str] = set()
     entries: List[YTEntry] = []
@@ -233,16 +291,21 @@ def download_mp3(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -> 
     return rc == 0 and mp3_path.exists() or flags.dry_run
 
 
-def fetch_captions(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags) -> bool:
+def fetch_captions(entry: YTEntry, paths: Paths, *, slug: str, flags: IOFlags, lang_hint: Optional[str] = None) -> bool:
     outtmpl = str((paths.timings / slug).with_suffix(".%(language)s.vtt"))
     url = f"https://www.youtube.com/watch?v={entry.video_id}"
+
+    # Prefer the detected language first, but allow fallback
+    sub_langs = "en.*,es.*,.*"
+    if lang_hint == "es":
+        sub_langs = "es.*,en.*,.*"
 
     cmd = [
         "yt-dlp",
         "--skip-download",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", "en.*,es.*,.*",
+        "--sub-langs", sub_langs,
         "--sub-format", "vtt",
         "--force-ipv4",
         "--retries", "10",
@@ -281,6 +344,7 @@ def step1_fetch(
         "audio_source": "reuse" if mp3_path.exists() else "none",
         "captions_source": "none",
         "youtube_picked": None,
+        "lang": None,
     }
 
     # ── Lyrics ────────────────────────────────
@@ -296,6 +360,10 @@ def step1_fetch(
 
     if not plain and synced:
         plain = _plain_from_synced_lrc(synced)
+
+    # Detect language from best available text (only en/es)
+    lang = detect_lang_en_es(plain or synced)
+    summary["lang"] = lang
 
     write_text(txt_path, (plain + "\n") if plain else "", flags, label="lyrics_txt")
     if synced:
@@ -313,7 +381,7 @@ def step1_fetch(
     candidates: List[YTEntry] = []
 
     if need_audio or need_captions:
-        candidates = youtube_search(artist, title)
+        candidates = youtube_search(artist, title, lang_hint=lang)
         if candidates:
             top = sorted(candidates, key=lambda e: e.view_count, reverse=True)
             log("YT", "Top candidates (weighted):")
@@ -345,7 +413,7 @@ def step1_fetch(
     if need_captions:
         if not picked:
             log("CAPT", "No YouTube candidate selected; cannot fetch captions", YELLOW)
-        elif fetch_captions(picked, paths, slug=slug, flags=flags):
+        elif fetch_captions(picked, paths, slug=slug, flags=flags, lang_hint=lang):
             summary["captions_source"] = "youtube_vtt"
 
     # ── Meta ─────────────────────────────────
