@@ -12,6 +12,7 @@ from .offset_tuner import tune_offset
 from .step1_fetch import step1_fetch
 from .step2_split import step2_split
 from .step3_sync import step3_sync
+from .step5_deliver import step5_deliver
 from .first_word_time import estimate_first_word_time
 
 # ─────────────────────────────────────────────
@@ -228,7 +229,7 @@ def read_saved_offset(paths: Paths, slug: str) -> float | None:
 # ─────────────────────────────────────────────
 def main():
     t0 = time.perf_counter()
-    log('', f"[TIMER] Start")
+    log('TIMER', f"Start")
 
     p = argparse.ArgumentParser(description="Mixterioso single-entry pipeline")
     p.add_argument("--query", required=True, help='Format: "Artist - Title"')
@@ -269,6 +270,8 @@ def main():
         flags=flags,
     )
 
+    log_elapsed('Step 1 (Fetch) End', t0)
+
     # Step 2: split/mix
     # NOTE: step2_split requires explicit mix args. Locked v1.x behavior:
     # default mode "full" copies mp3s/<slug>.mp3 to mixes/<slug>.mp3.
@@ -289,8 +292,12 @@ def main():
         flags=flags,
     )
 
+    log_elapsed('Step 2 (Split) End', t0)
+
     # Step 3: sync (build timings CSV from LRC or VTT)
     sync_source = step3_sync(paths, slug=slug, flags=flags)
+
+    log_elapsed('Step 3 (Sync) End', t0)
 
     _maybe_autoshift_offset_from_first_word(paths, slug, flags)
 
@@ -331,13 +338,18 @@ def main():
     log("RENDER", " ".join(render_cmd))
     subprocess.run(render_cmd, check=True)
 
-    t1 = time.perf_counter()
-    elapsed = t1 - t0
-    log('', f"[TIMER] End")
-    log('', f"[TIMER] Elapsed: {elapsed:.3f}s ({elapsed/60.0:.2f}m)")
+    log_elapsed('Step 4 (MP4 Gen) End', t0)
 
+    # Step 5: deliver (package outputs)
+    step5_deliver(paths, slug=slug, flags=flags)
+
+    log_elapsed('Pipeline End', t0)
     return 0
 
+def log_elapsed(msg: str, t0: float):
+    t1 = time.perf_counter()
+    elapsed = t1 - t0
+    log('TIMER', f"{msg} - Elapsed: {elapsed:.3f}s ({elapsed/60.0:.2f}m)", WHITE)
 
 if __name__ == "__main__":
     raise SystemExit(main())
